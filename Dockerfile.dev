@@ -1,0 +1,27 @@
+# Image de développement uniquement (hot reload via volume monté).
+# La prod NAS Synology utilise Node natif (paquet Node.js v18 DSM), pas ce Dockerfile.
+# Version Node alignée sur celle disponible dans le Centre de paquets Synology.
+FROM node:18-slim
+
+WORKDIR /app
+
+# openssl : requis par le client Prisma 5 sur images slim
+# procps : fournit `ps`, utilisé par `nest start --watch` pour suivre les sous-processus
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache npm install : copier d'abord package*.json puis installer
+COPY package.json package-lock.json* ./
+RUN npm install
+
+# Générer le client Prisma à partir du schéma (présent uniquement après bind mount,
+# donc on le refait dans le command: du compose à chaque démarrage).
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# Le reste du code est monté en volume via docker-compose pour le hot reload.
+
+EXPOSE 3000
+
+CMD ["npm", "run", "start:dev"]

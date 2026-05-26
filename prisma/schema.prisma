@@ -1,0 +1,195 @@
+// Acervatim — schéma relationnel MariaDB.
+// Privacy by design : aucune donnée perso directe (pas d'email, pas de nom).
+// Le `sub` Google est haché HMAC-SHA-256 avec SUB_HASH_PEPPER (env), le résultat est l'unique
+// pivot d'identité. Le `userId` interne est un UUID v4 opaque.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql" // compatible MariaDB 10.5+
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Identité ----------
+
+model User {
+  id            String   @id @default(uuid()) @db.Char(36) // UUID v4
+  googleSubHash String   @unique @map("google_sub_hash") @db.Char(64) // HMAC-SHA-256 hex
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  collections           Collection[]
+  items                 Item[]
+  oauthCredentials      OauthCredential[]
+  subscription          Subscription?
+  premiumGrant          PremiumGrant?
+  invitationRedemptions InvitationRedemption[]
+
+  @@map("users")
+}
+
+// ---------- Collections / items ----------
+
+model Collection {
+  id          String   @id @default(uuid()) @db.Char(36)
+  userId      String   @map("user_id") @db.Char(36)
+  typeId      String   @map("type_id") @db.Char(36)
+  name        String   @db.VarChar(255)
+  description String?  @db.Text
+  itemCount   Int      @default(0) @map("item_count")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type  CollectionType @relation(fields: [typeId], references: [id], onDelete: Restrict)
+  items Item[]
+
+  @@index([userId, createdAt])
+  @@index([typeId])
+  @@map("collections")
+}
+
+// Table de constantes : 'vinyl' | 'manga' | 'movie' | ...
+// Le code reste l'identifiant logique stable ; l'id UUID est la PK opaque.
+model CollectionType {
+  id          String   @id @default(uuid()) @db.Char(36)
+  code        String   @unique @db.VarChar(32)
+  label       String   @db.VarChar(64)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  collections Collection[]
+
+  @@map("collection_types")
+}
+
+model Item {
+  id           String   @id @default(uuid()) @db.Char(36)
+  collectionId String   @map("collection_id") @db.Char(36)
+  userId       String   @map("user_id") @db.Char(36) // dénormalisé pour les requêtes par user
+  source       String   @db.VarChar(32) // 'discogs' | 'mal' | 'tmdb' | ...
+  sourceId     String   @map("source_id") @db.VarChar(128)
+  unifiedData  Json     @map("unified_data")
+  rawData      Json     @map("raw_data")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, source, sourceId]) // un user ne peut référencer 2x le même item d'une source
+  @@index([collectionId, createdAt])
+  @@map("items")
+}
+
+// ---------- OAuth externe (Discogs, MAL, TMDB...) ----------
+
+model OauthCredential {
+  userId                  String   @map("user_id") @db.Char(36)
+  provider                String   @db.VarChar(32) // 'discogs' | 'mal' | 'tmdb'
+  accessTokenEncrypted    String   @map("access_token_encrypted") @db.Text
+  refreshTokenEncrypted   String?  @map("refresh_token_encrypted") @db.Text
+  expiresAt               BigInt   @default(0) @map("expires_at") // epoch ms, 0 = jamais (OAuth 1.0a)
+  scopes                  Json     @default("[]")
+  encryptedWithKeyVersion Int      @default(1) @map("encrypted_with_key_version")
+  updatedAt               DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, provider])
+  @@map("oauth_credentials")
+}
+
+// ---------- Cache & rate limit ----------
+// Pas de TTL natif sur MariaDB pour les rows.
+// Un cron applicatif supprime les rows expirées (job NestJS @Cron).
+
+model ApiCache {
+  cacheKey  String   @id @map("cache_key") @db.VarChar(255)
+  payload   Json
+  fetchedAt DateTime @default(now()) @map("fetched_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("api_cache")
+}
+
+model RateLimitBucket {
+  bucketKey  String   @id @map("bucket_key") @db.VarChar(255)
+  tokens     Float    @default(0)
+  lastRefill BigInt   @default(0) @map("last_refill") // epoch ms
+  expiresAt  DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("rate_limit_buckets")
+}
+
+// ---------- Premium (subscriptions + grants) ----------
+
+model Subscription {
+  userId         String    @id @map("user_id") @db.Char(36)
+  status         String    @db.VarChar(16) // 'active' | 'grace_period' | 'on_hold' | 'paused' | 'cancelled' | 'expired'
+  productId      String    @map("product_id") @db.VarChar(64)
+  purchaseToken  String    @unique @map("purchase_token") @db.VarChar(512)
+  expiresAt      BigInt    @map("expires_at") // epoch ms
+  autoRenew      Boolean   @default(true) @map("auto_renew")
+  startedAt      DateTime  @default(now()) @map("started_at")
+  lastVerifiedAt DateTime  @default(now()) @map("last_verified_at")
+  cancelReason   String?   @map("cancel_reason") @db.VarChar(64)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, expiresAt]) // cron : trouver les subs qui expirent bientôt
+  @@map("subscriptions")
+}
+
+model PremiumGrant {
+  userId    String   @id @map("user_id") @db.Char(36)
+  reason    String   @db.VarChar(32) // 'self' | 'beta_tester' | 'comp' | 'support' | 'admin'
+  grantedBy String?  @map("granted_by") @db.VarChar(64)
+  grantedAt DateTime @default(now()) @map("granted_at")
+  expiresAt BigInt?  @map("expires_at") // epoch ms ; null = permanent
+  notes     String?  @db.Text
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("premium_grants")
+}
+
+// ---------- Invitations (codes anonymes) ----------
+// Pas d'email, pas de cible : le code voyage hors-bande.
+// On stocke uniquement HMAC-SHA-256(code, INVITE_CODE_PEPPER) — jamais le code en clair.
+// Le code complet n'est retourné qu'à la création, à l'admin.
+
+model Invitation {
+  codeHash         String   @id @map("code_hash") @db.Char(64) // HMAC-SHA-256 hex
+  reason           String   @db.VarChar(32) // 'beta_tester' | 'comp' | 'support' | 'admin'
+  grantsPremium    Boolean  @default(false) @map("grants_premium")
+  premiumExpiresAt BigInt?  @map("premium_expires_at") // epoch ms ; null = permanent (si grantsPremium)
+  maxUses          Int      @default(1) @map("max_uses")
+  usedCount        Int      @default(0) @map("used_count")
+  expiresAt        BigInt?  @map("expires_at") // epoch ms ; null = jamais
+  createdBy        String?  @map("created_by") @db.VarChar(64)
+  notes            String?  @db.Text
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  redemptions InvitationRedemption[]
+
+  @@index([expiresAt])
+  @@map("invitations")
+}
+
+// Trace de claim : empêche un même user de re-déclencher un grant via le même code.
+model InvitationRedemption {
+  invitationCodeHash String   @map("invitation_code_hash") @db.Char(64)
+  userId             String   @map("user_id") @db.Char(36)
+  redeemedAt         DateTime @default(now()) @map("redeemed_at")
+
+  invitation Invitation @relation(fields: [invitationCodeHash], references: [codeHash], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([invitationCodeHash, userId])
+  @@index([userId])
+  @@map("invitation_redemptions")
+}

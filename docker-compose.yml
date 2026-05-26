@@ -1,0 +1,61 @@
+# Stack de développement local uniquement.
+# La prod NAS Synology utilise Node natif + MariaDB natif (cf. guide).
+# Démarrage : docker compose up --build
+# Reset DB : docker compose down -v
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: acervatim-app
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      # Override l'hôte DB pour pointer sur le service "db" du réseau compose.
+      # Le .env peut garder DATABASE_URL avec host=localhost pour les commandes Prisma exécutées hors compose.
+      DATABASE_URL: "mysql://${MARIADB_USER:-acervatim}:${MARIADB_PASSWORD:-changeme}@db:3306/${MARIADB_DATABASE:-acervatim}"
+    volumes:
+      - .:/app
+      - /app/node_modules      # anonymous volume pour préserver le node_modules du container
+    depends_on:
+      db:
+        condition: service_healthy
+    # Régénère le client Prisma à chaque démarrage (schéma monté en volume après build).
+    command: sh -c "npx prisma generate && npm run start:dev"
+
+  db:
+    image: mariadb:10.11
+    container_name: acervatim-db
+    ports:
+      - "3306:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-rootpassword}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-acervatim}
+      MARIADB_USER: ${MARIADB_USER:-acervatim}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-changeme}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  adminer:
+    image: adminer:latest
+    container_name: acervatim-adminer
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    depends_on:
+      - db
+
+volumes:
+  db_data:

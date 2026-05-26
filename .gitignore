@@ -1,0 +1,43 @@
+# Compiled output
+dist/
+build/
+*.tsbuildinfo
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Tests
+coverage/
+.nyc_output/
+
+# Logs
+logs/
+*.log
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Prisma migrations sont versionnées, mais pas les db locales
+prisma/*.db
+prisma/*.db-journal
+
+# OpenAPI artefact regénéré à chaque bootstrap
+openapi.json
+
+# Docs internes (non publiées)
+docs/interne/
+
+# Claude Code config locale
+.claude/
