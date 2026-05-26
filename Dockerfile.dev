@@ -7,8 +7,9 @@ WORKDIR /app
 
 # openssl : requis par le client Prisma 5 sur images slim
 # procps : fournit `ps`, utilisé par `nest start --watch` pour suivre les sous-processus
+# git    : requis par lint-staged (pre-commit hook tournant via le wrapper)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssl procps \
+    && apt-get install -y --no-install-recommends openssl procps git \
     && rm -rf /var/lib/apt/lists/*
 
 # Cache npm install : copier d'abord package*.json puis installer

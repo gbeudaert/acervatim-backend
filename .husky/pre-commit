@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+# Pre-commit hook: format staged files via prettier (running inside the app container).
+# All npm/npx run in the container per CLAUDE.md hard rule.
+
+if ! docker compose ps --status running --services 2>/dev/null | grep -q '^app$'; then
+  echo "pre-commit: the 'app' container is not running."
+  echo "            Start it with './scripts/dev.ps1 up-bg' before committing,"
+  echo "            or pass --no-verify to skip formatting (not recommended)."
+  exit 1
+fi
+
+docker compose exec -T app npx lint-staged
