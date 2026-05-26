@@ -1,0 +1,150 @@
+import { INestApplication, RequestMethod } from '@nestjs/common';
+import { Test, TestingModule } from '@nestjs/testing';
+import { ZodValidationPipe } from 'nestjs-zod';
+import { randomBytes } from 'crypto';
+import request from 'supertest';
+import { AppModule } from '../app.module';
+import { GoogleIdentityProvider } from '../auth/providers/google.provider';
+import { ProblemDetailsExceptionFilter } from '../common/filters/problem-details.filter';
+import { CorrelationIdInterceptor } from '../common/interceptors/correlation-id.interceptor';
+import { PrismaService } from '../prisma/prisma.service';
+
+class FakeGoogleProvider {
+  readonly name = 'google';
+  subject = '';
+  verify(_credential: unknown) {
+    return Promise.resolve({ subject: this.subject });
+  }
+}
+
+async function login(
+  app: INestApplication,
+  fake: FakeGoogleProvider,
+  sub: string,
+) {
+  fake.subject = sub;
+  const res = await request(app.getHttpServer())
+    .post('/v1/auth/google')
+    .send({ idToken: 'fake-token' })
+    .expect(200);
+  return {
+    token: res.body.accessToken as string,
+    userId: res.body.userId as string,
+  };
+}
+
+describe('Users (e2e) — /v1/me, /v1/me/export, /v1/me delete', () => {
+  let app: INestApplication;
+  let prisma: PrismaService;
+  let fakeGoogle: FakeGoogleProvider;
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    })
+      .overrideProvider(GoogleIdentityProvider)
+      .useValue(new FakeGoogleProvider())
+      .compile();
+
+    app = moduleRef.createNestApplication();
+    app.setGlobalPrefix('v1', {
+      exclude: [
+        { path: 'health', method: RequestMethod.ALL },
+        { path: 'health/(.*)', method: RequestMethod.ALL },
+      ],
+    });
+    app.useGlobalPipes(new ZodValidationPipe());
+    app.useGlobalInterceptors(new CorrelationIdInterceptor());
+    app.useGlobalFilters(new ProblemDetailsExceptionFilter());
+    await app.init();
+
+    prisma = moduleRef.get(PrismaService);
+    fakeGoogle = moduleRef.get(
+      GoogleIdentityProvider,
+    ) as unknown as FakeGoogleProvider;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("flow complet : login → me → export → delete → me 401, plus traces d'audit", async () => {
+    const sub = `e2e-users-sub-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+
+    try {
+      // GET /v1/me
+      const me = await request(app.getHttpServer())
+        .get('/v1/me')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(me.body.userId).toBe(userId);
+      expect(typeof me.body.createdAt).toBe('string');
+
+      // GET /v1/me/export
+      const exp = await request(app.getHttpServer())
+        .get('/v1/me/export')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(exp.headers['content-disposition']).toContain('attachment');
+      expect(exp.headers['content-disposition']).toContain(userId);
+      const payload = JSON.parse(exp.text);
+      expect(payload.schemaVersion).toBe(1);
+      expect(payload.data.user.id).toBe(userId);
+      expect(Array.isArray(payload.data.collections)).toBe(true);
+      expect(Array.isArray(payload.data.items)).toBe(true);
+      expect(Array.isArray(payload.data.oauthCredentials)).toBe(true);
+      expect(Array.isArray(payload.data.invitationRedemptions)).toBe(true);
+      expect(Array.isArray(payload.data.auditLogs)).toBe(true);
+
+      // DELETE /v1/me
+      await request(app.getHttpServer())
+        .delete('/v1/me')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      // GET /v1/me avec un token dont l'user n'existe plus → 404 (user not found)
+      const after = await request(app.getHttpServer())
+        .get('/v1/me')
+        .set('Authorization', `Bearer ${token}`);
+      expect(after.status).toBe(404);
+      expect(after.headers['content-type']).toContain(
+        'application/problem+json',
+      );
+
+      // Audit logs : auth.login + user.export + user.delete présents
+      const actions = await prisma.auditLog.findMany({
+        where: { userId },
+        select: { action: true },
+      });
+      const set = new Set(actions.map((a) => a.action));
+      expect(set.has('auth.login')).toBe(true);
+      expect(set.has('user.export')).toBe(true);
+      expect(set.has('user.delete')).toBe(true);
+
+      // L'user a bien été supprimé en DB (cascade Prisma)
+      const userInDb = await prisma.user.findUnique({ where: { id: userId } });
+      expect(userInDb).toBeNull();
+    } finally {
+      // Nettoyage : audit_logs n'a pas de FK, on les supprime explicitement.
+      await prisma.auditLog.deleteMany({ where: { userId } });
+      await prisma.user
+        .deleteMany({ where: { id: userId } })
+        .catch(() => undefined);
+    }
+  });
+
+  it('GET /v1/me sans Authorization → 401 Problem Details', async () => {
+    const res = await request(app.getHttpServer()).get('/v1/me').expect(401);
+    expect(res.headers['content-type']).toContain('application/problem+json');
+    expect(res.body.type).toContain('/probs/unauthorized');
+  });
+
+  it('GET /v1/me avec un Bearer cassé → 401', async () => {
+    const res = await request(app.getHttpServer())
+      .get('/v1/me')
+      .set('Authorization', 'Bearer not-a-real-jwt')
+      .expect(401);
+    expect(res.body.type).toContain('/probs/unauthorized');
+  });
+});

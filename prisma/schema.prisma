@@ -30,6 +30,24 @@ model User {
   @@map("users")
 }
 
+// ---------- Audit log ----------
+// Append-only. Aucune méthode update/delete exposée par AuditLogService.
+// `userId` est NULL si l'action n'est pas attribuable (avant identification).
+// `target` : FK loose (string), ex: userId cible d'un grant admin.
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Char(36)
+  userId    String?  @map("user_id") @db.Char(36)
+  action    String   @db.VarChar(64) // 'auth.login' | 'user.delete' | 'user.export' | 'premium.grant' | ...
+  target    String?  @db.VarChar(128)
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
 // ---------- Collections / items ----------
 
 model Collection {
