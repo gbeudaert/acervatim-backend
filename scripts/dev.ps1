@@ -36,6 +36,9 @@ Inspection :
   db-shell           CLI MariaDB (user acervatim, demande le password)
   db-grant           Applique db/init/01-grants.sql sur la base existante (sans reset)
 
+Git :
+  setup-hooks        Configure core.hooksPath sur .husky (a faire une fois apres clone)
+
 Prisma :
   migrate <nom>      Crée + applique une nouvelle migration
   migrate-deploy     Applique les migrations existantes (CI-style)
@@ -70,6 +73,16 @@ switch ($Command) {
     'logs'           { Invoke-Compose logs -f app @Rest }
     'shell'          { Invoke-Compose exec app sh }
     'db-shell'       { Invoke-Compose exec db mariadb -u acervatim -p acervatim }
+    'setup-hooks' {
+        & git rev-parse --is-inside-work-tree 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error 'Not inside a git repository. Run `git init` first.'
+            exit 1
+        }
+        & git config core.hooksPath .husky
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Write-Host 'core.hooksPath set to .husky. Pre-commit hook is active.' -ForegroundColor Green
+    }
     'db-grant' {
         $envLines = Get-Content '.env' -ErrorAction Stop
         $rootLine = $envLines | Where-Object { $_ -match '^MARIADB_ROOT_PASSWORD=' } | Select-Object -First 1

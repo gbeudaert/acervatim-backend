@@ -54,7 +54,9 @@ Ces règles s'appliquent à **tout endpoint applicatif** (les webhooks publics f
     name: z.string().max(255),
     description: z.string().optional(),
   });
-  export class CreateCollectionDto extends createZodDto(CreateCollectionSchema) {}
+  export class CreateCollectionDto extends createZodDto(
+    CreateCollectionSchema,
+  ) {}
   ```
 - Les DTOs `class-validator` existants (`src/invitations/dto/*`) seront migrés au sprint qui touche au module concerné.
 
@@ -129,7 +131,10 @@ Pourquoi : Prisma génère des artefacts spécifiques à la plateforme ; lancer 
 ./scripts/dev.ps1 exec <cmd...>            # commande arbitraire dans le conteneur
 ./scripts/dev.ps1 db-shell                 # CLI MariaDB
 ./scripts/dev.ps1 shell                    # shell sh dans le conteneur app
+./scripts/dev.ps1 setup-hooks              # active le pre-commit Prettier (une fois après clone)
 ```
+
+Après un clone neuf : `./scripts/dev.ps1 setup-hooks` une fois pour pointer `core.hooksPath` vers `.husky/`. Le hook `pre-commit` exécute `lint-staged` (Prettier sur les fichiers stagés) dans le conteneur — il a besoin que la stack soit `up`.
 
 Avant d'écrire un `npm <truc>` direct dans un sprint, un commentaire ou une instruction utilisateur : se demander si un passe-plat du wrapper existe (`./scripts/dev.ps1 help`). Si la commande n'a pas de wrapper dédié, utiliser `./scripts/dev.ps1 npm/npx/exec ...`. Si même ça ne suffit pas, **ajouter une commande au wrapper** plutôt que de contourner.
 
