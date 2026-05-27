@@ -19,7 +19,7 @@ export class CollectionsService {
   ) {}
 
   async create(userId: string, dto: CreateCollectionDto): Promise<Collection> {
-    await this.quota.assertCanCreateCollection(userId);
+    // typeCode → typeId hors-tx : lookup pur en lecture, indépendant du quota.
     const type = await this.prisma.collectionType.findUnique({
       where: { code: dto.typeCode },
       select: { id: true },
@@ -27,13 +27,18 @@ export class CollectionsService {
     if (!type) {
       throw new BadRequestException(`Unknown collection type: ${dto.typeCode}`);
     }
-    return this.prisma.collection.create({
-      data: {
-        userId,
-        typeId: type.id,
-        name: dto.name,
-        description: dto.description,
-      },
+    // Quota check + create dans la même tx : réduit la fenêtre TOCTOU
+    // sous concurrence (sans SELECT FOR UPDATE le risque reste, cf. review SEC-004).
+    return this.prisma.$transaction(async (tx) => {
+      await this.quota.assertCanCreateCollection(userId, tx);
+      return tx.collection.create({
+        data: {
+          userId,
+          typeId: type.id,
+          name: dto.name,
+          description: dto.description,
+        },
+      });
     });
   }
 
@@ -51,7 +56,9 @@ export class CollectionsService {
           where,
           take,
           ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-          orderBy: { createdAt: 'desc' },
+          // id desc en tiebreaker : deux rows avec le même createdAt (bulk insert,
+          // fixtures) ne se retrouvent jamais dupliquées ou sautées entre pages.
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       query.cursor,
       query.limit,

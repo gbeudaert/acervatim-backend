@@ -37,10 +37,12 @@ export class ItemsService {
     dto: CreateItemDto,
   ): Promise<Item> {
     await this.assertCollectionOwned(userId, collectionId);
-    await this.quota.assertCanCreateItem(userId);
     try {
-      const [item] = await this.prisma.$transaction([
-        this.prisma.item.create({
+      // Quota check + create + increment dans la même tx : réduit la fenêtre TOCTOU
+      // (cf. review SEC-004). Sans SELECT FOR UPDATE le risque résiduel est ~1 row.
+      return await this.prisma.$transaction(async (tx) => {
+        await this.quota.assertCanCreateItem(userId, tx);
+        const item = await tx.item.create({
           data: {
             collectionId,
             userId,
@@ -49,13 +51,13 @@ export class ItemsService {
             unifiedData: dto.unifiedData as Prisma.InputJsonValue,
             rawData: dto.rawData as Prisma.InputJsonValue,
           },
-        }),
-        this.prisma.collection.update({
+        });
+        await tx.collection.update({
           where: { id: collectionId },
           data: { itemCount: { increment: 1 } },
-        }),
-      ]);
-      return item;
+        });
+        return item;
+      });
     } catch (err) {
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -84,7 +86,8 @@ export class ItemsService {
           where,
           take,
           ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-          orderBy: { createdAt: 'desc' },
+          // id desc en tiebreaker : cf. CollectionsService.list.
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       query.cursor,
       query.limit,

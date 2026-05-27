@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { QuotaExceededException } from './quota-exceeded.exception';
 
@@ -16,12 +17,23 @@ export interface QuotaSummary {
   items: { used: number; max: number };
 }
 
+/**
+ * Accepte un client transactionnel (Prisma.TransactionClient) ou le client root
+ * — permet à l'appelant d'enrôler le check dans la transaction de création
+ * pour réduire la fenêtre TOCTOU.
+ */
+type DbClient = PrismaService | Prisma.TransactionClient;
+
 @Injectable()
 export class QuotaService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async assertCanCreateCollection(userId: string): Promise<void> {
-    const used = await this.prisma.collection.count({ where: { userId } });
+  async assertCanCreateCollection(
+    userId: string,
+    db?: DbClient,
+  ): Promise<void> {
+    const client = db ?? this.prisma;
+    const used = await client.collection.count({ where: { userId } });
     if (used >= FREE_TIER_LIMITS.collections) {
       throw new QuotaExceededException(
         `quota-exceeded: max ${FREE_TIER_LIMITS.collections} collections`,
@@ -29,8 +41,9 @@ export class QuotaService {
     }
   }
 
-  async assertCanCreateItem(userId: string): Promise<void> {
-    const agg = await this.prisma.collection.aggregate({
+  async assertCanCreateItem(userId: string, db?: DbClient): Promise<void> {
+    const client = db ?? this.prisma;
+    const agg = await client.collection.aggregate({
       where: { userId },
       _sum: { itemCount: true },
     });

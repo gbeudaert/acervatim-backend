@@ -12,10 +12,11 @@ type PrismaMock = {
     update: jest.Mock;
     delete: jest.Mock;
   };
+  $transaction: jest.Mock;
 };
 
 function makePrismaMock(): PrismaMock {
-  return {
+  const mock: PrismaMock = {
     collectionType: { findUnique: jest.fn() },
     collection: {
       create: jest.fn(),
@@ -24,7 +25,10 @@ function makePrismaMock(): PrismaMock {
       update: jest.fn(),
       delete: jest.fn(),
     },
+    // Invoque le callback avec le mock lui-même : tx === prisma dans les tests.
+    $transaction: jest.fn((cb) => cb(mock)),
   };
+  return mock;
 }
 
 function makeService(prisma: PrismaMock): CollectionsService {
@@ -120,7 +124,7 @@ describe('CollectionsService.list', () => {
       type: { code: { in: ['vinyl', 'manga'] } },
     });
     expect(call.take).toBe(51); // limit + 1
-    expect(call.orderBy).toEqual({ createdAt: 'desc' });
+    expect(call.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
   });
 
   it('renvoie nextCursor=null sur une page partielle', async () => {
