@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
+import { CollectionsModule } from './collections/collections.module';
 import { AuditLogModule } from './common/audit/audit-log.module';
 import { CryptoModule } from './common/crypto/crypto.module';
 import { validateEnv } from './config/env.validation';
@@ -23,6 +24,7 @@ import { UsersModule } from './users/users.module';
     AuthModule,
     UsersModule,
     InvitationsModule,
+    CollectionsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
