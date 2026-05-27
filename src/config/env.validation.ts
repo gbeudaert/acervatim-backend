@@ -7,7 +7,9 @@ const base64Length = (decodedBytes: number) =>
 
 export const EnvSchema = z.object({
   PORT: z.coerce.number().int().default(3000),
-  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  NODE_ENV: z
+    .enum(['development', 'production', 'test'])
+    .default('development'),
   DATABASE_URL: z.string().url(),
   SUB_HASH_PEPPER: z.string().min(32),
   ENCRYPTION_KEY: base64Length(32),
@@ -18,7 +20,22 @@ export const EnvSchema = z.object({
   GOOGLE_CLIENT_ID: z.string().min(1),
   DISCOGS_CONSUMER_KEY: z.string().optional(),
   DISCOGS_CONSUMER_SECRET: z.string().optional(),
+  DISCOGS_CALLBACK_URL: z
+    .string()
+    .url()
+    .default('http://localhost:3000/v1/oauth/discogs/callback'),
+  MAL_CLIENT_ID: z.string().optional(),
+  MAL_CLIENT_SECRET: z.string().optional(),
+  MAL_CALLBACK_URL: z
+    .string()
+    .url()
+    .default('http://localhost:3000/v1/oauth/mal/callback'),
+  TMDB_API_KEY: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
+  HTTP_USER_AGENT: z
+    .string()
+    .min(1)
+    .default('Acervatim-Backend/1.0 (+contact@acervatim.local)'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

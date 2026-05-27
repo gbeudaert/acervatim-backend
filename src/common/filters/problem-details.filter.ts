@@ -1,5 +1,6 @@
 import {
   ArgumentsHost,
+  BadGatewayException,
   BadRequestException,
   Catch,
   ConflictException,
@@ -88,6 +89,13 @@ export function mapException(exception: unknown): Mapped {
   }
   if (exception instanceof ConflictException) {
     return { type: `${TYPE_BASE}/conflict`, title: 'Conflict', status: 409 };
+  }
+  if (exception instanceof BadGatewayException) {
+    return {
+      type: `${TYPE_BASE}/upstream-unavailable`,
+      title: 'Upstream unavailable',
+      status: 502,
+    };
   }
   if (exception instanceof HttpException) {
     return mapStatus(exception.getStatus());

@@ -7,12 +7,17 @@ import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import { CollectionsModule } from './collections/collections.module';
 import { AuditLogModule } from './common/audit/audit-log.module';
+import { ApiCacheModule } from './common/cache/api-cache.module';
 import { CryptoModule } from './common/crypto/crypto.module';
+import { HttpModule } from './common/http/http.module';
 import { QuotaModule } from './common/quota/quota.module';
+import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
+import { OauthModule } from './oauth/oauth.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { SearchModule } from './search/search.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
@@ -34,6 +39,9 @@ import { UsersModule } from './users/users.module';
     }),
     CryptoModule,
     PrismaModule,
+    HttpModule,
+    ApiCacheModule,
+    RateLimitModule,
     QuotaModule,
     AuditLogModule,
     AuthModule,
@@ -41,6 +49,8 @@ import { UsersModule } from './users/users.module';
     InvitationsModule,
     CollectionsModule,
     ItemsModule,
+    OauthModule,
+    SearchModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
