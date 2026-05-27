@@ -31,6 +31,33 @@ export const EnvSchema = z.object({
     .url()
     .default('http://localhost:3000/v1/oauth/mal/callback'),
   TMDB_API_KEY: z.string().optional(),
+  // Google Play Billing — optionnels en dev/test, requis en prod pour activer
+  // verify + RTDN. Le JSON du service account est encodé base64 pour éviter les
+  // newlines (private_key contient des \n littéraux).
+  GOOGLE_PLAY_PACKAGE_NAME: z.string().min(1).optional(),
+  GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: z
+    .string()
+    .min(1)
+    .optional()
+    .refine(
+      (s) => {
+        if (!s) return true;
+        try {
+          const decoded = Buffer.from(s, 'base64').toString('utf8');
+          const parsed = JSON.parse(decoded);
+          return (
+            typeof parsed === 'object' &&
+            typeof parsed.client_email === 'string' &&
+            typeof parsed.private_key === 'string'
+          );
+        } catch {
+          return false;
+        }
+      },
+      { message: 'must be base64-encoded service account JSON' },
+    ),
+  GOOGLE_PUBSUB_SA_EMAIL: z.string().email().optional(),
+  GOOGLE_PUBSUB_AUDIENCE: z.string().url().optional(),
   CORS_ORIGINS: z.string().optional(),
   HTTP_USER_AGENT: z
     .string()
