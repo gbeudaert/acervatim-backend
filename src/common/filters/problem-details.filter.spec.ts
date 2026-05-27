@@ -6,6 +6,8 @@ import {
 } from '@nestjs/common';
 import { ZodValidationException } from 'nestjs-zod';
 import { z, ZodError } from 'zod';
+import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
+import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 import {
   mapException,
@@ -71,17 +73,31 @@ describe('mapException', () => {
     });
   });
 
-  it('mappe QuotaExceededException sur /probs/quota-exceeded 403 (avant /probs/forbidden)', () => {
+  it('mappe QuotaExceededException sur /probs/quota-exceeded 402 (Payment Required)', () => {
     expect(mapException(new QuotaExceededException('max 10'))).toMatchObject({
       type: expect.stringContaining('/probs/quota-exceeded'),
+      status: 402,
+    });
+  });
+
+  it('mappe une ForbiddenException ordinaire sur /probs/forbidden 403', () => {
+    expect(mapException(new ForbiddenException())).toMatchObject({
+      type: expect.stringContaining('/probs/forbidden'),
       status: 403,
     });
   });
 
-  it('mappe une ForbiddenException ordinaire sur /probs/forbidden (pas quota-exceeded)', () => {
-    expect(mapException(new ForbiddenException())).toMatchObject({
-      type: expect.stringContaining('/probs/forbidden'),
-      status: 403,
+  it('mappe InvitationExpiredException sur /probs/invitation-expired 410', () => {
+    expect(mapException(new InvitationExpiredException())).toMatchObject({
+      type: expect.stringContaining('/probs/invitation-expired'),
+      status: 410,
+    });
+  });
+
+  it('mappe InvitationExhaustedException sur /probs/invitation-exhausted 409 (avant /probs/conflict)', () => {
+    expect(mapException(new InvitationExhaustedException())).toMatchObject({
+      type: expect.stringContaining('/probs/invitation-exhausted'),
+      status: 409,
     });
   });
 

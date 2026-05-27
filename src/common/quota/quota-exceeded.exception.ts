@@ -1,11 +1,12 @@
-import { ForbiddenException } from '@nestjs/common';
+import { HttpException, HttpStatus } from '@nestjs/common';
 
 /**
- * Sous-classe sémantique de 403 — distincte des autres ForbiddenException pour
- * que `ProblemDetailsExceptionFilter` la mappe sur `/probs/quota-exceeded`.
+ * 402 Payment Required — quota free tier dépassé. Permet au client de
+ * différencier « upgrade pour continuer » d'un 403 « pas tes droits ».
+ * Mappée sur `/probs/quota-exceeded` par `ProblemDetailsExceptionFilter`.
  */
-export class QuotaExceededException extends ForbiddenException {
+export class QuotaExceededException extends HttpException {
   constructor(message: string) {
-    super(message);
+    super(message, HttpStatus.PAYMENT_REQUIRED);
   }
 }

@@ -389,7 +389,7 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
     }
   });
 
-  it('quota collections : la (max+1)ème → 403 /probs/quota-exceeded "max N"', async () => {
+  it('quota collections : la (max+1)ème → 402 /probs/quota-exceeded "max N"', async () => {
     const sub = `e2e-quota-coll-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
 
@@ -405,7 +405,7 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
         .post('/v1/collections')
         .set('Authorization', `Bearer ${token}`)
         .send({ typeCode: 'game', name: 'g-over' });
-      expect(over.status).toBe(403);
+      expect(over.status).toBe(402);
       expect(over.body.type).toContain('/probs/quota-exceeded');
       expect(over.body.detail).toContain(`max ${FREE_TIER_LIMITS.collections}`);
     } finally {
@@ -413,7 +413,7 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
     }
   });
 
-  it('quota items : sum(itemCount) == max → POST item → 403 quota-exceeded', async () => {
+  it('quota items : sum(itemCount) == max → POST item → 402 quota-exceeded', async () => {
     const sub = `e2e-quota-items-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
 
@@ -442,7 +442,7 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
           unifiedData: {},
           rawData: {},
         });
-      expect(over.status).toBe(403);
+      expect(over.status).toBe(402);
       expect(over.body.type).toContain('/probs/quota-exceeded');
       expect(over.body.detail).toContain(`max ${FREE_TIER_LIMITS.items}`);
     } finally {

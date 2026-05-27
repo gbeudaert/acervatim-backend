@@ -1,6 +1,4 @@
 import {
-  ConflictException,
-  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -11,6 +9,8 @@ import { randomBytes } from 'crypto';
 import { HashService } from '../common/crypto/hash.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
+import { InvitationExhaustedException } from './invitation-exhausted.exception';
+import { InvitationExpiredException } from './invitation-expired.exception';
 
 export interface CreatedInvitation {
   /** Code en clair. Retourné UNE seule fois, à l'admin qui crée l'invitation. */
@@ -39,7 +39,9 @@ export class InvitationsService implements OnModuleInit {
   onModuleInit() {
     const pepper = this.config.get<string>('INVITE_CODE_PEPPER');
     if (!pepper || pepper.length < 32) {
-      throw new Error('INVITE_CODE_PEPPER must be set (≥ 32 chars, base64 recommandé)');
+      throw new Error(
+        'INVITE_CODE_PEPPER must be set (≥ 32 chars, base64 recommandé)',
+      );
     }
     this.pepper = pepper;
   }
@@ -63,7 +65,9 @@ export class InvitationsService implements OnModuleInit {
         reason: input.reason,
         grantsPremium: input.grantsPremium ?? false,
         premiumExpiresAt:
-          input.premiumExpiresAt != null ? BigInt(input.premiumExpiresAt) : null,
+          input.premiumExpiresAt != null
+            ? BigInt(input.premiumExpiresAt)
+            : null,
         maxUses: input.maxUses ?? 1,
         expiresAt: input.expiresAt != null ? BigInt(input.expiresAt) : null,
         createdBy: input.createdBy,
@@ -87,14 +91,19 @@ export class InvitationsService implements OnModuleInit {
     const codeHash = this.hashCode(rawCode);
 
     return this.prisma.$transaction(async (tx) => {
-      const invitation = await tx.invitation.findUnique({ where: { codeHash } });
+      const invitation = await tx.invitation.findUnique({
+        where: { codeHash },
+      });
       if (!invitation) {
         throw new NotFoundException('Invitation introuvable');
       }
 
       const nowMs = Date.now();
-      if (invitation.expiresAt != null && Number(invitation.expiresAt) < nowMs) {
-        throw new ForbiddenException('Invitation expirée');
+      if (
+        invitation.expiresAt != null &&
+        Number(invitation.expiresAt) < nowMs
+      ) {
+        throw new InvitationExpiredException();
       }
 
       const existing = await tx.invitationRedemption.findUnique({
@@ -111,7 +120,7 @@ export class InvitationsService implements OnModuleInit {
       }
 
       if (invitation.usedCount >= invitation.maxUses) {
-        throw new ForbiddenException('Invitation épuisée');
+        throw new InvitationExhaustedException();
       }
 
       // Garde optimiste : n'incrémente que si la place est encore là.
@@ -120,7 +129,7 @@ export class InvitationsService implements OnModuleInit {
         data: { usedCount: { increment: 1 } },
       });
       if (bumped.count === 0) {
-        throw new ConflictException('Invitation épuisée (race)');
+        throw new InvitationExhaustedException('Invitation épuisée (race)');
       }
 
       await tx.invitationRedemption.create({

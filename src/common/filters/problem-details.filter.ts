@@ -15,6 +15,8 @@ import { randomUUID } from 'crypto';
 import { Request, Response } from 'express';
 import { ZodValidationException } from 'nestjs-zod';
 import { ZodIssue } from 'zod';
+import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
+import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 
 const TYPE_BASE = 'https://api.acervatim/probs';
@@ -61,7 +63,7 @@ export function mapException(exception: unknown): Mapped {
     return {
       type: `${TYPE_BASE}/quota-exceeded`,
       title: 'Quota exceeded',
-      status: 403,
+      status: 402,
     };
   }
   if (exception instanceof ForbiddenException) {
@@ -69,6 +71,20 @@ export function mapException(exception: unknown): Mapped {
   }
   if (exception instanceof NotFoundException) {
     return { type: `${TYPE_BASE}/not-found`, title: 'Not found', status: 404 };
+  }
+  if (exception instanceof InvitationExpiredException) {
+    return {
+      type: `${TYPE_BASE}/invitation-expired`,
+      title: 'Invitation expired',
+      status: 410,
+    };
+  }
+  if (exception instanceof InvitationExhaustedException) {
+    return {
+      type: `${TYPE_BASE}/invitation-exhausted`,
+      title: 'Invitation exhausted',
+      status: 409,
+    };
   }
   if (exception instanceof ConflictException) {
     return { type: `${TYPE_BASE}/conflict`, title: 'Conflict', status: 409 };
