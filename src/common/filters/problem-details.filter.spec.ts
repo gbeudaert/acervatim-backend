@@ -1,7 +1,16 @@
-import { ArgumentsHost, BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  ArgumentsHost,
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { ZodValidationException } from 'nestjs-zod';
 import { z, ZodError } from 'zod';
-import { mapException, ProblemDetailsExceptionFilter } from './problem-details.filter';
+import { QuotaExceededException } from '../quota/quota-exceeded.exception';
+import {
+  mapException,
+  ProblemDetailsExceptionFilter,
+} from './problem-details.filter';
 
 interface MockRes {
   headers: Record<string, string>;
@@ -34,7 +43,10 @@ function makeRes(): MockRes {
   return res;
 }
 
-function makeHost(req: { url: string; requestId?: string }, res: MockRes): ArgumentsHost {
+function makeHost(
+  req: { url: string; requestId?: string },
+  res: MockRes,
+): ArgumentsHost {
   return {
     switchToHttp: () => ({
       getRequest: () => req,
@@ -56,6 +68,20 @@ describe('mapException', () => {
     expect(mapException(new BadRequestException('x'))).toMatchObject({
       type: expect.stringContaining('/probs/bad-request'),
       status: 400,
+    });
+  });
+
+  it('mappe QuotaExceededException sur /probs/quota-exceeded 403 (avant /probs/forbidden)', () => {
+    expect(mapException(new QuotaExceededException('max 10'))).toMatchObject({
+      type: expect.stringContaining('/probs/quota-exceeded'),
+      status: 403,
+    });
+  });
+
+  it('mappe une ForbiddenException ordinaire sur /probs/forbidden (pas quota-exceeded)', () => {
+    expect(mapException(new ForbiddenException())).toMatchObject({
+      type: expect.stringContaining('/probs/forbidden'),
+      status: 403,
     });
   });
 
@@ -116,7 +142,9 @@ describe('ProblemDetailsExceptionFilter', () => {
     filter.catch(new NotFoundException(), host);
 
     expect(typeof (res.body as { requestId: string }).requestId).toBe('string');
-    expect((res.body as { requestId: string }).requestId.length).toBeGreaterThan(0);
+    expect(
+      (res.body as { requestId: string }).requestId.length,
+    ).toBeGreaterThan(0);
     expect(res.headers['X-Request-Id']).toBeDefined();
   });
 });

@@ -15,6 +15,7 @@ import { randomUUID } from 'crypto';
 import { Request, Response } from 'express';
 import { ZodValidationException } from 'nestjs-zod';
 import { ZodIssue } from 'zod';
+import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 
 const TYPE_BASE = 'https://api.acervatim/probs';
 
@@ -36,13 +37,32 @@ interface Mapped {
 
 export function mapException(exception: unknown): Mapped {
   if (exception instanceof ZodValidationException) {
-    return { type: `${TYPE_BASE}/validation-error`, title: 'Invalid request payload', status: 400 };
+    return {
+      type: `${TYPE_BASE}/validation-error`,
+      title: 'Invalid request payload',
+      status: 400,
+    };
   }
   if (exception instanceof BadRequestException) {
-    return { type: `${TYPE_BASE}/bad-request`, title: 'Bad request', status: 400 };
+    return {
+      type: `${TYPE_BASE}/bad-request`,
+      title: 'Bad request',
+      status: 400,
+    };
   }
   if (exception instanceof UnauthorizedException) {
-    return { type: `${TYPE_BASE}/unauthorized`, title: 'Unauthorized', status: 401 };
+    return {
+      type: `${TYPE_BASE}/unauthorized`,
+      title: 'Unauthorized',
+      status: 401,
+    };
+  }
+  if (exception instanceof QuotaExceededException) {
+    return {
+      type: `${TYPE_BASE}/quota-exceeded`,
+      title: 'Quota exceeded',
+      status: 403,
+    };
   }
   if (exception instanceof ForbiddenException) {
     return { type: `${TYPE_BASE}/forbidden`, title: 'Forbidden', status: 403 };
@@ -69,10 +89,18 @@ export function mapException(exception: unknown): Mapped {
 
 function mapStatus(status: number): Mapped {
   if (status === HttpStatus.PAYLOAD_TOO_LARGE) {
-    return { type: `${TYPE_BASE}/payload-too-large`, title: 'Payload too large', status };
+    return {
+      type: `${TYPE_BASE}/payload-too-large`,
+      title: 'Payload too large',
+      status,
+    };
   }
   if (status === HttpStatus.TOO_MANY_REQUESTS) {
-    return { type: `${TYPE_BASE}/too-many-requests`, title: 'Too many requests', status };
+    return {
+      type: `${TYPE_BASE}/too-many-requests`,
+      title: 'Too many requests',
+      status,
+    };
   }
   return { type: `${TYPE_BASE}/http-error`, title: 'HTTP error', status };
 }
@@ -80,9 +108,18 @@ function mapStatus(status: number): Mapped {
 /** Reconnaît les erreurs Express body-parser : { status: 413, expose: true, ... }. */
 function getExposedStatus(exception: unknown): number | undefined {
   if (!exception || typeof exception !== 'object') return undefined;
-  const e = exception as { status?: unknown; statusCode?: unknown; expose?: unknown };
+  const e = exception as {
+    status?: unknown;
+    statusCode?: unknown;
+    expose?: unknown;
+  };
   if (e.expose !== true) return undefined;
-  const s = typeof e.status === 'number' ? e.status : typeof e.statusCode === 'number' ? e.statusCode : undefined;
+  const s =
+    typeof e.status === 'number'
+      ? e.status
+      : typeof e.statusCode === 'number'
+        ? e.statusCode
+        : undefined;
   return s && s >= 400 && s < 600 ? s : undefined;
 }
 
@@ -139,8 +176,12 @@ export class ProblemDetailsExceptionFilter implements ExceptionFilter {
     }
 
     if (mapped.status >= 500) {
-      const stack = exception instanceof Error ? exception.stack : String(exception);
-      this.logger.error(`[${requestId}] ${mapped.title}: ${body.detail}`, stack);
+      const stack =
+        exception instanceof Error ? exception.stack : String(exception);
+      this.logger.error(
+        `[${requestId}] ${mapped.title}: ${body.detail}`,
+        stack,
+      );
     }
 
     res.setHeader('Content-Type', 'application/problem+json');

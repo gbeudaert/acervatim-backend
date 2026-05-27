@@ -11,6 +11,7 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { QuotaService } from '../common/quota/quota.service';
 import { UsersService } from './users.service';
 
 @ApiTags('users')
@@ -18,11 +19,19 @@ import { UsersService } from './users.service';
 @Controller('me')
 @UseGuards(JwtAuthGuard)
 export class UsersController {
-  constructor(private readonly users: UsersService) {}
+  constructor(
+    private readonly users: UsersService,
+    private readonly quota: QuotaService,
+  ) {}
 
   @Get()
   async me(@CurrentUserId() userId: string) {
     return this.users.findById(userId);
+  }
+
+  @Get('quota')
+  async getQuota(@CurrentUserId() userId: string) {
+    return this.quota.getQuotaSummary(userId);
   }
 
   @Get('export')

@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import { CollectionsModule } from './collections/collections.module';
 import { AuditLogModule } from './common/audit/audit-log.module';
 import { CryptoModule } from './common/crypto/crypto.module';
+import { QuotaModule } from './common/quota/quota.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
@@ -21,6 +22,7 @@ import { UsersModule } from './users/users.module';
     }),
     CryptoModule,
     PrismaModule,
+    QuotaModule,
     AuditLogModule,
     AuthModule,
     UsersModule,

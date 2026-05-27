@@ -5,13 +5,17 @@ import {
 } from '@nestjs/common';
 import { Item, Prisma } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
+import { QuotaService } from '../common/quota/quota.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
 
 @Injectable()
 export class ItemsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly quota: QuotaService,
+  ) {}
 
   /** 404 si la collection n'existe pas OU appartient à un autre user (pas de leak). */
   private async assertCollectionOwned(
@@ -33,6 +37,7 @@ export class ItemsService {
     dto: CreateItemDto,
   ): Promise<Item> {
     await this.assertCollectionOwned(userId, collectionId);
+    await this.quota.assertCanCreateItem(userId);
     try {
       const [item] = await this.prisma.$transaction([
         this.prisma.item.create({

@@ -1,4 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { QuotaService } from '../common/quota/quota.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CollectionsService } from './collections.service';
 
@@ -27,7 +28,12 @@ function makePrismaMock(): PrismaMock {
 }
 
 function makeService(prisma: PrismaMock): CollectionsService {
-  return new CollectionsService(prisma as unknown as PrismaService);
+  const quota = {
+    assertCanCreateCollection: jest.fn().mockResolvedValue(undefined),
+    assertCanCreateItem: jest.fn().mockResolvedValue(undefined),
+    getQuotaSummary: jest.fn(),
+  } as unknown as QuotaService;
+  return new CollectionsService(prisma as unknown as PrismaService, quota);
 }
 
 const USER_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';

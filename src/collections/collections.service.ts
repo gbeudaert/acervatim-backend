@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { Collection } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
+import { QuotaService } from '../common/quota/quota.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCollectionDto } from './dto/create-collection.dto';
 import { ListCollectionsQueryDto } from './dto/list-collections.query';
@@ -12,9 +13,13 @@ import { UpdateCollectionDto } from './dto/update-collection.dto';
 
 @Injectable()
 export class CollectionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly quota: QuotaService,
+  ) {}
 
   async create(userId: string, dto: CreateCollectionDto): Promise<Collection> {
+    await this.quota.assertCanCreateCollection(userId);
     const type = await this.prisma.collectionType.findUnique({
       where: { code: dto.typeCode },
       select: { id: true },
