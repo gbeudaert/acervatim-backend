@@ -8,6 +8,7 @@ import { AuditLogModule } from './common/audit/audit-log.module';
 import { CryptoModule } from './common/crypto/crypto.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
+import { ItemsModule } from './items/items.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { UsersModule } from './users/users.module';
 
@@ -25,6 +26,7 @@ import { UsersModule } from './users/users.module';
     UsersModule,
     InvitationsModule,
     CollectionsModule,
+    ItemsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
