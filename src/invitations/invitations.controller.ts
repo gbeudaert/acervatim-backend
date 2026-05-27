@@ -7,6 +7,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminTokenGuard } from './admin-token.guard';
@@ -26,6 +27,7 @@ export class InvitationsController {
   @Post('admin/invitations')
   @UseGuards(AdminTokenGuard)
   @HttpCode(HttpStatus.CREATED)
+  @Throttle({ admin: { ttl: 60_000, limit: 5 } })
   async create(@Body() dto: CreateInvitationDto) {
     const { code, codeHash } = await this.invitations.create(dto);
     return { code, codeHash };

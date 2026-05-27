@@ -1,5 +1,6 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { GoogleLoginDto } from './dto/google-login.dto';
 
@@ -17,6 +18,7 @@ export class AuthController {
 
   @Post('google')
   @HttpCode(HttpStatus.OK)
+  @Throttle({ auth: { ttl: 60_000, limit: 10 } })
   async loginWithGoogle(@Body() dto: GoogleLoginDto) {
     return this.authService.loginWithProvider('google', dto);
   }

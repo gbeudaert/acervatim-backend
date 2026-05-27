@@ -1,6 +1,7 @@
 import { RequestMethod } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { json } from 'express';
 import { writeFileSync } from 'fs';
@@ -11,10 +12,27 @@ import { ProblemDetailsExceptionFilter } from './common/filters/problem-details.
 import { CorrelationIdInterceptor } from './common/interceptors/correlation-id.interceptor';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  const config = app.get(ConfigService);
+
+  // Trust the first proxy hop (NAS Synology reverse proxy) so req.ip reflects
+  // the real client IP — required for ThrottlerGuard to bucket per-user, not per-proxy.
+  app.set('trust proxy', 1);
 
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(json({ limit: '256kb' }));
+
+  const corsOrigins = (config.get<string>('CORS_ORIGINS') ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  app.enableCors({
+    origin: corsOrigins.length > 0 ? corsOrigins : false,
+    credentials: false,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-Id'],
+    maxAge: 600,
+  });
 
   app.setGlobalPrefix('v1', {
     exclude: [
@@ -39,7 +57,6 @@ async function bootstrap() {
     SwaggerModule.setup('docs', app, document);
   }
 
-  const config = app.get(ConfigService);
   const port = config.get<number>('PORT', 3000);
 
   await app.listen(port);

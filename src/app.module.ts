@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
@@ -20,6 +22,16 @@ import { UsersModule } from './users/users.module';
       cache: true,
       validate: validateEnv,
     }),
+    ThrottlerModule.forRoot({
+      throttlers: [
+        { name: 'default', ttl: 60_000, limit: 100 },
+        { name: 'auth', ttl: 60_000, limit: 10 },
+        { name: 'admin', ttl: 60_000, limit: 5 },
+      ],
+      // Désactivé en NODE_ENV=test : les e2e logent ~10x depuis 127.0.0.1
+      // et exploseraient le bucket auth.
+      skipIf: () => process.env.NODE_ENV === 'test',
+    }),
     CryptoModule,
     PrismaModule,
     QuotaModule,
@@ -31,6 +43,6 @@ import { UsersModule } from './users/users.module';
     ItemsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule {}
