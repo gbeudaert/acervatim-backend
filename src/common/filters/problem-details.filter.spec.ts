@@ -8,6 +8,7 @@ import { ZodValidationException } from 'nestjs-zod';
 import { z, ZodError } from 'zod';
 import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
+import { PaymentRequiredException } from '../../premium/payment-required.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 import {
   mapException,
@@ -76,6 +77,13 @@ describe('mapException', () => {
   it('mappe QuotaExceededException sur /probs/quota-exceeded 402 (Payment Required)', () => {
     expect(mapException(new QuotaExceededException('max 10'))).toMatchObject({
       type: expect.stringContaining('/probs/quota-exceeded'),
+      status: 402,
+    });
+  });
+
+  it('mappe PaymentRequiredException sur /probs/payment-required 402 (distinct de quota-exceeded)', () => {
+    expect(mapException(new PaymentRequiredException())).toMatchObject({
+      type: expect.stringContaining('/probs/payment-required'),
       status: 402,
     });
   });

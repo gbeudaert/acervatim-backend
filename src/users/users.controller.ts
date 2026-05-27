@@ -12,6 +12,7 @@ import { Response } from 'express';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { QuotaService } from '../common/quota/quota.service';
+import { PremiumService } from '../premium/premium.service';
 import { UsersService } from './users.service';
 
 @ApiTags('users')
@@ -22,11 +23,16 @@ export class UsersController {
   constructor(
     private readonly users: UsersService,
     private readonly quota: QuotaService,
+    private readonly premium: PremiumService,
   ) {}
 
   @Get()
   async me(@CurrentUserId() userId: string) {
-    return this.users.findById(userId);
+    const [me, premium] = await Promise.all([
+      this.users.findById(userId),
+      this.premium.getStatus(userId),
+    ]);
+    return { ...me, premium };
   }
 
   @Get('quota')

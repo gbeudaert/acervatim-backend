@@ -18,6 +18,7 @@ import { ZodValidationException } from 'nestjs-zod';
 import { ZodIssue } from 'zod';
 import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
+import { PaymentRequiredException } from '../../premium/payment-required.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 
 const TYPE_BASE = 'https://api.acervatim/probs';
@@ -64,6 +65,13 @@ export function mapException(exception: unknown): Mapped {
     return {
       type: `${TYPE_BASE}/quota-exceeded`,
       title: 'Quota exceeded',
+      status: 402,
+    };
+  }
+  if (exception instanceof PaymentRequiredException) {
+    return {
+      type: `${TYPE_BASE}/payment-required`,
+      title: 'Payment required',
       status: 402,
     };
   }

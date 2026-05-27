@@ -80,6 +80,11 @@ describe('Users (e2e) — /v1/me, /v1/me/export, /v1/me delete', () => {
         .expect(200);
       expect(me.body.userId).toBe(userId);
       expect(typeof me.body.createdAt).toBe('string');
+      expect(me.body.premium).toEqual({
+        isPremium: false,
+        source: 'none',
+        expiresAt: null,
+      });
 
       // GET /v1/me/export
       const exp = await request(app.getHttpServer())
