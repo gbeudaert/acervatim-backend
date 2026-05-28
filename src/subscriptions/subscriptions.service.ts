@@ -152,21 +152,13 @@ export class SubscriptionsService {
       return { outcome: 'pending_verify' };
     }
 
-    const snapshot = await this.googlePlay.getSubscription(notif.purchaseToken);
-    if (!snapshot) {
+    const status = await this.refreshFromGoogle(
+      existing.userId,
+      notif.purchaseToken,
+    );
+    if (status === null) {
       throw new NotFoundException('subscription not found on Google Play');
     }
-    const status = mapGoogleState(snapshot.state);
-
-    await this.prisma.subscription.update({
-      where: { userId: existing.userId },
-      data: {
-        status,
-        expiresAt: BigInt(snapshot.expiresAt),
-        autoRenew: snapshot.autoRenew,
-        lastVerifiedAt: new Date(),
-      },
-    });
 
     await this.auditLog.record({
       userId: existing.userId,
@@ -184,5 +176,30 @@ export class SubscriptionsService {
     );
 
     return { outcome: 'updated' };
+  }
+
+  /**
+   * Re-query Google pour un sub existant et update la row (status, expiresAt,
+   * autoRenew, lastVerifiedAt). Source de vérité = Google. Retourne le status
+   * mappé, ou null si Google ne reconnaît plus le token. Partagé entre le
+   * webhook RTDN et le cron de re-vérification.
+   */
+  async refreshFromGoogle(
+    userId: string,
+    purchaseToken: string,
+  ): Promise<SubscriptionStatus | null> {
+    const snapshot = await this.googlePlay.getSubscription(purchaseToken);
+    if (!snapshot) return null;
+    const status = mapGoogleState(snapshot.state);
+    await this.prisma.subscription.update({
+      where: { userId },
+      data: {
+        status,
+        expiresAt: BigInt(snapshot.expiresAt),
+        autoRenew: snapshot.autoRenew,
+        lastVerifiedAt: new Date(),
+      },
+    });
+    return status;
   }
 }
