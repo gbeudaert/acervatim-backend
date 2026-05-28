@@ -6,7 +6,10 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleAuth } from 'google-auth-library';
-import { google, androidpublisher_v3 } from 'googleapis';
+import {
+  androidpublisher,
+  androidpublisher_v3,
+} from '@googleapis/androidpublisher';
 
 /**
  * État courant d'un abonnement vu côté Google Play, projeté sur ce dont on a
@@ -49,7 +52,7 @@ export class GooglePlayService implements OnModuleInit {
         credentials,
         scopes: ['https://www.googleapis.com/auth/androidpublisher'],
       });
-      this.publisher = google.androidpublisher({ version: 'v3', auth });
+      this.publisher = androidpublisher({ version: 'v3', auth });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.error(`Google Play SA JSON parse failed: ${msg}`);
