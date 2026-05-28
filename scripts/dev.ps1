@@ -45,6 +45,10 @@ Prisma :
   generate           Régénère le client Prisma
   studio             Lance Prisma Studio dans le conteneur (port 5555)
 
+Scripts :
+  grant-premium <args...>  CLI premium grants (add/revoke/list)
+                           ex: ./scripts/dev.ps1 grant-premium add <userId> --reason comp
+
 Passe-plats (exécutés dans app) :
   npm <args...>      ex: ./scripts/dev.ps1 npm install zod
   npx <args...>      ex: ./scripts/dev.ps1 npx prisma db pull
@@ -105,6 +109,7 @@ switch ($Command) {
         Write-Warning 'Studio écoute sur 5555 dans le conteneur. Ajouter "5555:5555" aux ports de app dans docker-compose.yml pour y accéder depuis Windows.'
         Invoke-Compose exec app npx prisma studio
     }
+    'grant-premium'  { Invoke-Compose exec app npx ts-node --transpile-only scripts/grant-premium.ts @Rest }
     'npm'            { Invoke-Compose exec app npm @Rest }
     'npx'            { Invoke-Compose exec app npx @Rest }
     'exec'           { Invoke-Compose exec app @Rest }
