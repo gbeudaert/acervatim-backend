@@ -123,6 +123,7 @@ describe('CollectionsService.findOne', () => {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       type: 'vinyl',
+      hierarchy: [], // type plat
     });
   });
 

@@ -34,7 +34,7 @@ const RATE_LIMIT_CAPACITY = 60;
 const RATE_LIMIT_REFILL_PER_SEC = 1;
 
 const MAL_MANGA_FIELDS =
-  'id,title,main_picture,start_date,synopsis,authors{first_name,last_name},mean,media_type,status';
+  'id,title,main_picture,start_date,synopsis,authors{first_name,last_name},mean,media_type,status,num_volumes';
 
 interface PendingState {
   userId: string;
@@ -66,6 +66,7 @@ interface MalMangaNode {
   mean?: number;
   media_type?: string;
   status?: string;
+  num_volumes?: number;
 }
 
 @Injectable()
@@ -263,6 +264,7 @@ export class MalAdapter
         mean: node.mean,
         media_type: node.media_type,
         status: node.status,
+        num_volumes: node.num_volumes,
       },
       rawData: node,
     };

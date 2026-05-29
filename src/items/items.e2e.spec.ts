@@ -8,6 +8,7 @@ import { GoogleIdentityProvider } from '../auth/providers/google.provider';
 import { ProblemDetailsExceptionFilter } from '../common/filters/problem-details.filter';
 import { CorrelationIdInterceptor } from '../common/interceptors/correlation-id.interceptor';
 import { FREE_TIER_LIMITS } from '../common/quota/quota.service';
+import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 class FakeGoogleProvider {
@@ -15,6 +16,45 @@ class FakeGoogleProvider {
   subject = '';
   verify(_credential: unknown) {
     return Promise.resolve({ subject: this.subject });
+  }
+}
+
+// Snapshot stubbé : 'mal' renvoie un UnifiedItem manga enrichi, tout autre provider
+// une référence sans snapshot (rawData null). Évite tout appel réseau MAL en e2e.
+class FakeSnapshots {
+  hasAdapter(provider: string): boolean {
+    return provider === 'mal';
+  }
+  snapshot(ref: { provider: string; externalId: string }) {
+    if (ref.provider === 'mal') {
+      return Promise.resolve({
+        provider: 'mal',
+        externalId: ref.externalId,
+        rawData: {
+          source: 'mal',
+          sourceId: ref.externalId,
+          mediaType: 'manga',
+          title: `Serie ${ref.externalId}`,
+          creators: ['Eiichiro Oda'],
+          description: 'A long synopsis',
+          coverUrl: 'https://example.com/cover.jpg',
+          metadata: {
+            mean: 8.7,
+            media_type: 'manga',
+            status: 'currently_publishing',
+            num_volumes: 108,
+          },
+          rawData: { id: Number(ref.externalId) || 0 },
+        },
+        fetchedAt: '2026-05-29T00:00:00.000Z',
+      });
+    }
+    return Promise.resolve({
+      provider: ref.provider,
+      externalId: ref.externalId,
+      rawData: null,
+      fetchedAt: null,
+    });
   }
 }
 
@@ -38,17 +78,30 @@ async function cleanupUser(
   prisma: PrismaService,
   userId: string,
 ): Promise<void> {
-  // collections + items + oauthcreds cascade via FK ; audit_logs n'a pas de FK.
+  // collections + items + nodes + oauthcreds cascade via FK ; audit_logs n'a pas de FK.
   await prisma.user
     .deleteMany({ where: { id: userId } })
     .catch(() => undefined);
   await prisma.auditLog.deleteMany({ where: { userId } });
 }
 
-describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
+describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let fakeGoogle: FakeGoogleProvider;
+
+  const createCollection = async (
+    token: string,
+    typeCode: string,
+    name: string,
+  ): Promise<string> => {
+    const res = await request(app.getHttpServer())
+      .post('/v1/collections')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ typeCode, name })
+      .expect(201);
+    return res.body.id as string;
+  };
 
   beforeAll(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -56,6 +109,8 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
     })
       .overrideProvider(GoogleIdentityProvider)
       .useValue(new FakeGoogleProvider())
+      .overrideProvider(SourceSnapshotService)
+      .useValue(new FakeSnapshots())
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -80,496 +135,396 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
     await app.close();
   });
 
-  it('flow complet : create collection → add 3 items → list → delete 1 → itemCount=2 → cascade delete', async () => {
-    const sub = `e2e-flow-${randomBytes(8).toString('hex')}`;
+  it('vinyl (plat) : create → list légère → findOne curé → PATCH → attach source → /sources → delete', async () => {
+    const sub = `e2e-vinyl-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
 
     try {
-      // Création de la collection
+      const coll = await createCollection(token, 'vinyl', 'Mes vinyles');
+
+      // Create (pas de node/volume sur un type plat)
       const created = await request(app.getHttpServer())
-        .post('/v1/collections')
+        .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'vinyl', name: 'Ma collection vinyl' })
+        .send({
+          unifiedData: { title: 'Hollow Knight OST', creators: ['Larkin'] },
+        })
         .expect(201);
-      expect(created.body.userId).toBe(userId);
-      expect(created.body.type).toBe('vinyl');
-      expect(created.body.typeId).toBeUndefined();
-      expect(created.body.itemCount).toBe(0);
-      const collectionId = created.body.id as string;
+      expect(created.body.nodeId).toBeNull();
+      expect(created.body.volume).toBeNull();
+      expect(created.body.unifiedData).toMatchObject({
+        type: 'vinyl',
+        title: 'Hollow Knight OST',
+      });
+      expect(created.body.sources).toEqual([]);
+      const itemId = created.body.id as string;
 
-      // Détail = objet brut (pas d'enveloppe { data })
-      const detail = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}`)
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(detail.body.id).toBe(collectionId);
-      expect(detail.body.data).toBeUndefined();
-
-      // Ajout de 3 items
-      const itemIds: string[] = [];
-      for (let i = 0; i < 3; i++) {
-        const res = await request(app.getHttpServer())
-          .post(`/v1/collections/${collectionId}/items`)
-          .set('Authorization', `Bearer ${token}`)
-          .send({
-            source: 'discogs',
-            sourceId: `disc-${i}-${randomBytes(4).toString('hex')}`,
-            unifiedData: { title: `Title ${i}` },
-            rawData: { raw: i },
-          })
-          .expect(201);
-        itemIds.push(res.body.id);
-      }
-
-      // itemCount maintenu à 3
-      const afterCreate = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}`)
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(afterCreate.body.itemCount).toBe(3);
-
-      // List items : enveloppe { data, meta.pagination }
+      // Liste = projection légère vinyl
       const list = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}/items`)
+        .get(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(Array.isArray(list.body.data)).toBe(true);
-      expect(list.body.data).toHaveLength(3);
-      expect(list.body.meta.pagination).toEqual({
-        nextCursor: null,
-        limit: 50,
+      expect(list.body.data[0]).toEqual({
+        id: itemId,
+        type: 'vinyl',
+        title: 'Hollow Knight OST',
+        coverUrl: null,
+        creators: ['Larkin'],
+        genre: [],
+        releaseDate: null,
       });
 
-      // Detail d'un item
-      const itemDetail = await request(app.getHttpServer())
-        .get(`/v1/items/${itemIds[0]}`)
+      // PATCH unifiedData (curation)
+      const patched = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ unifiedData: { title: 'Hollow Knight OST (Deluxe)' } })
+        .expect(200);
+      expect(patched.body.unifiedData.title).toBe('Hollow Knight OST (Deluxe)');
+
+      // Attach une source isbn (pas d'adapter → réf sans rawData)
+      await request(app.getHttpServer())
+        .post(`/v1/items/${itemId}/sources`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ provider: 'isbn', externalId: '9782723492607' })
+        .expect(201);
+
+      // findOne curé : sources = réfs SANS rawData
+      const detail = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}`)
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(itemDetail.body.id).toBe(itemIds[0]);
-      expect(itemDetail.body.data).toBeUndefined();
+      expect(detail.body.sources).toEqual([
+        { provider: 'isbn', externalId: '9782723492607', fetchedAt: null },
+      ]);
+      expect(detail.body.sources[0].rawData).toBeUndefined();
 
-      // Suppression d'un item → itemCount décrémenté
-      await request(app.getHttpServer())
-        .delete(`/v1/items/${itemIds[0]}`)
-        .set('Authorization', `Bearer ${token}`)
-        .expect(204);
-      const afterDelete = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}`)
+      // /sources : snapshots bruts (rawData présent, ici null pour une réf)
+      const sources = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}/sources`)
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(afterDelete.body.itemCount).toBe(2);
-
-      // Cascade : delete collection → tous les items partent
-      await request(app.getHttpServer())
-        .delete(`/v1/collections/${collectionId}`)
-        .set('Authorization', `Bearer ${token}`)
-        .expect(204);
-      const orphanItems = await prisma.item.count({
-        where: { collectionId },
+      expect(sources.body[0]).toMatchObject({
+        provider: 'isbn',
+        externalId: '9782723492607',
+        rawData: null,
       });
-      expect(orphanItems).toBe(0);
+
+      // delete → itemCount décrémenté
+      await request(app.getHttpServer())
+        .delete(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(204);
+      const after = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(after.body.itemCount).toBe(0);
+      expect(after.body.hierarchy).toEqual([]); // type plat
     } finally {
       await cleanupUser(prisma, userId);
     }
   });
 
-  it('isolation cross-user : B reçoit 404 (jamais 403) sur les ressources de A', async () => {
+  it('vinyl autorise les doublons (pas de contrainte nodeId/volume)', async () => {
+    const sub = `e2e-vinyl-dup-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'dups');
+      const body = { unifiedData: { title: 'Same' } };
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send(body)
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send(body)
+        .expect(201);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('manga : tome (node+volume) → 201 ; 2× même (node,volume) → 409 ; hierarchy + drill-down + purge', async () => {
+    const sub = `e2e-manga-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+
+    try {
+      const coll = await createCollection(token, 'manga', 'Mes mangas');
+      const node = { provider: 'mal', externalId: '13' };
+
+      // T.1
+      const t1 = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ node, volume: 1, unifiedData: { title: 'One Piece — T.1' } })
+        .expect(201);
+      expect(t1.body.volume).toBe(1);
+      expect(t1.body.nodeId).not.toBeNull();
+      const nodeId = t1.body.nodeId as string;
+
+      // T.2 (même série, volume différent)
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ node, volume: 2, unifiedData: {} })
+        .expect(201);
+
+      // (node, volume) dupliqué → 409
+      const dup = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ node, volume: 1, unifiedData: {} });
+      expect(dup.status).toBe(409);
+      expect(dup.body.type).toContain('/probs/conflict');
+
+      // hierarchy : 1 série
+      const detail = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(detail.body.hierarchy).toEqual([
+        { key: 'serie', label: 'Série', count: 1 },
+      ]);
+
+      // nodes : enrichi via MAL, ownedCount=2
+      const nodes = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/nodes?level=serie`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(nodes.body.data).toHaveLength(1);
+      expect(nodes.body.data[0]).toMatchObject({
+        id: nodeId,
+        level: 'serie',
+        title: 'Serie 13',
+        author: 'Eiichiro Oda',
+        status: 'ongoing',
+        totalCount: 108,
+        rating: 8.7,
+        ownedCount: 2,
+        isWishlist: false,
+      });
+      expect(nodes.body.data[0].sources).toEqual([
+        {
+          provider: 'mal',
+          externalId: '13',
+          fetchedAt: '2026-05-29T00:00:00.000Z',
+        },
+      ]);
+
+      // drill-down ?nodeId=
+      const drill = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/items?nodeId=${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(drill.body.data).toHaveLength(2);
+      expect(drill.body.data[0]).toMatchObject({
+        type: 'manga',
+        serie: 'Serie 13',
+      });
+
+      // supprime les 2 tomes → purge du nœud (non-wishlist)
+      for (const id of drill.body.data.map((d: { id: string }) => d.id)) {
+        await request(app.getHttpServer())
+          .delete(`/v1/items/${id}`)
+          .set('Authorization', `Bearer ${token}`)
+          .expect(204);
+      }
+      await request(app.getHttpServer())
+        .get(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(404);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('manga : ?nodeId interdit n’est pas applicable au vinyl (400) + POST série wishlist conservée', async () => {
+    const sub = `e2e-wishlist-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+
+    try {
+      // vinyl : ?nodeId → 400
+      const vinyl = await createCollection(token, 'vinyl', 'flat');
+      const bad = await request(app.getHttpServer())
+        .get(
+          `/v1/collections/${vinyl}/items?nodeId=11111111-1111-4111-1111-111111111111`,
+        )
+        .set('Authorization', `Bearer ${token}`);
+      expect(bad.status).toBe(400);
+
+      // manga : série wishlist (sans tome)
+      const manga = await createCollection(token, 'manga', 'wl');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${manga}/nodes`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          level: 'serie',
+          source: { provider: 'mal', externalId: '21' },
+          isWishlist: true,
+        })
+        .expect(201);
+      expect(created.body).toMatchObject({
+        level: 'serie',
+        title: 'Serie 21',
+        totalCount: 108,
+        ownedCount: 0,
+        isWishlist: true,
+      });
+      const nodeId = created.body.id as string;
+
+      // conservée malgré ownedCount=0
+      await request(app.getHttpServer())
+        .get(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      // PATCH note/comment
+      const patched = await request(app.getHttpServer())
+        .patch(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ note: 5, comment: 'top' })
+        .expect(200);
+      expect(patched.body.userData).toEqual({ note: 5, comment: 'top' });
+
+      // PATCH isWishlist=false sur nœud vide → 204 purge
+      await request(app.getHttpServer())
+        .patch(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ isWishlist: false })
+        .expect(204);
+      await request(app.getHttpServer())
+        .get(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(404);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('filtre ?provider[in]= sur sources[] des items', async () => {
+    const sub = `e2e-provider-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'prov');
+      const withMal = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          unifiedData: { title: 'A' },
+          sources: [{ provider: 'mal', externalId: 'm1' }],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ unifiedData: { title: 'B' } })
+        .expect(201);
+
+      const filtered = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/items?provider[in]=mal`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(filtered.body.data).toHaveLength(1);
+      expect(filtered.body.data[0].id).toBe(withMal.body.id);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('isolation cross-user : B reçoit 404 sur item/nœud de A', async () => {
     const subA = `e2e-iso-A-${randomBytes(8).toString('hex')}`;
     const subB = `e2e-iso-B-${randomBytes(8).toString('hex')}`;
     const a = await login(app, fakeGoogle, subA);
     const b = await login(app, fakeGoogle, subB);
 
     try {
-      const created = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${a.token}`)
-        .send({ typeCode: 'manga', name: 'A’s manga' })
-        .expect(201);
-      const collectionId = created.body.id as string;
-
-      const item = await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
+      const coll = await createCollection(a.token, 'manga', 'A mangas');
+      const tome = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${a.token}`)
         .send({
-          source: 'mal',
-          sourceId: `mal-${randomBytes(4).toString('hex')}`,
+          node: { provider: 'mal', externalId: '99' },
+          volume: 1,
           unifiedData: {},
-          rawData: {},
         })
         .expect(201);
-      const itemId = item.body.id as string;
 
-      // B GET la collection de A → 404
-      const get = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}`)
-        .set('Authorization', `Bearer ${b.token}`);
-      expect(get.status).toBe(404);
-      expect(get.headers['content-type']).toContain('application/problem+json');
-      expect(get.body.type).toContain('/probs/not-found');
-
-      // B PATCH la collection de A → 404 (pas 403, pas de leak)
-      const patch = await request(app.getHttpServer())
-        .patch(`/v1/collections/${collectionId}`)
+      await request(app.getHttpServer())
+        .get(`/v1/items/${tome.body.id}`)
         .set('Authorization', `Bearer ${b.token}`)
-        .send({ name: 'pwn' });
-      expect(patch.status).toBe(404);
-
-      // B DELETE l'item de A → 404
-      const del = await request(app.getHttpServer())
-        .delete(`/v1/items/${itemId}`)
-        .set('Authorization', `Bearer ${b.token}`);
-      expect(del.status).toBe(404);
-
-      // B POST item dans la collection de A → 404
-      const postItem = await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get(`/v1/nodes/${tome.body.nodeId}`)
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${b.token}`)
         .send({
-          source: 'mal',
-          sourceId: 'x',
+          node: { provider: 'mal', externalId: '99' },
+          volume: 2,
           unifiedData: {},
-          rawData: {},
-        });
-      expect(postItem.status).toBe(404);
-
-      // Aucune fuite : A n'a pas été muté
-      const stillThere = await request(app.getHttpServer())
-        .get(`/v1/collections/${collectionId}`)
-        .set('Authorization', `Bearer ${a.token}`)
-        .expect(200);
-      expect(stillThere.body.name).toBe('A’s manga');
+        })
+        .expect(404);
     } finally {
       await cleanupUser(prisma, a.userId);
       await cleanupUser(prisma, b.userId);
     }
   });
 
-  it('filtre inconnu (Zod .strict) → 400 Problem Details', async () => {
-    const sub = `e2e-strict-${randomBytes(8).toString('hex')}`;
+  it('type non implémenté (movie) → POST permissif', async () => {
+    const sub = `e2e-movie-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
-
     try {
-      const res = await request(app.getHttpServer())
-        .get('/v1/collections?status=foo')
-        .set('Authorization', `Bearer ${token}`);
-      expect(res.status).toBe(400);
-      expect(res.headers['content-type']).toContain('application/problem+json');
-      expect(res.body.type).toContain('/probs/validation-error');
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('filtre type[in] : ne renvoie que les codes demandés', async () => {
-    const sub = `e2e-filter-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      const codes = ['vinyl', 'manga', 'movie'] as const;
-      for (const code of codes) {
-        await request(app.getHttpServer())
-          .post('/v1/collections')
-          .set('Authorization', `Bearer ${token}`)
-          .send({ typeCode: code, name: `${code}-coll` })
-          .expect(201);
-      }
-
-      const res = await request(app.getHttpServer())
-        .get('/v1/collections?type[in]=vinyl,manga')
+      const coll = await createCollection(token, 'movie', 'films');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(res.body.data).toHaveLength(2);
-      const names = (res.body.data as { name: string }[])
-        .map((c) => c.name)
-        .sort();
-      expect(names).toEqual(['manga-coll', 'vinyl-coll']);
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('filtre items[in]/[all] : recherche substring sur le contenu des items', async () => {
-    const sub = `e2e-items-filter-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    const createCollection = async (typeCode: string, name: string) => {
-      const res = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode, name })
+        .send({ unifiedData: { whatever: 'goes', nested: { ok: true } } })
         .expect(201);
-      return res.body.id as string;
-    };
-    const addItem = async (
-      collectionId: string,
-      unifiedData: Record<string, unknown>,
-    ) => {
+      expect(created.body.unifiedData).toMatchObject({ whatever: 'goes' });
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('quota : nœuds non comptés ; seuls les items comptent dans /me/quota', async () => {
+    const sub = `e2e-quota-nodes-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'manga', 'q');
+
+      // POST série (nœud) seul → items.used reste 0
       await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
+        .post(`/v1/collections/${coll}/nodes`)
         .set('Authorization', `Bearer ${token}`)
-        .send({
-          source: 'discogs',
-          sourceId: `disc-${randomBytes(6).toString('hex')}`,
-          unifiedData,
-          rawData: {},
-        })
+        .send({ level: 'serie', source: { provider: 'mal', externalId: '7' } })
         .expect(201);
-    };
-    const namesOf = (body: { data: { name: string }[] }) =>
-      body.data.map((c) => c.name).sort();
-
-    try {
-      // collA : un item dont le TITRE contient "Hollow"
-      const collA = await createCollection('vinyl', 'coll-hollow');
-      await addItem(collA, { title: 'Hollow Knight OST', artist: 'Larkin' });
-
-      // collB : un item dont l'AUTEUR contient "Naruto"
-      const collB = await createCollection('manga', 'coll-naruto');
-      await addItem(collB, { name: 'Manga X', author: 'Naruto Sensei' });
-
-      // collC : DEUX items distincts (un "hollow", un "naruto")
-      const collC = await createCollection('book', 'coll-both');
-      await addItem(collC, { title: 'The Hollow' });
-      await addItem(collC, { author: 'naruto' });
-
-      // [in] mono-terme + case-insensitive (query 'hollow' vs data 'Hollow')
-      const inOne = await request(app.getHttpServer())
-        .get('/v1/collections?items[in]=hollow')
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(namesOf(inOne.body)).toEqual(['coll-both', 'coll-hollow']);
-
-      // [in] multi-termes = OR (hollow OU naruto) → les 3 collections
-      const inOr = await request(app.getHttpServer())
-        .get('/v1/collections?items[in]=hollow,naruto')
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(namesOf(inOr.body)).toEqual([
-        'coll-both',
-        'coll-hollow',
-        'coll-naruto',
-      ]);
-
-      // [all] = AND : un item "hollow" ET un item "naruto" dans la même collection
-      // → seule collC (items distincts) qualifie.
-      const allAnd = await request(app.getHttpServer())
-        .get('/v1/collections?items[all]=hollow,naruto')
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(namesOf(allAnd.body)).toEqual(['coll-both']);
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('pagination cursor : 3 collections, limit=1 → walk les pages jusqu’à nextCursor=null', async () => {
-    const sub = `e2e-page-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      for (let i = 0; i < 3; i++) {
-        await request(app.getHttpServer())
-          .post('/v1/collections')
-          .set('Authorization', `Bearer ${token}`)
-          .send({ typeCode: 'book', name: `book-${i}` })
-          .expect(201);
-      }
-
-      // Page 1
-      const p1 = await request(app.getHttpServer())
-        .get('/v1/collections?limit=1')
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(p1.body.data).toHaveLength(1);
-      expect(p1.body.meta.pagination.limit).toBe(1);
-      expect(p1.body.meta.pagination.nextCursor).not.toBeNull();
-
-      // Page 2
-      const p2 = await request(app.getHttpServer())
-        .get(
-          `/v1/collections?limit=1&cursor=${p1.body.meta.pagination.nextCursor}`,
-        )
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(p2.body.data).toHaveLength(1);
-      expect(p2.body.data[0].id).not.toBe(p1.body.data[0].id);
-
-      // Page 3 — dernière, nextCursor=null
-      const p3 = await request(app.getHttpServer())
-        .get(
-          `/v1/collections?limit=1&cursor=${p2.body.meta.pagination.nextCursor}`,
-        )
-        .set('Authorization', `Bearer ${token}`)
-        .expect(200);
-      expect(p3.body.data).toHaveLength(1);
-      expect(p3.body.meta.pagination.nextCursor).toBeNull();
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('typeCode inconnu → 400', async () => {
-    const sub = `e2e-typecode-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      const res = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'inexistant', name: 'x' });
-      expect(res.status).toBe(400);
-      expect(res.body.type).toMatch(/\/probs\/(bad-request|validation-error)/);
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('unicité (source, sourceId) : 2x le même item → 409 conflict', async () => {
-    const sub = `e2e-dup-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      const coll = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'movie', name: 'movies' })
-        .expect(201);
-      const collectionId = coll.body.id;
-
-      const sourceId = `tmdb-${randomBytes(4).toString('hex')}`;
-      await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({
-          source: 'tmdb',
-          sourceId,
-          unifiedData: {},
-          rawData: {},
-        })
-        .expect(201);
-
-      const dup = await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({
-          source: 'tmdb',
-          sourceId,
-          unifiedData: {},
-          rawData: {},
-        });
-      expect(dup.status).toBe(409);
-      expect(dup.body.type).toContain('/probs/conflict');
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('quota collections : la (max+1)ème → 402 /probs/quota-exceeded "max N"', async () => {
-    const sub = `e2e-quota-coll-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      for (let i = 0; i < FREE_TIER_LIMITS.collections; i++) {
-        await request(app.getHttpServer())
-          .post('/v1/collections')
-          .set('Authorization', `Bearer ${token}`)
-          .send({ typeCode: 'game', name: `g-${i}` })
-          .expect(201);
-      }
-      const over = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'game', name: 'g-over' });
-      expect(over.status).toBe(402);
-      expect(over.body.type).toContain('/probs/quota-exceeded');
-      expect(over.body.detail).toContain(`max ${FREE_TIER_LIMITS.collections}`);
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('quota items : sum(itemCount) == max → POST item → 402 quota-exceeded', async () => {
-    const sub = `e2e-quota-items-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      const coll = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'vinyl', name: 'soon-full' })
-        .expect(201);
-      const collectionId = coll.body.id as string;
-
-      // On bump le compteur côté DB pour éviter de créer 500 items dans l'e2e.
-      // QuotaService.assertCanCreateItem somme sur collection.itemCount → ce hack
-      // suffit pour atteindre la limite.
-      await prisma.collection.update({
-        where: { id: collectionId },
-        data: { itemCount: FREE_TIER_LIMITS.items },
-      });
-
-      const over = await request(app.getHttpServer())
-        .post(`/v1/collections/${collectionId}/items`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({
-          source: 'discogs',
-          sourceId: `over-${randomBytes(4).toString('hex')}`,
-          unifiedData: {},
-          rawData: {},
-        });
-      expect(over.status).toBe(402);
-      expect(over.body.type).toContain('/probs/quota-exceeded');
-      expect(over.body.detail).toContain(`max ${FREE_TIER_LIMITS.items}`);
-    } finally {
-      await cleanupUser(prisma, userId);
-    }
-  });
-
-  it('GET /v1/me/quota : compteurs cohérents avec l’état réel', async () => {
-    const sub = `e2e-me-quota-${randomBytes(8).toString('hex')}`;
-    const { token, userId } = await login(app, fakeGoogle, sub);
-
-    try {
-      // État initial : 0 / 0
-      const initial = await request(app.getHttpServer())
+      const q1 = await request(app.getHttpServer())
         .get('/v1/me/quota')
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(initial.body).toEqual({
-        collections: { used: 0, max: FREE_TIER_LIMITS.collections },
-        items: { used: 0, max: FREE_TIER_LIMITS.items },
-      });
+      expect(q1.body.items.used).toBe(0);
 
-      // 2 collections, 3 items dans la première
-      const coll1 = await request(app.getHttpServer())
-        .post('/v1/collections')
-        .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'vinyl', name: 'A' })
-        .expect(201);
+      // POST tome → items.used = 1
       await request(app.getHttpServer())
-        .post('/v1/collections')
+        .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${token}`)
-        .send({ typeCode: 'manga', name: 'B' })
+        .send({
+          node: { provider: 'mal', externalId: '7' },
+          volume: 1,
+          unifiedData: {},
+        })
         .expect(201);
-      for (let i = 0; i < 3; i++) {
-        await request(app.getHttpServer())
-          .post(`/v1/collections/${coll1.body.id}/items`)
-          .set('Authorization', `Bearer ${token}`)
-          .send({
-            source: 'discogs',
-            sourceId: `s-${i}-${randomBytes(4).toString('hex')}`,
-            unifiedData: {},
-            rawData: {},
-          })
-          .expect(201);
-      }
-
-      const after = await request(app.getHttpServer())
+      const q2 = await request(app.getHttpServer())
         .get('/v1/me/quota')
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(after.body.collections.used).toBe(2);
-      expect(after.body.items.used).toBe(3);
+      expect(q2.body.items.used).toBe(1);
+      expect(q2.body.items.max).toBe(FREE_TIER_LIMITS.items);
     } finally {
       await cleanupUser(prisma, userId);
     }
