@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { filterAll, filterIn, parseFilters } from './parse-filters';
+import {
+  filterAll,
+  filterIn,
+  parseFilters,
+  searchFilter,
+} from './parse-filters';
 
 describe('filterIn', () => {
   const schema = filterIn(['vinyl', 'manga', 'movie']);
@@ -52,6 +57,44 @@ describe('filterAll', () => {
 
   it('rejette une clé { in } pour un filterAll', () => {
     expect(() => schema.parse({ in: 'jazz' })).toThrow();
+  });
+});
+
+describe('searchFilter', () => {
+  const schema = searchFilter();
+
+  it('parse [in] (CSV → string[], texte libre, pas de whitelist)', () => {
+    expect(schema.parse({ in: 'holow,naruto' })).toEqual({
+      in: ['holow', 'naruto'],
+    });
+  });
+
+  it('parse [all] et accepte n’importe quel texte', () => {
+    expect(schema.parse({ all: 'one piece' })).toEqual({ all: ['one piece'] });
+  });
+
+  it('accepte [in] et [all] simultanément', () => {
+    expect(schema.parse({ in: 'a', all: 'b,c' })).toEqual({
+      in: ['a'],
+      all: ['b', 'c'],
+    });
+  });
+
+  it('rejette un objet sans [in] ni [all]', () => {
+    expect(() => schema.parse({})).toThrow();
+  });
+
+  it('rejette une clé inconnue (.strict)', () => {
+    expect(() => schema.parse({ in: 'a', contains: 'b' })).toThrow();
+  });
+
+  it('rejette une CSV vide', () => {
+    expect(() => schema.parse({ in: ',,' })).toThrow();
+  });
+
+  it('rejette au-delà de 10 termes', () => {
+    const eleven = Array.from({ length: 11 }, (_, i) => `t${i}`).join(',');
+    expect(() => schema.parse({ in: eleven })).toThrow();
   });
 });
 

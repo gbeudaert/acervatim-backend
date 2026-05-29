@@ -13,6 +13,7 @@ type PrismaMock = {
     delete: jest.Mock;
   };
   $transaction: jest.Mock;
+  $queryRaw: jest.Mock;
 };
 
 function makePrismaMock(): PrismaMock {
@@ -27,6 +28,7 @@ function makePrismaMock(): PrismaMock {
     },
     // Invoque le callback avec le mock lui-même : tx === prisma dans les tests.
     $transaction: jest.fn((cb) => cb(mock)),
+    $queryRaw: jest.fn(),
   };
   return mock;
 }
@@ -151,6 +153,53 @@ describe('CollectionsService.list', () => {
     });
     expect(call.take).toBe(51); // limit + 1
     expect(call.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
+  });
+
+  it('items[in] : contraint findMany sur l’union des collectionId matchants', async () => {
+    const prisma = makePrismaMock();
+    prisma.$queryRaw
+      .mockResolvedValueOnce([{ collectionId: 'c1' }])
+      .mockResolvedValueOnce([{ collectionId: 'c2' }]);
+    prisma.collection.findMany.mockResolvedValue([]);
+
+    await makeService(prisma).list(USER_A, {
+      limit: 50,
+      items: { in: ['holow', 'naruto'] },
+    } as never);
+
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2); // un appel SQL par terme
+    const call = prisma.collection.findMany.mock.calls[0][0];
+    expect(call.where).toEqual({ userId: USER_A, id: { in: ['c1', 'c2'] } });
+  });
+
+  it('items[all] : contraint findMany sur l’intersection des collectionId par terme', async () => {
+    const prisma = makePrismaMock();
+    prisma.$queryRaw
+      .mockResolvedValueOnce([{ collectionId: 'c1' }, { collectionId: 'c2' }])
+      .mockResolvedValueOnce([{ collectionId: 'c2' }, { collectionId: 'c3' }]);
+    prisma.collection.findMany.mockResolvedValue([]);
+
+    await makeService(prisma).list(USER_A, {
+      limit: 50,
+      items: { all: ['holow', 'naruto'] },
+    } as never);
+
+    const call = prisma.collection.findMany.mock.calls[0][0];
+    expect(call.where).toEqual({ userId: USER_A, id: { in: ['c2'] } });
+  });
+
+  it('items[in] sans match : page vide, sans requête findMany', async () => {
+    const prisma = makePrismaMock();
+    prisma.$queryRaw.mockResolvedValue([]);
+
+    const page = await makeService(prisma).list(USER_A, {
+      limit: 50,
+      items: { in: ['inexistant'] },
+    } as never);
+
+    expect(page.data).toEqual([]);
+    expect(page.meta.pagination.nextCursor).toBeNull();
+    expect(prisma.collection.findMany).not.toHaveBeenCalled();
   });
 
   it('renvoie nextCursor=null sur une page partielle', async () => {

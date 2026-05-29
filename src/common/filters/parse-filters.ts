@@ -53,6 +53,41 @@ export function filterAll<const T extends readonly [string, ...string[]]>(
     .transform(({ all }) => ({ hasEvery: all }));
 }
 
+const SEARCH_MAX_TERMS = 10;
+const SEARCH_TERM_MAX_LEN = 100;
+
+const searchTermsCsv = z
+  .string()
+  .transform(splitCsv)
+  .pipe(
+    z
+      .array(z.string().min(1).max(SEARCH_TERM_MAX_LEN))
+      .min(1)
+      .max(SEARCH_MAX_TERMS),
+  );
+
+/**
+ * Schéma Zod pour un filtre de recherche substring `field[in]=a,b` (OR) et/ou
+ * `field[all]=a,b` (AND).
+ *
+ * Contrairement à `filterIn` (whitelist enum, égalité stricte), les valeurs sont
+ * du **texte libre** matché en `contains` par le service appelant. Renvoie
+ * `{ in?: string[]; all?: string[] }` — au moins l'un des deux est présent.
+ *
+ * Usage : `items: searchFilter().optional()`.
+ */
+export function searchFilter() {
+  return z
+    .object({
+      in: searchTermsCsv.optional(),
+      all: searchTermsCsv.optional(),
+    })
+    .strict()
+    .refine((v) => v.in !== undefined || v.all !== undefined, {
+      message: 'expected at least one of [in] or [all]',
+    });
+}
+
 /**
  * Valide `query` contre `schema` et renvoie l'objet typé prêt à splatter dans Prisma `where`.
  *

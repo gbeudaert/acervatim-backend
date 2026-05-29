@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Collection } from '@prisma/client';
+import { Collection, Prisma } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
 import { QuotaService } from '../common/quota/quota.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -18,6 +18,16 @@ export type CollectionResponse = Omit<Collection, 'typeId'> & {
 };
 
 const TYPE_INCLUDE = { type: { select: { code: true } } };
+
+// Champs de `unifiedData` couverts par la recherche items[in]/items[all].
+const ITEM_SEARCH_FIELDS = ['title', 'name', 'artist', 'author'] as const;
+
+// `string_contains` de Prisma compare via JSON_UNQUOTE(...), qui sort en collation
+// utf8mb4_bin (sensible à la casse) sur MariaDB, et MySQL n'a pas de `mode: insensitive`.
+// On passe donc par du SQL paramétré avec COLLATE utf8mb4_general_ci pour un contains CI.
+function escapeLike(term: string): string {
+  return term.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
 
 @Injectable()
 export class CollectionsService {
@@ -39,6 +49,57 @@ export class CollectionsService {
       updatedAt: collection.updatedAt,
       type: collection.type.code,
     };
+  }
+
+  // IDs des collections de `userId` ayant >= 1 item dont un champ recherché contient
+  // `term` (contains case-insensitive). Un appel SQL par terme.
+  private async matchingCollectionIds(
+    userId: string,
+    term: string,
+  ): Promise<string[]> {
+    const pattern = `%${escapeLike(term)}%`;
+    const clauses = ITEM_SEARCH_FIELDS.map(
+      (field) =>
+        Prisma.sql`JSON_UNQUOTE(JSON_EXTRACT(i.unified_data, ${`$.${field}`})) COLLATE utf8mb4_general_ci LIKE ${pattern}`,
+    );
+    const rows = await this.prisma.$queryRaw<{ collectionId: string }[]>`
+      SELECT DISTINCT i.collection_id AS collectionId
+      FROM items i
+      WHERE i.user_id = ${userId}
+        AND (${Prisma.join(clauses, ' OR ')})
+    `;
+    return rows.map((r) => r.collectionId);
+  }
+
+  // Combine items[in] (OR = union des termes) et items[all] (AND = un set par terme),
+  // puis intersecte le tout (les filtres se combinent en AND). Set d'IDs éventuellement vide.
+  private async resolveItemFilterIds(
+    userId: string,
+    items: { in?: string[]; all?: string[] },
+  ): Promise<string[]> {
+    const sets: Set<string>[] = [];
+    if (items.in) {
+      const union = new Set<string>();
+      for (const term of items.in) {
+        for (const id of await this.matchingCollectionIds(userId, term)) {
+          union.add(id);
+        }
+      }
+      sets.push(union);
+    }
+    if (items.all) {
+      for (const term of items.all) {
+        sets.push(new Set(await this.matchingCollectionIds(userId, term)));
+      }
+    }
+    if (sets.length === 0) {
+      return [];
+    }
+    let acc = [...sets[0]];
+    for (let i = 1; i < sets.length; i++) {
+      acc = acc.filter((id) => sets[i].has(id));
+    }
+    return acc;
   }
 
   /** 404 si la collection appartient à un autre user (pas de 403 — pas de leak). */
@@ -85,10 +146,21 @@ export class CollectionsService {
     userId: string,
     query: ListCollectionsQueryDto,
   ): Promise<CursorPage<CollectionResponse>> {
-    const where = {
+    const where: Prisma.CollectionWhereInput = {
       userId,
       ...(query.type ? { type: { code: query.type } } : {}),
     };
+    if (query.items) {
+      const ids = await this.resolveItemFilterIds(userId, query.items);
+      if (ids.length === 0) {
+        // Aucun item ne matche → page vide (évite un `IN ()` et une requête inutile).
+        return {
+          data: [],
+          meta: { pagination: { nextCursor: null, limit: query.limit } },
+        };
+      }
+      where.id = { in: ids };
+    }
     const page = await paginate(
       (take, cursor) =>
         this.prisma.collection.findMany({

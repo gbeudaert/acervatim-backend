@@ -92,7 +92,8 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
         .send({ typeCode: 'vinyl', name: 'Ma collection vinyl' })
         .expect(201);
       expect(created.body.userId).toBe(userId);
-      expect(created.body.typeId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(created.body.type).toBe('vinyl');
+      expect(created.body.typeId).toBeUndefined();
       expect(created.body.itemCount).toBe(0);
       const collectionId = created.body.id as string;
 
@@ -282,6 +283,80 @@ describe('Collections + Items (e2e) — sprint 03 Bloc E', () => {
         .map((c) => c.name)
         .sort();
       expect(names).toEqual(['manga-coll', 'vinyl-coll']);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('filtre items[in]/[all] : recherche substring sur le contenu des items', async () => {
+    const sub = `e2e-items-filter-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+
+    const createCollection = async (typeCode: string, name: string) => {
+      const res = await request(app.getHttpServer())
+        .post('/v1/collections')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ typeCode, name })
+        .expect(201);
+      return res.body.id as string;
+    };
+    const addItem = async (
+      collectionId: string,
+      unifiedData: Record<string, unknown>,
+    ) => {
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${collectionId}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          source: 'discogs',
+          sourceId: `disc-${randomBytes(6).toString('hex')}`,
+          unifiedData,
+          rawData: {},
+        })
+        .expect(201);
+    };
+    const namesOf = (body: { data: { name: string }[] }) =>
+      body.data.map((c) => c.name).sort();
+
+    try {
+      // collA : un item dont le TITRE contient "Hollow"
+      const collA = await createCollection('vinyl', 'coll-hollow');
+      await addItem(collA, { title: 'Hollow Knight OST', artist: 'Larkin' });
+
+      // collB : un item dont l'AUTEUR contient "Naruto"
+      const collB = await createCollection('manga', 'coll-naruto');
+      await addItem(collB, { name: 'Manga X', author: 'Naruto Sensei' });
+
+      // collC : DEUX items distincts (un "hollow", un "naruto")
+      const collC = await createCollection('book', 'coll-both');
+      await addItem(collC, { title: 'The Hollow' });
+      await addItem(collC, { author: 'naruto' });
+
+      // [in] mono-terme + case-insensitive (query 'hollow' vs data 'Hollow')
+      const inOne = await request(app.getHttpServer())
+        .get('/v1/collections?items[in]=hollow')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(namesOf(inOne.body)).toEqual(['coll-both', 'coll-hollow']);
+
+      // [in] multi-termes = OR (hollow OU naruto) → les 3 collections
+      const inOr = await request(app.getHttpServer())
+        .get('/v1/collections?items[in]=hollow,naruto')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(namesOf(inOr.body)).toEqual([
+        'coll-both',
+        'coll-hollow',
+        'coll-naruto',
+      ]);
+
+      // [all] = AND : un item "hollow" ET un item "naruto" dans la même collection
+      // → seule collC (items distincts) qualifie.
+      const allAnd = await request(app.getHttpServer())
+        .get('/v1/collections?items[all]=hollow,naruto')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(namesOf(allAnd.body)).toEqual(['coll-both']);
     } finally {
       await cleanupUser(prisma, userId);
     }
