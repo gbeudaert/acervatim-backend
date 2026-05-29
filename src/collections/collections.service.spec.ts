@@ -46,13 +46,17 @@ const COLL_ID = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
 const TYPE_ID = 'dddddddd-dddd-4ddd-dddd-dddddddddddd';
 
 describe('CollectionsService.create', () => {
-  it('résout typeCode → typeId et crée', async () => {
+  it('résout typeCode → typeId, crée et renvoie type (pas typeId)', async () => {
     const prisma = makePrismaMock();
     prisma.collectionType.findUnique.mockResolvedValue({ id: TYPE_ID });
-    prisma.collection.create.mockResolvedValue({ id: COLL_ID, userId: USER_A });
+    prisma.collection.create.mockResolvedValue({
+      id: COLL_ID,
+      userId: USER_A,
+      type: { code: 'vinyl' },
+    });
 
     const svc = makeService(prisma);
-    await svc.create(USER_A, {
+    const result = await svc.create(USER_A, {
       typeCode: 'vinyl',
       name: 'Ma collection',
       description: 'desc',
@@ -69,7 +73,10 @@ describe('CollectionsService.create', () => {
         name: 'Ma collection',
         description: 'desc',
       },
+      include: { type: { select: { code: true } } },
     });
+    expect(result).toMatchObject({ id: COLL_ID, type: 'vinyl' });
+    expect(result).not.toHaveProperty('typeId');
   });
 
   it('throw BadRequest si typeCode inconnu', async () => {
@@ -85,17 +92,36 @@ describe('CollectionsService.create', () => {
 });
 
 describe('CollectionsService.findOne', () => {
-  it('renvoie la collection si le user en est propriétaire', async () => {
+  it('renvoie la collection (type, pas typeId) si le user en est propriétaire', async () => {
     const prisma = makePrismaMock();
-    const row = { id: COLL_ID, userId: USER_A };
+    const row = {
+      id: COLL_ID,
+      userId: USER_A,
+      name: 'Ma collection',
+      description: null,
+      itemCount: 0,
+      createdAt: new Date('2026-05-20T00:00:00.000Z'),
+      updatedAt: new Date('2026-05-20T00:00:00.000Z'),
+      type: { code: 'vinyl' },
+    };
     prisma.collection.findFirst.mockResolvedValue(row);
 
     const result = await makeService(prisma).findOne(USER_A, COLL_ID);
 
     expect(prisma.collection.findFirst).toHaveBeenCalledWith({
       where: { id: COLL_ID, userId: USER_A },
+      include: { type: { select: { code: true } } },
     });
-    expect(result).toBe(row);
+    expect(result).toEqual({
+      id: COLL_ID,
+      userId: USER_A,
+      name: 'Ma collection',
+      description: null,
+      itemCount: 0,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      type: 'vinyl',
+    });
   });
 
   it('throw NotFound (jamais 403) si la collection appartient à un autre user', async () => {
@@ -129,13 +155,17 @@ describe('CollectionsService.list', () => {
 
   it('renvoie nextCursor=null sur une page partielle', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findMany.mockResolvedValue([{ id: 'r1' }, { id: 'r2' }]);
+    prisma.collection.findMany.mockResolvedValue([
+      { id: 'r1', type: { code: 'vinyl' } },
+      { id: 'r2', type: { code: 'manga' } },
+    ]);
 
     const page = await makeService(prisma).list(USER_A, {
       limit: 50,
     } as never);
 
     expect(page.data).toHaveLength(2);
+    expect(page.data[0]).toMatchObject({ id: 'r1', type: 'vinyl' });
     expect(page.meta.pagination.nextCursor).toBeNull();
   });
 
@@ -158,14 +188,26 @@ describe('CollectionsService.update', () => {
   it('vérifie l’appartenance puis update', async () => {
     const prisma = makePrismaMock();
     prisma.collection.findFirst.mockResolvedValue({ id: COLL_ID });
-    prisma.collection.update.mockResolvedValue({ id: COLL_ID, name: 'new' });
+    prisma.collection.update.mockResolvedValue({
+      id: COLL_ID,
+      name: 'new',
+      type: { code: 'vinyl' },
+    });
 
-    await makeService(prisma).update(USER_A, COLL_ID, { name: 'new' });
+    const result = await makeService(prisma).update(USER_A, COLL_ID, {
+      name: 'new',
+    });
 
+    expect(prisma.collection.findFirst).toHaveBeenCalledWith({
+      where: { id: COLL_ID, userId: USER_A },
+      select: { id: true },
+    });
     expect(prisma.collection.update).toHaveBeenCalledWith({
       where: { id: COLL_ID },
       data: { name: 'new' },
+      include: { type: { select: { code: true } } },
     });
+    expect(result).toMatchObject({ type: 'vinyl' });
   });
 
   it('throw NotFound si la collection n’appartient pas au user (pas d’update)', async () => {
