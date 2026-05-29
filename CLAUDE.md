@@ -110,6 +110,10 @@ Ces règles s'appliquent à **tout endpoint applicatif** (les webhooks publics f
 - Plusieurs filtres dans la même requête se combinent en AND : `?type[in]=vinyl,manga&tags[all]=jazz,rock` = `(type IN (...)) AND (tags ALL (...))`.
 - Parsing centralisé : helper `parseFilters(query, schema)` (Zod) → objet Prisma `where`. Implémenté au sprint 03.
 - Les champs filtrables doivent être **whitelistés par endpoint** (schéma Zod), pas de filtre arbitraire client → SQL.
+- **Deux familles d'opérateurs `[in]`/`[all]`** selon le helper (`src/common/filters/parse-filters.ts`) :
+  - `filterIn` / `filterAll` : valeurs **whitelistées** (enum), **égalité exacte** (`WHERE IN`). Cas par défaut, c'est ce que décrivent les puces ci-dessus.
+  - `searchFilter` : valeurs **texte libre**, matchées en **substring (contains) insensible à la casse**. Ici `[in]`/`[all]` combinent des _termes de recherche_ en OR/AND — **pas** une appartenance exacte. Seul usage actuel : `GET /v1/collections?items[in]=...&items[all]=...` (recherche sur le contenu des items). Détails dans [docs/interne/context-ia.md §10.5](docs/interne/context-ia.md#105-filtres-fieldin--fieldall).
+- **Règle dure — recherche insensible à la casse sur JSON** : ne **jamais** utiliser le `string_contains` Prisma sur une colonne JSON pour un contains CI. Sur MariaDB, `JSON_UNQUOTE(...)` ressort en collation `utf8mb4_bin` (sensible à la casse) et MySQL n'a pas de `mode: 'insensitive'`. Passer par du SQL paramétré avec `COLLATE utf8mb4_general_ci` (référence : `CollectionsService.matchingCollectionIds`).
 
 ## Commandes — TOUJOURS via le wrapper, jamais en direct
 
