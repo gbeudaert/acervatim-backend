@@ -7,6 +7,8 @@ import { Collection, Prisma } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
 import { QuotaService } from '../common/quota/quota.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { HierarchySummaryEntry, summarizeHierarchy } from './types/hierarchy';
+import { getProfile } from './types/registry';
 import { CreateCollectionDto } from './dto/create-collection.dto';
 import { ListCollectionsQueryDto } from './dto/list-collections.query';
 import { UpdateCollectionDto } from './dto/update-collection.dto';
@@ -15,6 +17,11 @@ import { UpdateCollectionDto } from './dto/update-collection.dto';
 // (`vinyl`, `manga`, …), exposé sous `type`.
 export type CollectionResponse = Omit<Collection, 'typeId'> & {
   type: string;
+};
+
+// Détail enrichi du résumé de hiérarchie (nœuds par niveau ; `[]` = type plat).
+export type CollectionDetailResponse = CollectionResponse & {
+  hierarchy: HierarchySummaryEntry[];
 };
 
 const TYPE_INCLUDE = { type: { select: { code: true } } };
@@ -178,7 +185,7 @@ export class CollectionsService {
     return { ...page, data: page.data.map((c) => this.toResponse(c)) };
   }
 
-  async findOne(userId: string, id: string): Promise<CollectionResponse> {
+  async findOne(userId: string, id: string): Promise<CollectionDetailResponse> {
     const collection = await this.prisma.collection.findFirst({
       where: { id, userId },
       include: TYPE_INCLUDE,
@@ -186,7 +193,20 @@ export class CollectionsService {
     if (!collection) {
       throw new NotFoundException('Collection not found');
     }
-    return this.toResponse(collection);
+    const profile = getProfile(collection.type.code);
+    let hierarchy: HierarchySummaryEntry[] = [];
+    if (profile.hierarchy.length > 0) {
+      const groups = await this.prisma.collectionNode.groupBy({
+        by: ['level'],
+        where: { collectionId: id },
+        _count: { _all: true },
+      });
+      const counts: Record<string, number> = Object.fromEntries(
+        groups.map((g) => [g.level, g._count._all]),
+      );
+      hierarchy = summarizeHierarchy(profile, counts);
+    }
+    return { ...this.toResponse(collection), hierarchy };
   }
 
   async update(

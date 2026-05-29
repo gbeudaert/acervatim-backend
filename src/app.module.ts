@@ -16,6 +16,7 @@ import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
+import { NodesModule } from './nodes/nodes.module';
 import { OauthModule } from './oauth/oauth.module';
 import { PremiumModule } from './premium/premium.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -54,6 +55,7 @@ import { UsersModule } from './users/users.module';
     InvitationsModule,
     CollectionsModule,
     ItemsModule,
+    NodesModule,
     OauthModule,
     SearchModule,
     SubscriptionsModule,

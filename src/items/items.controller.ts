@@ -15,6 +15,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { AttachItemSourceDto } from './dto/attach-source.dto';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
 import { UpdateItemDto } from './dto/update-item.dto';
@@ -59,6 +60,15 @@ export class ItemsController {
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
     return this.items.getSources(userId, id);
+  }
+
+  @Post('items/:id/sources')
+  async attachSource(
+    @CurrentUserId() userId: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: AttachItemSourceDto,
+  ) {
+    return this.items.attachSource(userId, id, dto);
   }
 
   @Patch('items/:id')

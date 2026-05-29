@@ -362,14 +362,53 @@ export class ItemsService {
     return this.toCurated(updated);
   }
 
+  async attachSource(
+    userId: string,
+    id: string,
+    dto: SourceRef,
+  ): Promise<CuratedItem> {
+    const item = await this.prisma.item.findFirst({ where: { id, userId } });
+    if (!item) {
+      throw new NotFoundException('Item not found');
+    }
+    const entry = await this.snapshots.snapshot(dto, userId);
+    const sources = [...this.toEntries(item.sources), entry];
+    const updated = await this.prisma.item.update({
+      where: { id },
+      data: { sources: sources as unknown as Prisma.InputJsonValue },
+    });
+    return this.toCurated(updated);
+  }
+
   async remove(userId: string, id: string): Promise<void> {
-    const item = await this.findOne(userId, id);
-    await this.prisma.$transaction([
-      this.prisma.item.delete({ where: { id } }),
-      this.prisma.collection.update({
+    const item = await this.prisma.item.findFirst({
+      where: { id, userId },
+      select: { id: true, collectionId: true, nodeId: true },
+    });
+    if (!item) {
+      throw new NotFoundException('Item not found');
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.item.delete({ where: { id } });
+      await tx.collection.update({
         where: { id: item.collectionId },
         data: { itemCount: { decrement: 1 } },
-      }),
-    ]);
+      });
+      // Purge du nœud devenu vide et non-wishlist (dernier tome supprimé).
+      if (item.nodeId) {
+        const remaining = await tx.item.count({
+          where: { nodeId: item.nodeId },
+        });
+        if (remaining === 0) {
+          const node = await tx.collectionNode.findUnique({
+            where: { id: item.nodeId },
+            select: { isWishlist: true },
+          });
+          if (node && !node.isWishlist) {
+            await tx.collectionNode.delete({ where: { id: item.nodeId } });
+          }
+        }
+      }
+    });
   }
 }
