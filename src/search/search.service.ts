@@ -1,9 +1,8 @@
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { CursorPage } from '../common/pagination/paginate';
+import { SOURCE_ADAPTERS } from '../common/sources/source-snapshot.service';
 import { SourceAdapter, UnifiedItem } from '../oauth/providers/types';
-
-export const SOURCE_ADAPTERS = Symbol('SOURCE_ADAPTERS');
 
 @Injectable()
 export class SearchService {

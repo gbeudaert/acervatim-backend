@@ -1,10 +1,14 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { SourcesModule } from '../common/sources/sources.module';
 import { ItemsController } from './items.controller';
 import { ItemsService } from './items.service';
 
 @Module({
-  imports: [AuthModule], // pour JwtAuthGuard
+  imports: [
+    AuthModule, // pour JwtAuthGuard
+    SourcesModule, // SourceSnapshotService
+  ],
   controllers: [ItemsController],
   providers: [ItemsService],
   exports: [ItemsService],

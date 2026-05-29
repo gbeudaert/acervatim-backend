@@ -22,6 +22,7 @@ model User {
 
   collections           Collection[]
   items                 Item[]
+  collectionNodes       CollectionNode[]
   oauthCredentials      OauthCredential[]
   subscription          Subscription?
   premiumGrant          PremiumGrant?
@@ -63,6 +64,7 @@ model Collection {
   user  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   type  CollectionType @relation(fields: [typeId], references: [id], onDelete: Restrict)
   items Item[]
+  nodes CollectionNode[]
 
   @@index([userId, createdAt])
   @@index([typeId])
@@ -86,19 +88,48 @@ model Item {
   id           String   @id @default(uuid()) @db.Char(36)
   collectionId String   @map("collection_id") @db.Char(36)
   userId       String   @map("user_id") @db.Char(36) // dénormalisé pour les requêtes par user
-  source       String   @db.VarChar(32) // 'discogs' | 'mal' | 'tmdb' | ...
-  sourceId     String   @map("source_id") @db.VarChar(128)
-  unifiedData  Json     @map("unified_data")
-  rawData      Json     @map("raw_data")
+  nodeId       String?  @map("node_id") @db.Char(36) // série (manga) ; null = type plat (vinyl)
+  volume       Int? // n° de tome (manga) ; null pour les types plats
+  unifiedData  Json     @map("unified_data") // VÉRITÉ curée par l'utilisateur
+  sources      Json     @default("[]") // [{ provider, externalId, rawData, fetchedAt }]
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
-  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  collection Collection      @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  node       CollectionNode? @relation(fields: [nodeId], references: [id], onDelete: Cascade)
 
-  @@unique([userId, source, sourceId]) // un user ne peut référencer 2x le même item d'une source
+  @@unique([userId, nodeId, volume]) // manga : 1 tome/(série,volume) ; (null,null) vinyl non dédupliqué (MySQL)
   @@index([collectionId, createdAt])
+  @@index([nodeId])
   @@map("items")
+}
+
+// Nœud de hiérarchie matérialisé : une série (manga) est un nœud, ses tomes sont des items.
+// MAL ne connaît que les séries — un nœud porte ses propres sources[] (ex. MAL),
+// indépendantes des sources[] des items (ex. ISBN).
+model CollectionNode {
+  id           String   @id @default(uuid()) @db.Char(36)
+  collectionId String   @map("collection_id") @db.Char(36)
+  userId       String   @map("user_id") @db.Char(36)
+  parentId     String?  @map("parent_id") @db.Char(36)
+  level        String   @db.VarChar(32) // 'serie' | 'set'
+  unifiedData  Json     @map("unified_data") // VÉRITÉ curée (pré-remplie d'un snapshot)
+  sources      Json     @default("[]") // [{ provider, externalId, rawData, fetchedAt }]
+  userData     Json     @default("{}") @map("user_data") // note, commentaire
+  isWishlist   Boolean  @default(false) @map("is_wishlist") // survit à ownedCount = 0
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  collection Collection       @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent     CollectionNode?  @relation("NodeTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children   CollectionNode[] @relation("NodeTree")
+  items      Item[]
+
+  @@index([collectionId, level])
+  @@index([parentId])
+  @@map("collection_nodes")
 }
 
 // ---------- OAuth externe (Discogs, MAL, TMDB...) ----------

@@ -7,6 +7,7 @@ import {
   HttpStatus,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -16,6 +17,7 @@ import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
+import { UpdateItemDto } from './dto/update-item.dto';
 import { ItemsService } from './items.service';
 
 @ApiTags('items')
@@ -49,6 +51,23 @@ export class ItemsController {
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
     return this.items.findOne(userId, id);
+  }
+
+  @Get('items/:id/sources')
+  async sources(
+    @CurrentUserId() userId: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ) {
+    return this.items.getSources(userId, id);
+  }
+
+  @Patch('items/:id')
+  async update(
+    @CurrentUserId() userId: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: UpdateItemDto,
+  ) {
+    return this.items.update(userId, id, dto);
   }
 
   @Delete('items/:id')
