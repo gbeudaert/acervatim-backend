@@ -1,3 +1,4 @@
+import { PremiumService, PremiumStatus } from '../../premium/premium.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { QuotaExceededException } from './quota-exceeded.exception';
 import { FREE_TIER_LIMITS, QuotaService } from './quota.service';
@@ -18,8 +19,28 @@ function makePrismaMock(): PrismaMock {
   };
 }
 
-function makeService(prisma: PrismaMock): QuotaService {
-  return new QuotaService(prisma as unknown as PrismaService);
+const FREE_STATUS: PremiumStatus = {
+  isPremium: false,
+  source: 'none',
+  expiresAt: null,
+};
+const PREMIUM_STATUS: PremiumStatus = {
+  isPremium: true,
+  source: 'grant',
+  expiresAt: null,
+};
+
+function makePremiumMock(status: PremiumStatus = FREE_STATUS): PremiumService {
+  return {
+    getStatus: jest.fn().mockResolvedValue(status),
+  } as unknown as PremiumService;
+}
+
+function makeService(
+  prisma: PrismaMock,
+  premium: PremiumService = makePremiumMock(),
+): QuotaService {
+  return new QuotaService(prisma as unknown as PrismaService, premium);
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -129,5 +150,38 @@ describe('QuotaService.getQuotaSummary', () => {
     const summary = await makeService(prisma).getQuotaSummary(USER);
 
     expect(summary.items.used).toBe(0);
+  });
+});
+
+describe('QuotaService — comptes premium (illimité)', () => {
+  it('assertCanCreateCollection passe même au-dessus de la limite, sans compter', async () => {
+    const prisma = makePrismaMock();
+    const svc = makeService(prisma, makePremiumMock(PREMIUM_STATUS));
+
+    await expect(svc.assertCanCreateCollection(USER)).resolves.toBeUndefined();
+    // Sortie anticipée : aucun count DB.
+    expect(prisma.collection.count).not.toHaveBeenCalled();
+  });
+
+  it('assertCanCreateItem passe même au-dessus de la limite, sans agréger', async () => {
+    const prisma = makePrismaMock();
+    const svc = makeService(prisma, makePremiumMock(PREMIUM_STATUS));
+
+    await expect(svc.assertCanCreateItem(USER)).resolves.toBeUndefined();
+    expect(prisma.collection.aggregate).not.toHaveBeenCalled();
+  });
+
+  it('getQuotaSummary renvoie max:null mais garde le used réel', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.count.mockResolvedValue(15);
+    prisma.collection.aggregate.mockResolvedValue({ _sum: { itemCount: 700 } });
+    const svc = makeService(prisma, makePremiumMock(PREMIUM_STATUS));
+
+    const summary = await svc.getQuotaSummary(USER);
+
+    expect(summary).toEqual({
+      collections: { used: 15, max: null },
+      items: { used: 700, max: null },
+    });
   });
 });

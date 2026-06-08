@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { PremiumService } from '../../premium/premium.service';
 import { QuotaExceededException } from './quota-exceeded.exception';
 
 /**
  * Limites free tier — hardcodées au sprint 03.
- * Au sprint 05, substituer par un lookup `premiumService.getLimits(userId)`.
+ * Les comptes premium (grant actif OU sub active, cf. `PremiumService`) sont
+ * illimités : les asserts passent toujours et le résumé renvoie `max: null`.
  */
 export const FREE_TIER_LIMITS = {
   collections: 10,
@@ -13,8 +15,9 @@ export const FREE_TIER_LIMITS = {
 } as const;
 
 export interface QuotaSummary {
-  collections: { used: number; max: number };
-  items: { used: number; max: number };
+  /** `max: null` = illimité (compte premium). */
+  collections: { used: number; max: number | null };
+  items: { used: number; max: number | null };
 }
 
 /**
@@ -26,12 +29,16 @@ type DbClient = PrismaService | Prisma.TransactionClient;
 
 @Injectable()
 export class QuotaService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly premium: PremiumService,
+  ) {}
 
   async assertCanCreateCollection(
     userId: string,
     db?: DbClient,
   ): Promise<void> {
+    if (await this.isPremium(userId)) return;
     const client = db ?? this.prisma;
     const used = await client.collection.count({ where: { userId } });
     if (used >= FREE_TIER_LIMITS.collections) {
@@ -42,6 +49,7 @@ export class QuotaService {
   }
 
   async assertCanCreateItem(userId: string, db?: DbClient): Promise<void> {
+    if (await this.isPremium(userId)) return;
     const client = db ?? this.prisma;
     const agg = await client.collection.aggregate({
       where: { userId },
@@ -56,7 +64,8 @@ export class QuotaService {
   }
 
   async getQuotaSummary(userId: string): Promise<QuotaSummary> {
-    const [collectionsUsed, itemsAgg] = await Promise.all([
+    const [isPremium, collectionsUsed, itemsAgg] = await Promise.all([
+      this.isPremium(userId),
       this.prisma.collection.count({ where: { userId } }),
       this.prisma.collection.aggregate({
         where: { userId },
@@ -66,12 +75,18 @@ export class QuotaService {
     return {
       collections: {
         used: collectionsUsed,
-        max: FREE_TIER_LIMITS.collections,
+        max: isPremium ? null : FREE_TIER_LIMITS.collections,
       },
       items: {
         used: itemsAgg._sum.itemCount ?? 0,
-        max: FREE_TIER_LIMITS.items,
+        max: isPremium ? null : FREE_TIER_LIMITS.items,
       },
     };
+  }
+
+  /** Premium = grant actif OU sub active (cf. `PremiumService`) → illimité. */
+  private async isPremium(userId: string): Promise<boolean> {
+    const status = await this.premium.getStatus(userId);
+    return status.isPremium;
   }
 }
