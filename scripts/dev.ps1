@@ -48,6 +48,8 @@ Prisma :
 Scripts :
   grant-premium <args...>  CLI premium grants (add/revoke/list)
                            ex: ./scripts/dev.ps1 grant-premium add <userId> --reason comp
+  mint-jwt <args...>       DEV ONLY : cree un user de test + signe un JWT interne
+                           ex: ./scripts/dev.ps1 mint-jwt [--sub <label>] [--user <id>] [--expires 7d]
 
 Passe-plats (exécutés dans app) :
   npm <args...>      ex: ./scripts/dev.ps1 npm install zod
@@ -110,6 +112,7 @@ switch ($Command) {
         Invoke-Compose exec app npx prisma studio
     }
     'grant-premium'  { Invoke-Compose exec app npx ts-node --transpile-only scripts/grant-premium.ts @Rest }
+    'mint-jwt'       { Invoke-Compose exec app npx ts-node --transpile-only scripts/mint-jwt.ts @Rest }
     'npm'            { Invoke-Compose exec app npm @Rest }
     'npx'            { Invoke-Compose exec app npx @Rest }
     'exec'           { Invoke-Compose exec app @Rest }
