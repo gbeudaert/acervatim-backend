@@ -26,6 +26,7 @@ Setup / lifecycle :
   build              Rebuild l'image app (après modif Dockerfile.dev ou package.json)
   up                 Démarre tous les services en foreground (logs)
   up-bg              Démarre en background (-d)
+  restart            Redémarre le conteneur app (re-exécute prisma generate + start:dev)
   down               Stoppe (garde le volume db)
   reset              Stoppe + supprime le volume db (RESET total de la base)
 
@@ -73,6 +74,7 @@ switch ($Command) {
     'build'          { Invoke-Compose build @Rest }
     'up'             { Invoke-Compose up @Rest }
     'up-bg'          { Invoke-Compose up -d @Rest }
+    'restart'        { Invoke-Compose restart app @Rest }
     'down'           { Invoke-Compose down @Rest }
     'reset'          { Invoke-Compose down -v @Rest }
     'ps'             { Invoke-Compose ps @Rest }
