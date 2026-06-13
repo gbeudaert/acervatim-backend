@@ -1,5 +1,6 @@
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
+import { ItemUserDataSchema } from './item-user-data.schema';
 
 const UNIFIED_DATA_MAX_BYTES = 32_000;
 const MAX_SOURCES = 20;
@@ -28,6 +29,8 @@ export const CreateItemSchema = z
     volume: z.number().int().nonnegative().optional(),
     // Vérité curée — validée ensuite par le profil du type (discriminant forcé).
     unifiedData: boundedJsonRecord(UNIFIED_DATA_MAX_BYTES, 'unifiedData'),
+    // Données perso/subjectives (rating, prix, dernière écoute) — optionnel.
+    userData: ItemUserDataSchema.optional(),
     // Sources propres à l'item (ex. isbn) — snapshot si adapter.
     sources: z.array(SourceRefSchema).max(MAX_SOURCES).optional(),
   })

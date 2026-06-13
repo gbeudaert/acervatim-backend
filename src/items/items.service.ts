@@ -39,6 +39,7 @@ export interface CuratedItem {
   createdAt: Date;
   updatedAt: Date;
   unifiedData: JsonRecord;
+  userData: JsonRecord;
   sources: SourceRefView[];
 }
 
@@ -124,6 +125,7 @@ export class ItemsService {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       unifiedData: (item.unifiedData ?? {}) as JsonRecord,
+      userData: (item.userData ?? {}) as JsonRecord,
       sources: this.toEntries(item.sources).map((e) => ({
         provider: e.provider,
         externalId: e.externalId,
@@ -220,6 +222,7 @@ export class ItemsService {
             nodeId,
             volume: dto.volume ?? null,
             unifiedData: unifiedData as Prisma.InputJsonValue,
+            userData: (dto.userData ?? {}) as Prisma.InputJsonValue,
             sources: itemSources as unknown as Prisma.InputJsonValue,
           },
         });
@@ -351,14 +354,23 @@ export class ItemsService {
     if (!item) {
       throw new NotFoundException('Item not found');
     }
-    const unifiedData = this.validateUnified(
-      item.collection.type.code,
-      dto.unifiedData,
-    );
-    const updated = await this.prisma.item.update({
-      where: { id },
-      data: { unifiedData: unifiedData as Prisma.InputJsonValue },
-    });
+    const data: Prisma.ItemUpdateInput = {};
+    if (dto.unifiedData !== undefined) {
+      // `unifiedData` est remplacé en bloc (re-validé par le profil du type).
+      data.unifiedData = this.validateUnified(
+        item.collection.type.code,
+        dto.unifiedData,
+      ) as Prisma.InputJsonValue;
+    }
+    if (dto.userData !== undefined) {
+      // `userData` est mergé (PATCH partiel) sur l'existant.
+      const merged = {
+        ...((item.userData ?? {}) as JsonRecord),
+        ...dto.userData,
+      };
+      data.userData = merged as Prisma.InputJsonValue;
+    }
+    const updated = await this.prisma.item.update({ where: { id }, data });
     return this.toCurated(updated);
   }
 

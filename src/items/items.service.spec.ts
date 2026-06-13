@@ -101,6 +101,7 @@ function itemRow(overrides: Record<string, unknown> = {}) {
     nodeId: null,
     volume: null,
     unifiedData: { type: 'vinyl', title: 'Hollow Knight OST' },
+    userData: {},
     sources: [],
     createdAt: new Date('2026-05-20T00:00:00.000Z'),
     updatedAt: new Date('2026-05-20T00:00:00.000Z'),
@@ -172,6 +173,29 @@ describe('ItemsService.create', () => {
 
     const data = prisma.item.create.mock.calls[0][0].data;
     expect(data.unifiedData).toMatchObject({ type: 'vinyl' });
+  });
+
+  it('persiste userData (perso) tel quel à la création, {} par défaut', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.item.create.mockResolvedValue(itemRow());
+    prisma.collection.update.mockResolvedValue({});
+
+    const { svc } = makeService(prisma);
+
+    // sans userData → {}
+    await svc.create(USER_A, COLL_ID, DTO);
+    expect(prisma.item.create.mock.calls[0][0].data.userData).toEqual({});
+
+    // avec userData → passé tel quel
+    await svc.create(USER_A, COLL_ID, {
+      unifiedData: { title: 'x' },
+      userData: { rating: 4, purchasePrice: 12.5 },
+    } as CreateItemDto);
+    expect(prisma.item.create.mock.calls[1][0].data.userData).toEqual({
+      rating: 4,
+      purchasePrice: 12.5,
+    });
   });
 
   it('rejette node/volume sur un type plat (400)', async () => {
@@ -316,6 +340,60 @@ describe('ItemsService.findOne', () => {
     await expect(svc.findOne(USER_B, ITEM_ID)).rejects.toThrow(
       NotFoundException,
     );
+  });
+});
+
+describe('ItemsService.update', () => {
+  const VINYL_ITEM = {
+    ...itemRow({ userData: { rating: 3, purchasePrice: 9 } }),
+    collection: { type: { code: 'vinyl' } },
+  };
+
+  it('merge userData (PATCH partiel) sur l’existant, sans toucher unifiedData', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(VINYL_ITEM);
+    prisma.item.update.mockResolvedValue(itemRow());
+
+    const { svc } = makeService(prisma);
+    await svc.update(USER_A, ITEM_ID, {
+      userData: { rating: 5, lastPlayedAt: '2026-06-01T10:00:00.000Z' },
+    } as never);
+
+    const data = prisma.item.update.mock.calls[0][0].data;
+    expect(data.userData).toEqual({
+      rating: 5, // écrasé
+      purchasePrice: 9, // conservé
+      lastPlayedAt: '2026-06-01T10:00:00.000Z', // ajouté
+    });
+    expect(data.unifiedData).toBeUndefined();
+  });
+
+  it('met à jour unifiedData seul sans toucher userData', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(VINYL_ITEM);
+    prisma.item.update.mockResolvedValue(itemRow());
+
+    const { svc } = makeService(prisma);
+    await svc.update(USER_A, ITEM_ID, {
+      unifiedData: { title: 'Nouveau titre' },
+    } as never);
+
+    const data = prisma.item.update.mock.calls[0][0].data;
+    expect(data.unifiedData).toMatchObject({
+      type: 'vinyl',
+      title: 'Nouveau titre',
+    });
+    expect(data.userData).toBeUndefined();
+  });
+
+  it('throw NotFound (jamais 403) si l’item appartient à un autre user', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(null);
+
+    const { svc } = makeService(prisma);
+    await expect(
+      svc.update(USER_B, ITEM_ID, { userData: { rating: 1 } } as never),
+    ).rejects.toThrow(NotFoundException);
   });
 });
 

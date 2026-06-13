@@ -92,6 +92,7 @@ model Item {
   volume       Int? // n° de tome (manga) ; null pour les types plats
   unifiedData  Json     @map("unified_data") // VÉRITÉ curée par l'utilisateur
   sources      Json     @default("[]") // [{ provider, externalId, rawData, fetchedAt }]
+  userData     Json     @default("{}") @map("user_data") // perso/subjectif : rating, prix, dernière écoute
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
