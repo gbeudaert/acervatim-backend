@@ -5,7 +5,7 @@ Ce fichier est chargé automatiquement à chaque session Claude Code. Il contien
 ## Stack imposée
 
 - Node.js 24.x (LTS) · NestJS 10 · Prisma 6 · MariaDB 10.5+ (provider `mysql`)
-- Cible de déploiement : Raspberry Pi 4 (linux/arm64) sous Docker — le NAS Synology (armv7l) est abandonné, incompatible Prisma.
+- Cible de déploiement : Raspberry Pi 4 (linux/arm64) sous Podman — le NAS Synology (armv7l) est abandonné, incompatible Prisma. Base MariaDB hébergée sur le NAS (pas de conteneur DB en prod).
 - TypeScript strict (déjà configuré dans `tsconfig.json`)
 - Validation : `class-validator` + `class-transformer` (whitelist + forbidNonWhitelisted activés globalement dans `main.ts`)
 - Jamais d'ajout de dépendance sans en discuter avant.

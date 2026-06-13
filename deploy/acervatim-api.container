@@ -1,0 +1,54 @@
+# Quadlet systemd pour l'API Acervatim sous Podman.
+# Cible : Raspberry Pi 4 (arm64), Podman rootless. La base MariaDB est sur le
+# NAS (pas de conteneur DB ici) : DATABASE_URL pointe le NAS via le .env.
+#
+# Installation (rootless, recommandé) :
+#   1. Builder l'image sur le Pi :
+#        podman build -t acervatim-api:latest .
+#   2. Copier ce fichier dans :
+#        ~/.config/containers/systemd/acervatim-api.container
+#   3. Déposer le .env (avec DATABASE_URL=mysql://user:pass@<ip-nas>:3306/acervatim
+#      et les secrets SUB_HASH_PEPPER / ENCRYPTION_KEY / JWT_PRIVATE_KEY / ...) dans :
+#        ~/acervatim/.env       (chmod 600)
+#   4. Recharger et démarrer :
+#        systemctl --user daemon-reload
+#        systemctl --user start acervatim-api
+#   5. Survie hors session SSH (sinon le service ET le timer de healthcheck
+#      s'arrêtent à la déconnexion) :
+#        loginctl enable-linger $USER
+#
+# Variante root : déposer dans /etc/containers/systemd/, remplacer %h par un
+# chemin absolu (ex. /opt/acervatim/.env) et WantedBy=multi-user.target.
+#
+# Migrations Prisma : ce conteneur ne les exécute pas (le CLI prisma est une
+# devDep, absente de l'image runtime). Avant un déploiement qui change le schéma,
+# lancer une fois la cible dédiée contre la base du NAS :
+#   podman build --target migrate -t acervatim-migrate .
+#   podman run --rm --env-file ~/acervatim/.env acervatim-migrate
+
+[Unit]
+Description=Acervatim API (NestJS + Prisma)
+# La base est distante (NAS) : le réseau doit être prêt. Restart=always couvre
+# le cas où le NAS n'est pas encore joignable au démarrage du Pi.
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/acervatim-api:latest
+ContainerName=acervatim-api
+# --init : main.ts n'a pas de handler SIGTERM ; sans init, Node en PID 1 ignore
+# le signal et l'arrêt attend le SIGKILL.
+RunInit=true
+PublishPort=3000:3000
+# DATABASE_URL (NAS) + secrets. NODE_ENV=production est déjà posé dans l'image.
+EnvironmentFile=%h/acervatim/.env
+# Le healthcheck (/health) est défini dans l'image ; Podman le planifie via un
+# timer systemd transient. Rien à redéclarer ici.
+
+[Service]
+Restart=always
+# Laisse le temps au premier `prisma connect` (NAS) + au bootstrap Nest.
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target

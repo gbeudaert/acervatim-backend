@@ -1,5 +1,5 @@
 # Image de production multi-stage sur base Red Hat UBI 9.
-# Cible de déploiement : Raspberry Pi 4 (linux/arm64) sous Docker.
+# Cible de déploiement : Raspberry Pi 4 (linux/arm64) sous Podman.
 #
 # - Builder : ubi9/nodejs-24 (npm + toolchain) — même famille OS que le runtime,
 #   donc le client Prisma généré ici (engine rhel-openssl-3.0.x) est directement
@@ -8,18 +8,24 @@
 #   dist/ + node_modules de prod.
 # Les deux images sont multi-arch (amd64 + arm64).
 #
-# Build local (validation) : docker build -t acervatim-api .
-# Build pour le RPi 4     : docker buildx build --platform linux/arm64 -t acervatim-api .
-#   (Prisma génère l'engine de la plateforme du build : toujours builder pour
-#    l'architecture de déploiement, pas de copie d'image cross-arch.)
-# Run : docker run --init -p 3000:3000 --env-file .env acervatim-api
-#       (--init recommandé : main.ts n'enregistre pas de handler SIGTERM,
-#        sans init Node en PID 1 ignore le signal et docker stop attend le SIGKILL)
+# Image OCI standard : commandes identiques sous Podman et Docker (les bases UBI
+# Red Hat sont d'ailleurs taillées pour Podman). Exemples en `podman`.
+#
+# Build (sur le RPi, arm64 natif)  : podman build -t acervatim-api .
+# Build cross-arch (depuis x86)    : podman build --platform linux/arm64 -t acervatim-api .
+#   (nécessite qemu-user-static + binfmt sur l'hôte de build. Prisma génère
+#    l'engine de la plateforme du build : builder pour l'arch de déploiement,
+#    jamais copier une image cross-arch.)
+# Run ponctuel : podman run --init -p 3000:3000 --env-file .env acervatim-api
+#   (--init : main.ts n'enregistre pas de handler SIGTERM ; sans init, Node en
+#    PID 1 ignore le signal et l'arrêt attend le SIGKILL. `--init` = catatonit
+#    sous Podman, tini sous Docker.)
+# Déploiement RPi : via le Quadlet systemd deploy/acervatim-api.container.
 #
 # Migrations : non incluses dans l'image runtime (le CLI prisma est une devDep).
-# Utiliser la cible dédiée :
-#   docker build --target migrate -t acervatim-migrate .
-#   docker run --rm --env-file .env acervatim-migrate
+# Utiliser la cible dédiée, une fois, contre la base (sur le NAS) :
+#   podman build --target migrate -t acervatim-migrate .
+#   podman run --rm --env-file .env acervatim-migrate
 
 # ---------- Étape 1 : build (deps complètes + compilation) ----------
 FROM registry.access.redhat.com/ubi9/nodejs-24:latest AS build

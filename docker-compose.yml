@@ -1,5 +1,6 @@
 # Stack de développement local uniquement.
-# La prod (Raspberry Pi 4, Docker) utilise le Dockerfile multi-stage à la racine.
+# La prod (Raspberry Pi 4, Podman) utilise le Dockerfile multi-stage à la racine
+# + le Quadlet deploy/acervatim-api.container.
 # Démarrage : docker compose up --build
 # Reset DB : docker compose down -v
 
