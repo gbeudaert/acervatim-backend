@@ -14,6 +14,10 @@ export const MangaItemSchema = z
     type: z.literal('manga'),
     title: z.string().max(512).optional(),
     coverUrl: z.string().url().nullable().default(null),
+    // Éditeur de l'édition française du tome.
+    publisherFr: z.string().max(256).nullable().default(null),
+    // Nombre de pages du tome.
+    pageCount: z.number().int().positive().nullable().default(null),
   })
   .strict();
 
@@ -27,6 +31,11 @@ export const MangaSerieSchema = z
       .default('unknown'),
     totalCount: z.number().int().nonnegative().nullable().default(null), // num_volumes
     rating: z.number().min(0).max(10).nullable().default(null), // mean
+    // Démographie cible de la série (propriété série, pas tome).
+    demographic: z
+      .enum(['shonen', 'shojo', 'seinen', 'josei', 'kodomo', 'other'])
+      .nullable()
+      .default(null),
     synopsis: z.string().max(4000).nullable().default(null),
     coverUrl: z.string().url().nullable().default(null),
   })
