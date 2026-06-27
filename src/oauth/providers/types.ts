@@ -32,7 +32,9 @@ export interface AdapterSearchResult {
 
 /**
  * Contrat unique pour toute source externe (Discogs, MAL, TMDB, ...).
- * `search` est le point d'entrée du `GET /v1/search`.
+ * `search` est le point d'entrée du `GET /v1/search` (recherche texte libre).
+ * `searchByBarcode` est une capacité OPTIONNELLE : seules les sources qui exposent
+ * une recherche par code-barres (EAN/UPC) l'implémentent (ex: Discogs pour le vinyle).
  * `fetchDetails` sert au `POST /v1/items` pour récupérer le détail complet d'une ressource.
  */
 export interface SourceAdapter {
@@ -40,5 +42,9 @@ export interface SourceAdapter {
   readonly mediaType: CollectionTypeCode;
 
   search(query: string, ctx: AdapterContext): Promise<AdapterSearchResult>;
+  searchByBarcode?(
+    barcode: string,
+    ctx: AdapterContext,
+  ): Promise<AdapterSearchResult>;
   fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem>;
 }

@@ -2,7 +2,17 @@ import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { CursorPage } from '../common/pagination/paginate';
 import { SOURCE_ADAPTERS } from '../common/sources/source-snapshot.service';
-import { SourceAdapter, UnifiedItem } from '../oauth/providers/types';
+import {
+  AdapterSearchResult,
+  SourceAdapter,
+  UnifiedItem,
+} from '../oauth/providers/types';
+
+/** Critère de recherche : exactement un des deux est défini (garanti par le DTO). */
+export interface SearchCriteria {
+  q?: string;
+  barcode?: string;
+}
 
 @Injectable()
 export class SearchService {
@@ -15,7 +25,7 @@ export class SearchService {
   async search(
     userId: string,
     type: CollectionTypeCode,
-    query: string,
+    criteria: SearchCriteria,
     cursor: string | undefined,
     limit: number,
   ): Promise<CursorPage<UnifiedItem>> {
@@ -25,7 +35,18 @@ export class SearchService {
         `search not supported for type '${type}' yet`,
       );
     }
-    const res = await adapter.search(query, { userId, cursor, limit });
+    const ctx = { userId, cursor, limit };
+    let res: AdapterSearchResult;
+    if (criteria.barcode) {
+      if (!adapter.searchByBarcode) {
+        throw new BadRequestException(
+          `barcode search not supported for type '${type}'`,
+        );
+      }
+      res = await adapter.searchByBarcode(criteria.barcode, ctx);
+    } else {
+      res = await adapter.search(criteria.q ?? '', ctx);
+    }
     return {
       data: res.items,
       meta: {

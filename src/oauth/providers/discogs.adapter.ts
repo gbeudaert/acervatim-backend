@@ -70,6 +70,7 @@ interface DiscogsReleaseResponse {
   labels?: { name: string }[];
   country?: string;
   tracklist?: unknown;
+  identifiers?: { type?: string; value?: string; description?: string }[];
 }
 
 @Injectable()
@@ -194,12 +195,38 @@ export class DiscogsAdapter
     query: string,
     ctx: AdapterContext,
   ): Promise<AdapterSearchResult> {
+    return this.runSearch({ q: query }, ctx);
+  }
+
+  async searchByBarcode(
+    barcode: string,
+    ctx: AdapterContext,
+  ): Promise<AdapterSearchResult> {
+    return this.runSearch({ barcode }, ctx);
+  }
+
+  private async runSearch(
+    criteria: { q?: string; barcode?: string },
+    ctx: AdapterContext,
+  ): Promise<AdapterSearchResult> {
     await this.consumeRate(ctx.userId);
     const page = parsePage(ctx.cursor);
-    const url = `${DISCOGS_API_BASE}/database/search?type=release&q=${encodeURIComponent(
-      query,
-    )}&per_page=${ctx.limit}&page=${page}`;
-    const cacheKey = `discogs:search:${ctx.userId}:${query}:${page}:${ctx.limit}`;
+
+    const params = new URLSearchParams({ type: 'release' });
+    // Discogs expose un paramètre dédié `barcode=` — bien plus fiable qu'un `q=` sur l'EAN.
+    if (criteria.barcode) {
+      params.set('barcode', criteria.barcode);
+    } else {
+      params.set('q', criteria.q ?? '');
+    }
+    params.set('per_page', String(ctx.limit));
+    params.set('page', String(page));
+
+    const url = `${DISCOGS_API_BASE}/database/search?${params.toString()}`;
+    const mode = criteria.barcode
+      ? `barcode:${criteria.barcode}`
+      : `q:${criteria.q}`;
+    const cacheKey = `discogs:search:${ctx.userId}:${mode}:${page}:${ctx.limit}`;
 
     const raw = await this.cache.getOrFetch<DiscogsSearchResponse>(
       cacheKey,
@@ -312,6 +339,7 @@ export class DiscogsAdapter
         formats: r.formats?.map((f) => f.name),
         labels: r.labels?.map((l) => l.name),
         country: r.country,
+        barcode: extractBarcode(r.identifiers),
         tracklist: r.tracklist,
         uri: r.uri,
       },
@@ -374,6 +402,19 @@ function queryParams(url: string): Record<string, string> {
     out[k] = v;
   });
   return out;
+}
+
+function extractBarcode(
+  identifiers: DiscogsReleaseResponse['identifiers'],
+): string | undefined {
+  // Discogs liste les codes-barres dans `identifiers` (type "Barcode"). On normalise
+  // en gardant uniquement les digits (les valeurs Discogs contiennent parfois des espaces).
+  const found = (identifiers ?? []).find(
+    (i) => i.type?.toLowerCase() === 'barcode' && i.value,
+  );
+  if (!found?.value) return undefined;
+  const digits = found.value.replace(/\D/g, '');
+  return digits.length > 0 ? digits : undefined;
 }
 
 function extractCreatorsFromTitle(title: string | undefined): string[] {

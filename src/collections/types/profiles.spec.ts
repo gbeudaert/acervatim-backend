@@ -28,6 +28,24 @@ describe('VinylItemSchema — champs ajoutés', () => {
       }),
     ).toThrow();
   });
+
+  it('accepte un barcode digits-only et défaut null si absent', () => {
+    const parsed = VinylItemSchema.parse({
+      type: 'vinyl',
+      title: 'A',
+      barcode: '0888072024557',
+    });
+    expect(parsed.barcode).toBe('0888072024557');
+    expect(
+      VinylItemSchema.parse({ type: 'vinyl', title: 'A' }).barcode,
+    ).toBeNull();
+  });
+
+  it('rejette un barcode non numerique', () => {
+    expect(() =>
+      VinylItemSchema.parse({ type: 'vinyl', title: 'A', barcode: 'ABC-123' }),
+    ).toThrow();
+  });
 });
 
 describe('MangaItemSchema — champs ajoutés', () => {

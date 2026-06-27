@@ -42,7 +42,7 @@ describe('SearchService', () => {
     });
     const svc = new SearchService([vinylAdapter, mangaAdapter]);
 
-    const res = await svc.search(USER, 'vinyl', 'miles', undefined, 50);
+    const res = await svc.search(USER, 'vinyl', { q: 'miles' }, undefined, 50);
 
     expect(vinylAdapter.search).toHaveBeenCalledWith('miles', {
       userId: USER,
@@ -59,7 +59,7 @@ describe('SearchService', () => {
       nextCursor: '2',
     });
     const svc = new SearchService([adapter]);
-    const res = await svc.search(USER, 'vinyl', 'q', '1', 25);
+    const res = await svc.search(USER, 'vinyl', { q: 'q' }, '1', 25);
     expect(res).toEqual({
       data: [VINYL_ITEM],
       meta: { pagination: { nextCursor: '2', limit: 25 } },
@@ -69,7 +69,7 @@ describe('SearchService', () => {
   it('propage le cursor au call adapter', async () => {
     const adapter = makeAdapter('vinyl', { items: [], nextCursor: null });
     const svc = new SearchService([adapter]);
-    await svc.search(USER, 'vinyl', 'q', 'cursor-from-client', 10);
+    await svc.search(USER, 'vinyl', { q: 'q' }, 'cursor-from-client', 10);
     expect(adapter.search).toHaveBeenCalledWith('q', {
       userId: USER,
       cursor: 'cursor-from-client',
@@ -81,7 +81,45 @@ describe('SearchService', () => {
     const vinyl = makeAdapter('vinyl', { items: [], nextCursor: null });
     const svc = new SearchService([vinyl]);
     await expect(
-      svc.search(USER, 'book', 'q', undefined, 10),
+      svc.search(USER, 'book', { q: 'q' }, undefined, 10),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('route vers searchByBarcode quand un barcode est fourni', async () => {
+    const adapter = makeAdapter('vinyl', {
+      items: [VINYL_ITEM],
+      nextCursor: null,
+    });
+    const barcodeMock = jest
+      .fn()
+      .mockResolvedValue({ items: [VINYL_ITEM], nextCursor: null });
+    (adapter as unknown as { searchByBarcode: jest.Mock }).searchByBarcode =
+      barcodeMock;
+    const svc = new SearchService([adapter]);
+
+    const res = await svc.search(
+      USER,
+      'vinyl',
+      { barcode: '0888072024557' },
+      undefined,
+      50,
+    );
+
+    expect(barcodeMock).toHaveBeenCalledWith('0888072024557', {
+      userId: USER,
+      cursor: undefined,
+      limit: 50,
+    });
+    expect(adapter.search).not.toHaveBeenCalled();
+    expect(res.data).toEqual([VINYL_ITEM]);
+  });
+
+  it('throw BadRequest si barcode fourni mais adapter sans searchByBarcode', async () => {
+    const adapter = makeAdapter('vinyl', { items: [], nextCursor: null });
+    // makeAdapter ne définit pas searchByBarcode → capacité absente.
+    const svc = new SearchService([adapter]);
+    await expect(
+      svc.search(USER, 'vinyl', { barcode: '0888072024557' }, undefined, 10),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });

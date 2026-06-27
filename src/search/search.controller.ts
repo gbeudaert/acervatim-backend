@@ -22,7 +22,7 @@ export class SearchController {
     return this.search.search(
       userId,
       query.type,
-      query.q,
+      { q: query.q, barcode: query.barcode },
       query.cursor,
       query.limit,
     );

@@ -10,6 +10,12 @@ export const VinylItemSchema = z
     genre: z.array(z.string().max(64)).default([]),
     label: z.string().max(256).optional(),
     format: z.string().max(64).optional(),
+    // Code-barres EAN/UPC (digits only) — issu du scan ou des identifiers Discogs.
+    barcode: z
+      .string()
+      .regex(/^\d{6,14}$/)
+      .nullable()
+      .default(null),
     // Vitesse de gravure (RPM), distincte du format physique.
     recordingSpeed: z
       .enum(['RPM_33', 'RPM_45', 'RPM_78', 'OTHER'])

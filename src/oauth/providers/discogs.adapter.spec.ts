@@ -292,6 +292,50 @@ describe('DiscogsAdapter.search', () => {
   });
 });
 
+describe('DiscogsAdapter.searchByBarcode', () => {
+  it('interroge Discogs avec le paramètre `barcode=` (pas `q=`)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.searchByBarcode('0888072024557', { userId: USER, limit: 50 });
+
+    expect(deps.bucket.consume).toHaveBeenCalledWith(`discogs:${USER}`, 60, 1);
+    const [url] = deps.http.request.mock.calls[0];
+    expect(url).toContain('barcode=0888072024557');
+    expect(url).toContain('type=release');
+    expect(url).not.toContain('q=');
+  });
+
+  it('mappe les résultats vers UnifiedItem comme la recherche texte', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        results: [{ id: 7, title: 'Daft Punk - Discovery', year: 2001 }],
+        pagination: { page: 1, pages: 1 },
+      },
+    });
+
+    const res = await svc.searchByBarcode('0888072024557', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0]).toMatchObject({
+      source: 'discogs',
+      sourceId: '7',
+      mediaType: 'vinyl',
+      creators: ['Daft Punk'],
+    });
+  });
+});
+
 describe('DiscogsAdapter.fetchDetails', () => {
   it('mappe artists + images + released vers UnifiedItem', async () => {
     const { deps, svc } = makeDeps();
@@ -328,5 +372,25 @@ describe('DiscogsAdapter.fetchDetails', () => {
       labels: ['Columbia'],
       country: 'US',
     });
+  });
+
+  it('extrait le barcode depuis identifiers (type "Barcode", digits only)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        id: 99,
+        title: 'Discovery',
+        identifiers: [
+          { type: 'Barcode', value: '0 888072 024557', description: 'Text' },
+          { type: 'Matrix / Runout', value: 'ABC-123' },
+        ],
+      },
+    });
+
+    const item = await svc.fetchDetails('99', { userId: USER, limit: 50 });
+
+    expect(item.metadata).toMatchObject({ barcode: '0888072024557' });
   });
 });
