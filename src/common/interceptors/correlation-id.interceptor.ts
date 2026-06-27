@@ -28,11 +28,15 @@ export class CorrelationIdInterceptor implements NestInterceptor {
     const req = http.getRequest<Request>();
     const res = http.getResponse<Response>();
 
+    // L'AccessLogMiddleware pose deja req.requestId en amont (avant les guards).
+    // On le reutilise pour garder un id unique sur toute la chaine ; fallback
+    // sur le header/genere si l'interceptor est utilise hors middleware (tests).
     const incoming = req.headers[HEADER];
     const id =
-      typeof incoming === 'string' && UUID_RE.test(incoming)
+      req.requestId ??
+      (typeof incoming === 'string' && UUID_RE.test(incoming)
         ? incoming
-        : randomUUID();
+        : randomUUID());
 
     req.requestId = id;
     res.setHeader('X-Request-Id', id);

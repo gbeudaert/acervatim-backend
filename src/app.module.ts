@@ -1,4 +1,9 @@
-import { Module } from '@nestjs/common';
+import {
+  MiddlewareConsumer,
+  Module,
+  NestModule,
+  RequestMethod,
+} from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -10,6 +15,7 @@ import { CollectionsModule } from './collections/collections.module';
 import { AuditLogModule } from './common/audit/audit-log.module';
 import { ApiCacheModule } from './common/cache/api-cache.module';
 import { CryptoModule } from './common/crypto/crypto.module';
+import { AccessLogMiddleware } from './common/logging/access-log.middleware';
 import { HttpModule } from './common/http/http.module';
 import { QuotaModule } from './common/quota/quota.module';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module';
@@ -63,4 +69,14 @@ import { UsersModule } from './users/users.module';
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer
+      .apply(AccessLogMiddleware)
+      .exclude(
+        { path: 'health', method: RequestMethod.ALL },
+        { path: 'health/(.*)', method: RequestMethod.ALL },
+      )
+      .forRoutes('*');
+  }
+}

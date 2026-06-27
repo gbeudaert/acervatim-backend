@@ -61,7 +61,9 @@ interface DiscogsReleaseResponse {
   title?: string;
   year?: number | string;
   released?: string;
-  artists?: { name: string }[];
+  // `anv` = artist name variation (nom tel que credite sur la pochette).
+  // `name` peut porter un suffixe de desambiguisation Discogs : "Nirvana (2)".
+  artists?: { name?: string; anv?: string; join?: string }[];
   images?: { uri?: string; uri150?: string }[];
   thumb?: string;
   uri?: string;
@@ -331,7 +333,7 @@ export class DiscogsAdapter
       sourceId: id,
       mediaType: 'vinyl',
       title: r.title ?? '',
-      creators: (r.artists ?? []).map((a) => a.name).filter(Boolean),
+      creators: (r.artists ?? []).map(cleanArtistName).filter(Boolean),
       releaseDate,
       coverUrl: cover,
       description: r.notes,
@@ -402,6 +404,13 @@ function queryParams(url: string): Record<string, string> {
     out[k] = v;
   });
   return out;
+}
+
+function cleanArtistName(a: { name?: string; anv?: string }): string {
+  // Prefere le nom credite (anv) si present, sinon le nom canonique.
+  // Strip le suffixe de desambiguisation Discogs " (N)" final ("Nirvana (2)").
+  const raw = (a.anv && a.anv.trim()) || a.name || '';
+  return raw.replace(/\s*\(\d+\)$/, '').trim();
 }
 
 function extractBarcode(

@@ -374,6 +374,27 @@ describe('DiscogsAdapter.fetchDetails', () => {
     });
   });
 
+  it('multi-auteurs : prefere anv, strip le suffixe homonyme " (N)"', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        id: 100,
+        title: 'Split',
+        artists: [
+          { name: 'Artiste1' },
+          { name: 'Nirvana (2)' },
+          { name: 'The Beatles', anv: 'Beatles' },
+        ],
+      },
+    });
+
+    const item = await svc.fetchDetails('100', { userId: USER, limit: 50 });
+
+    expect(item.creators).toEqual(['Artiste1', 'Nirvana', 'Beatles']);
+  });
+
   it('extrait le barcode depuis identifiers (type "Barcode", digits only)', async () => {
     const { deps, svc } = makeDeps();
     deps.http.request.mockResolvedValue({
