@@ -17,6 +17,7 @@ import { ApiCacheModule } from './common/cache/api-cache.module';
 import { CryptoModule } from './common/crypto/crypto.module';
 import { AccessLogMiddleware } from './common/logging/access-log.middleware';
 import { HttpModule } from './common/http/http.module';
+import { BnfModule } from './common/sources/bnf/bnf.module';
 import { QuotaModule } from './common/quota/quota.module';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { validateEnv } from './config/env.validation';
@@ -53,6 +54,7 @@ import { UsersModule } from './users/users.module';
     HttpModule,
     ApiCacheModule,
     RateLimitModule,
+    BnfModule,
     QuotaModule,
     AuditLogModule,
     AuthModule,

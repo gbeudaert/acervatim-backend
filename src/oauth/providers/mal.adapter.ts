@@ -12,6 +12,8 @@ import { randomBytes } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
+import { BnfService } from '../../common/sources/bnf/bnf.service';
+import { BnfAuthor } from '../../common/sources/bnf/bnf.types';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { OAuthFlowProvider } from './flow.types';
 import { codeChallengePlain, generateCodeVerifier } from './pkce';
@@ -35,6 +37,20 @@ const RATE_LIMIT_REFILL_PER_SEC = 1;
 
 const MAL_MANGA_FIELDS =
   'id,title,main_picture,start_date,synopsis,authors{first_name,last_name},mean,media_type,status,num_volumes';
+
+// Fields supplémentaires utiles au pivot ISBN→MAL (auteurs pour le match, alternative_titles pour debug).
+const MAL_PIVOT_FIELDS = `${MAL_MANGA_FIELDS},alternative_titles`;
+
+// Types MAL considérés comme "manga" pour la consolidation (exclut light_novel, etc.).
+const MANGA_MEDIA_TYPES = new Set([
+  'manga',
+  'manhwa',
+  'manhua',
+  'one_shot',
+  'doujinshi',
+]);
+
+const PIVOT_SEARCH_LIMIT = 10;
 
 interface PendingState {
   userId: string;
@@ -67,6 +83,15 @@ interface MalMangaNode {
   media_type?: string;
   status?: string;
   num_volumes?: number;
+  alternative_titles?: { synonyms?: string[]; en?: string; ja?: string };
+}
+
+interface PivotCandidate {
+  node: MalMangaNode;
+  rank: number;
+  authorMatched: boolean;
+  typeOk: boolean;
+  confidence: number;
 }
 
 @Injectable()
@@ -88,6 +113,7 @@ export class MalAdapter
     private readonly cache: ApiCacheService,
     private readonly bucket: TokenBucketService,
     private readonly creds: OauthCredentialsService,
+    private readonly bnf: BnfService,
   ) {}
 
   onModuleInit() {
@@ -200,6 +226,103 @@ export class MalAdapter
     return { items, nextCursor };
   }
 
+  /**
+   * Recherche manga par ISBN (EAN-13). Pivot ISBN → BnF (titre original romaji)
+   * → MAL (recherche fuzzy + consolidation auteur/type).
+   *
+   * Logging volontairement explicite sur le process de pivot : ce qu'on a obtenu
+   * de la BnF, ce qu'on a interrogé côté MAL, et ce qu'on a retenu (+ confiance).
+   * Cf. docs/interne/CONTEXT_isbn_to_mal.md.
+   */
+  async searchByBarcode(
+    barcode: string,
+    ctx: AdapterContext,
+  ): Promise<AdapterSearchResult> {
+    const isbn = barcode;
+    this.logger.log(`pivot: start isbn=${isbn}`);
+
+    const resolution = await this.bnf.resolveByIsbn(isbn);
+    if (!resolution.ok) {
+      this.logger.warn(
+        `pivot: bnf unresolved isbn=${isbn} reason=${resolution.reason} -> no candidate`,
+      );
+      return { items: [], nextCursor: null };
+    }
+    const notice = resolution.notice;
+
+    if (!notice.originalTitle) {
+      // BnF a la fiche mais pas de titre original → pivot MAL impossible (cf. log BnF).
+      this.logger.warn(
+        `pivot: bnf_only isbn=${isbn} (pas de titre original) -> pas d'enrichissement MAL`,
+      );
+      return { items: [], nextCursor: null };
+    }
+
+    this.logger.log(
+      `pivot: bnf->mal isbn=${isbn} query="${notice.originalTitle}" author="${notice.authors[0]?.surname ?? notice.authors[0]?.full ?? '-'}" edition="${notice.edition ?? '-'}" 454h="${notice.sourceVolumeRange ?? '-'}"`,
+    );
+
+    await this.consumeRate(ctx.userId);
+    const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(notice.originalTitle)}&limit=${PIVOT_SEARCH_LIMIT}&fields=${encodeURIComponent(MAL_PIVOT_FIELDS)}`;
+    const cacheKey = `mal:pivot:${notice.originalTitle.toLowerCase()}`;
+
+    const raw = await this.cache.getOrFetch<MalSearchResponse>(
+      cacheKey,
+      SEARCH_CACHE_TTL_SECONDS,
+      async () => this.malPublicGet<MalSearchResponse>(url),
+    );
+    const candidates = (raw.data ?? []).map((d) => d.node);
+    this.logger.log(
+      `pivot: mal candidates isbn=${isbn} count=${candidates.length} titles=[${candidates
+        .slice(0, 5)
+        .map((c) => c.title)
+        .join(' | ')}]`,
+    );
+
+    const chosen = this.choosePivotCandidate(candidates, notice.authors);
+    if (!chosen) {
+      this.logger.warn(
+        `pivot: no MAL candidate matched author/type isbn=${isbn} -> bnf_only`,
+      );
+      return { items: [], nextCursor: null };
+    }
+
+    if (
+      chosen.node.status === 'currently_publishing' ||
+      chosen.node.num_volumes === 0
+    ) {
+      this.logger.warn(
+        `pivot: MAL serie en cours / comptage indispo isbn=${isbn} mal_id=${chosen.node.id} status=${chosen.node.status} num_volumes=${chosen.node.num_volumes} -> totalCount peu fiable, privilegier l'enumeration BnF`,
+      );
+    }
+
+    this.logger.log(
+      `pivot: retained isbn=${isbn} mal_id=${chosen.node.id} title="${chosen.node.title}" media_type=${chosen.node.media_type} authorMatch=${chosen.authorMatched} typeOk=${chosen.typeOk} confidence=${chosen.confidence.toFixed(2)}`,
+    );
+
+    const item = this.mapNode(chosen.node);
+    item.metadata = {
+      ...item.metadata,
+      pivot: {
+        isbn,
+        confidence: chosen.confidence,
+        authorMatched: chosen.authorMatched,
+        resolutionPath: 'bnf+mal',
+      },
+      // Données du tome scanné (à reporter dans le tome créé côté client).
+      scannedTome: {
+        isbn,
+        titleFr: notice.titleFr,
+        volume: notice.volume,
+        edition: notice.edition,
+        publisherFr: notice.publisherFr,
+        sourceVolumeRange: notice.sourceVolumeRange,
+      },
+    };
+
+    return { items: [item], nextCursor: null };
+  }
+
   async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
     await this.consumeRate(ctx.userId);
     const url = `${MAL_API_BASE}/manga/${encodeURIComponent(id)}?fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
@@ -228,6 +351,63 @@ export class MalAdapter
       headers: { Authorization: `Bearer ${userCreds.accessToken}` },
     });
     return res.data;
+  }
+
+  /**
+   * Accès aux données PUBLIQUES MAL via `X-MAL-CLIENT-ID` (sans token OAuth user).
+   * Utilisé par le pivot ISBN : la recherche par ISBN ne doit pas exiger que
+   * l'utilisateur ait connecté son compte MAL.
+   */
+  private async malPublicGet<T>(url: string): Promise<T> {
+    if (!this.clientId) {
+      this.logger.error('MAL_CLIENT_ID not configured — pivot impossible');
+      throw new ServiceUnavailableException('mal: not configured');
+    }
+    const res = await this.http.request<T>(url, {
+      method: 'GET',
+      headers: { 'X-MAL-CLIENT-ID': this.clientId },
+    });
+    return res.data;
+  }
+
+  /**
+   * Consolidation : choisit le meilleur candidat MAL pour les auteurs BnF.
+   * Critère d'acceptation : match auteur, OU (type manga ET premier résultat).
+   * Sinon → null (on préfère ne rien retenir plutôt qu'un faux positif silencieux).
+   */
+  private choosePivotCandidate(
+    candidates: MalMangaNode[],
+    bnfAuthors: BnfAuthor[],
+  ): PivotCandidate | null {
+    let best: PivotCandidate | null = null;
+
+    candidates.forEach((node, rank) => {
+      const typeOk = node.media_type
+        ? MANGA_MEDIA_TYPES.has(node.media_type)
+        : false;
+      const authorMatched = matchesAuthor(bnfAuthors, node.authors);
+
+      let confidence = rank === 0 ? 0.3 : Math.max(0, 0.3 - rank * 0.05);
+      if (authorMatched) confidence += 0.5;
+      if (typeOk) confidence += 0.2;
+
+      const cand: PivotCandidate = {
+        node,
+        rank,
+        authorMatched,
+        typeOk,
+        confidence,
+      };
+      if (!best || cand.confidence > best.confidence) best = cand;
+    });
+
+    if (!best) return null;
+    // Garde-fou anti faux-positif : exiger un signal fort.
+    const b: PivotCandidate = best;
+    if (!b.authorMatched && !(b.typeOk && b.rank === 0)) {
+      return null;
+    }
+    return b;
   }
 
   private async consumeRate(userId: string): Promise<void> {
@@ -281,6 +461,52 @@ export class MalAdapter
 
 function pendingKey(state: string): string {
   return `oauth-mal-pending:${state}`;
+}
+
+/** Normalise un nom : minuscules, sans accents/diacritiques. */
+function normName(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .trim();
+}
+
+/** Tokens d'un nom (mots ≥ 2 lettres), pour comparer sans tenir compte de l'ordre. */
+function nameTokens(s: string | undefined): string[] {
+  if (!s) return [];
+  return normName(s)
+    .split(/[\s,]+/)
+    .filter((w) => w.length >= 2);
+}
+
+/**
+ * Match auteur BnF ↔ MAL : vrai si au moins un token de nom (nom/prénom) est
+ * commun. Insensible à la casse, aux accents et à l'ordre nom/prénom — c'est le
+ * validateur robuste du pivot (le titre romaji peut matcher par chance, l'auteur
+ * confirme). Ex. BnF 700$a "Isayama" ↔ MAL last_name "Isayama".
+ */
+function matchesAuthor(
+  bnfAuthors: BnfAuthor[],
+  malAuthors: MalMangaNode['authors'],
+): boolean {
+  if (!bnfAuthors?.length || !malAuthors?.length) return false;
+
+  const malTokens = new Set(
+    malAuthors.flatMap((a) => [
+      ...nameTokens(a.node?.first_name),
+      ...nameTokens(a.node?.last_name),
+    ]),
+  );
+  if (malTokens.size === 0) return false;
+
+  const bnfTokens = bnfAuthors.flatMap((a) => [
+    ...nameTokens(a.surname),
+    ...nameTokens(a.given),
+    ...nameTokens(a.full),
+  ]);
+
+  return bnfTokens.some((t) => malTokens.has(t));
 }
 
 function parseOffset(cursor: string | undefined): number {

@@ -31,6 +31,11 @@ export const EnvSchema = z.object({
     .url()
     .default('http://localhost:3000/v1/oauth/mal/callback'),
   TMDB_API_KEY: z.string().optional(),
+  // Catalogue général BnF (SRU) — résolveur ISBN→titre original pour le pivot manga.
+  BNF_SRU_BASE_URL: z
+    .string()
+    .url()
+    .default('https://catalogue.bnf.fr/api/SRU'),
   // Google Play Billing — optionnels en dev/test, requis en prod pour activer
   // verify + RTDN. Le JSON du service account est encodé base64 pour éviter les
   // newlines (private_key contient des \n littéraux).

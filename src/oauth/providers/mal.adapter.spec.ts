@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
+import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { MalAdapter } from './mal.adapter';
 
@@ -27,6 +28,7 @@ interface MockDeps {
     remove: jest.Mock;
     listConnected: jest.Mock;
   };
+  bnf: { resolveByIsbn: jest.Mock };
 }
 
 function makeConfig(
@@ -63,6 +65,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     remove: jest.fn(),
     listConnected: jest.fn(),
   };
+  const bnf = { resolveByIsbn: jest.fn() };
 
   const svc = new MalAdapter(
     config,
@@ -70,9 +73,10 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     cache as unknown as ApiCacheService,
     bucket as unknown as TokenBucketService,
     creds as unknown as OauthCredentialsService,
+    bnf as unknown as BnfService,
   );
   svc.onModuleInit();
-  return { deps: { config, http, cache, bucket, creds }, svc };
+  return { deps: { config, http, cache, bucket, creds, bnf }, svc };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -298,5 +302,123 @@ describe('MalAdapter.search', () => {
 
     const res = await svc.search('x', { userId: USER, limit: 50 });
     expect(res.nextCursor).toBe('50'); // 0 + 50
+  });
+});
+
+describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
+  const NOTICE = {
+    isbn: '9782811623258',
+    ark: 'http://catalogue.bnf.fr/ark:/12148/cb44459249t',
+    titleFr: "L'attaque des titans",
+    volume: '1',
+    edition: 'Éd. colossale',
+    publisherFr: 'Pika édition',
+    seriesTitle: 'Pika seinen',
+    originalTitle: 'Shingeki no kyojin',
+    originalTitleSource: '454$t' as const,
+    sourceVolumeRange: '1-3',
+    authors: [{ surname: 'Isayama', given: 'Hajime', full: 'Hajime Isayama' }],
+    publicationDate: 'DL 2015',
+    ongoing: false,
+  };
+
+  function malManga(node: Record<string, unknown>) {
+    return {
+      status: 200,
+      headers: {},
+      data: { data: [{ node }], paging: {} },
+    };
+  }
+
+  it('résout via BnF (X-MAL-CLIENT-ID public), retient le match auteur et porte le 454$h dans metadata.scannedTome', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
+    deps.http.request.mockResolvedValue(
+      malManga({
+        id: 23390,
+        title: 'Shingeki no Kyojin',
+        media_type: 'manga',
+        status: 'finished',
+        num_volumes: 34,
+        authors: [
+          {
+            node: { first_name: 'Hajime', last_name: 'Isayama' },
+            role: 'Story & Art',
+          },
+        ],
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+
+    // Recherche MAL en accès public (pas de Bearer user).
+    const [url, opts] = deps.http.request.mock.calls[0];
+    expect(url).toContain('q=Shingeki%20no%20kyojin');
+    expect(opts.headers['X-MAL-CLIENT-ID']).toBe('cid');
+    expect(opts.headers.Authorization).toBeUndefined();
+
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].sourceId).toBe('23390');
+    const meta = res.items[0].metadata as Record<string, any>;
+    expect(meta.pivot).toMatchObject({
+      authorMatched: true,
+      resolutionPath: 'bnf+mal',
+    });
+    expect(meta.scannedTome).toMatchObject({
+      edition: 'Éd. colossale',
+      sourceVolumeRange: '1-3',
+      volume: '1',
+    });
+  });
+
+  it('renvoie 0 item si BnF ne résout pas', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    const res = await svc.searchByBarcode('0000000000000', {
+      userId: USER,
+      limit: 50,
+    });
+    expect(res.items).toHaveLength(0);
+    expect(deps.http.request).not.toHaveBeenCalled();
+  });
+
+  it('rejette un candidat sans match auteur ni type (anti faux-positif)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
+    deps.http.request.mockResolvedValue(
+      malManga({
+        id: 999,
+        title: 'Autre oeuvre',
+        media_type: 'light_novel',
+        authors: [
+          { node: { first_name: 'Ryo', last_name: 'Kawakami' }, role: 'Story' },
+        ],
+      }),
+    );
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+    expect(res.items).toHaveLength(0);
+  });
+
+  it('bnf_only si la notice n’a pas de titre original', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: { ...NOTICE, originalTitle: null, originalTitleSource: null },
+    });
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+    expect(res.items).toHaveLength(0);
+    expect(deps.http.request).not.toHaveBeenCalled();
   });
 });

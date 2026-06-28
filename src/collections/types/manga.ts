@@ -18,6 +18,10 @@ export const MangaItemSchema = z
     publisherFr: z.string().max(256).nullable().default(null),
     // Nombre de pages du tome.
     pageCount: z.number().int().positive().nullable().default(null),
+    // Plage de tomes de l'édition SOURCE couverte par ce tome FR (BnF 454$h).
+    // Ex "1-3" pour un tome d'édition Colossale qui compile les tomes 1 à 3 de
+    // l'édition standard. null = édition standard (mapping 1:1).
+    sourceVolumeRange: z.string().max(64).nullable().default(null),
   })
   .strict();
 
