@@ -1,6 +1,8 @@
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { CursorPage } from '../common/pagination/paginate';
+import { BnfService } from '../common/sources/bnf/bnf.service';
+import { EditionMapping } from '../common/sources/bnf/bnf.types';
 import { SOURCE_ADAPTERS } from '../common/sources/source-snapshot.service';
 import {
   AdapterSearchResult,
@@ -18,8 +20,23 @@ export interface SearchCriteria {
 export class SearchService {
   private readonly byMediaType: Map<CollectionTypeCode, SourceAdapter>;
 
-  constructor(@Inject(SOURCE_ADAPTERS) adapters: SourceAdapter[]) {
+  constructor(
+    @Inject(SOURCE_ADAPTERS) adapters: SourceAdapter[],
+    private readonly bnf: BnfService,
+  ) {
     this.byMediaType = new Map(adapters.map((a) => [a.mediaType, a]));
+  }
+
+  /**
+   * Énumère une édition manga complète (« toute la série d'un coup ») via la BnF.
+   * Sert à afficher le bon nombre de tomes (ex 12 pour la Colossale) et leur
+   * correspondance avec l'édition source.
+   */
+  async editionMapping(
+    titleFr: string,
+    edition?: string,
+  ): Promise<EditionMapping> {
+    return this.bnf.enumerateEdition(titleFr, edition ?? null);
   }
 
   async search(

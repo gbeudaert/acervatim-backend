@@ -93,6 +93,54 @@ describe('BnfService', () => {
     if (res.ok) expect(res.notice.ongoing).toBe(true);
   });
 
+  it('énumère une édition : filtre 205, dédup par tome, dérive le compte', async () => {
+    const rec = (
+      vol: string,
+      ed205: string | null,
+      h454: string | null,
+      isbn: string,
+    ) => `<srw:record><srw:recordData>
+      <mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2">
+        <mxc:datafield tag="010" ind1=" " ind2=" "><mxc:subfield code="a">${isbn}</mxc:subfield></mxc:datafield>
+        <mxc:datafield tag="200" ind1="1" ind2=" ">
+          <mxc:subfield code="a">L'attaque des titans</mxc:subfield>
+          <mxc:subfield code="h">${vol}</mxc:subfield>
+        </mxc:datafield>
+        ${ed205 ? `<mxc:datafield tag="205" ind1=" " ind2=" "><mxc:subfield code="a">${ed205}</mxc:subfield></mxc:datafield>` : ''}
+        ${h454 ? `<mxc:datafield tag="454" ind1=" " ind2="1"><mxc:subfield code="t">Shingeki no kyojin</mxc:subfield><mxc:subfield code="h">${h454}</mxc:subfield></mxc:datafield>` : ''}
+      </mxc:record></srw:recordData></srw:record>`;
+
+    const guide = `<srw:record><srw:recordData>
+      <mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2">
+        <mxc:datafield tag="200" ind1="1" ind2=" "><mxc:subfield code="a">L'attaque des titans : guide officiel</mxc:subfield></mxc:datafield>
+      </mxc:record></srw:recordData></srw:record>`;
+
+    const xml = `<srw:searchRetrieveResponse xmlns:srw="x">
+      <srw:numberOfRecords>5</srw:numberOfRecords>
+      <srw:records>
+        ${rec('1', 'Éd. colossale', 'vol. 1-3', '978-1')}
+        ${rec('2', 'Éd. colossale', 'vol. 4-6', '978-2')}
+        ${rec('2', 'Éd. colossale', 'vol. 4-6', '978-2bis')}
+        ${rec('1', null, null, '978-std')}
+        ${guide}
+      </srw:records></srw:searchRetrieveResponse>`;
+
+    const { svc } = makeService(xml);
+    const mapping = await svc.enumerateEdition(
+      "L'attaque des titans",
+      'Éd. colossale',
+    );
+
+    expect(mapping.tomeCount).toBe(2); // T.1 + T.2 (dédup), std + guide exclus
+    expect(mapping.tomes.map((t) => t.editionVolume)).toEqual([1, 2]);
+    expect(mapping.tomes[0]).toMatchObject({
+      editionVolume: 1,
+      sourceVolumeRange: '1-3',
+      isbn: '978-1',
+    });
+    expect(mapping.tomes[1].sourceVolumeRange).toBe('4-6');
+  });
+
   it('tombe en 500$a quand 454$t est absent', async () => {
     const xml = COLOSSALE_XML.replace(
       /<mxc:datafield tag="454"[\s\S]*?<\/mxc:datafield>/,

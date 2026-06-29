@@ -1,11 +1,19 @@
 import { BadRequestException } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
+import { BnfService } from '../common/sources/bnf/bnf.service';
 import {
   AdapterSearchResult,
   SourceAdapter,
   UnifiedItem,
 } from '../oauth/providers/types';
 import { SearchService } from './search.service';
+
+const bnfMock = { enumerateEdition: jest.fn() };
+const bnf = bnfMock as unknown as BnfService;
+
+function makeService(adapters: SourceAdapter[]): SearchService {
+  return new SearchService(adapters, bnf);
+}
 
 function makeAdapter(
   mediaType: CollectionTypeCode,
@@ -40,7 +48,7 @@ describe('SearchService', () => {
       items: [],
       nextCursor: null,
     });
-    const svc = new SearchService([vinylAdapter, mangaAdapter]);
+    const svc = makeService([vinylAdapter, mangaAdapter]);
 
     const res = await svc.search(USER, 'vinyl', { q: 'miles' }, undefined, 50);
 
@@ -58,7 +66,7 @@ describe('SearchService', () => {
       items: [VINYL_ITEM],
       nextCursor: '2',
     });
-    const svc = new SearchService([adapter]);
+    const svc = makeService([adapter]);
     const res = await svc.search(USER, 'vinyl', { q: 'q' }, '1', 25);
     expect(res).toEqual({
       data: [VINYL_ITEM],
@@ -68,7 +76,7 @@ describe('SearchService', () => {
 
   it('propage le cursor au call adapter', async () => {
     const adapter = makeAdapter('vinyl', { items: [], nextCursor: null });
-    const svc = new SearchService([adapter]);
+    const svc = makeService([adapter]);
     await svc.search(USER, 'vinyl', { q: 'q' }, 'cursor-from-client', 10);
     expect(adapter.search).toHaveBeenCalledWith('q', {
       userId: USER,
@@ -79,7 +87,7 @@ describe('SearchService', () => {
 
   it("throw BadRequest si aucun adapter n'est enregistré pour ce type (ex: book)", async () => {
     const vinyl = makeAdapter('vinyl', { items: [], nextCursor: null });
-    const svc = new SearchService([vinyl]);
+    const svc = makeService([vinyl]);
     await expect(
       svc.search(USER, 'book', { q: 'q' }, undefined, 10),
     ).rejects.toBeInstanceOf(BadRequestException);
@@ -95,7 +103,7 @@ describe('SearchService', () => {
       .mockResolvedValue({ items: [VINYL_ITEM], nextCursor: null });
     (adapter as unknown as { searchByBarcode: jest.Mock }).searchByBarcode =
       barcodeMock;
-    const svc = new SearchService([adapter]);
+    const svc = makeService([adapter]);
 
     const res = await svc.search(
       USER,
@@ -117,9 +125,40 @@ describe('SearchService', () => {
   it('throw BadRequest si barcode fourni mais adapter sans searchByBarcode', async () => {
     const adapter = makeAdapter('vinyl', { items: [], nextCursor: null });
     // makeAdapter ne définit pas searchByBarcode → capacité absente.
-    const svc = new SearchService([adapter]);
+    const svc = makeService([adapter]);
     await expect(
       svc.search(USER, 'vinyl', { barcode: '0888072024557' }, undefined, 10),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('editionMapping délègue à BnfService.enumerateEdition (titre + édition)', async () => {
+    const mapping = {
+      titleFr: "L'attaque des titans",
+      edition: 'Éd. colossale',
+      tomeCount: 12,
+      tomes: [],
+      recordsScanned: 30,
+      ongoing: false,
+    };
+    bnfMock.enumerateEdition.mockResolvedValue(mapping);
+    const svc = makeService([]);
+
+    const res = await svc.editionMapping(
+      "L'attaque des titans",
+      'Éd. colossale',
+    );
+
+    expect(bnfMock.enumerateEdition).toHaveBeenCalledWith(
+      "L'attaque des titans",
+      'Éd. colossale',
+    );
+    expect(res).toBe(mapping);
+  });
+
+  it('editionMapping passe null quand aucune édition (standard)', async () => {
+    bnfMock.enumerateEdition.mockResolvedValue({ tomeCount: 34 });
+    const svc = makeService([]);
+    await svc.editionMapping('Naruto');
+    expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null);
   });
 });

@@ -317,6 +317,9 @@ export class MalAdapter
         edition: notice.edition,
         publisherFr: notice.publisherFr,
         sourceVolumeRange: notice.sourceVolumeRange,
+        // Libellé de correspondance dérivé (ex "Tomes 1, 2, 3"). Présentation —
+        // séparé de la note privée userData, à afficher en tête côté app.
+        sourceVolumeLabel: volumeRangeLabel(notice.sourceVolumeRange),
       },
     };
 
@@ -461,6 +464,25 @@ export class MalAdapter
 
 function pendingKey(state: string): string {
   return `oauth-mal-pending:${state}`;
+}
+
+/**
+ * Libellé de correspondance inter-édition depuis un `454$h` normalisé.
+ * "1-3" → "Tomes 1, 2, 3" ; "5" → "Tome 5" ; null → null.
+ */
+function volumeRangeLabel(range: string | null): string | null {
+  if (!range) return null;
+  const m = range.match(/^(\d+)\s*-\s*(\d+)$/);
+  if (m) {
+    const from = Number(m[1]);
+    const to = Number(m[2]);
+    if (Number.isFinite(from) && Number.isFinite(to) && to >= from) {
+      const list: number[] = [];
+      for (let v = from; v <= to; v++) list.push(v);
+      return `Tomes ${list.join(', ')}`;
+    }
+  }
+  return /^\d+$/.test(range) ? `Tome ${range}` : `Tomes ${range}`;
 }
 
 /** Normalise un nom : minuscules, sans accents/diacritiques. */

@@ -3,7 +3,13 @@ import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../cache/api-cache.service';
 import { HttpClientService } from '../../http/http-client.service';
 import { TokenBucketService } from '../../rate-limit/token-bucket.service';
-import { BnfAuthor, BnfNotice, BnfResolution } from './bnf.types';
+import {
+  BnfAuthor,
+  BnfNotice,
+  BnfResolution,
+  EditionMapping,
+  EditionTome,
+} from './bnf.types';
 import {
   allDatafields,
   controlfield,
@@ -15,6 +21,8 @@ import {
 
 const DEFAULT_BASE_URL = 'https://catalogue.bnf.fr/api/SRU';
 const NOTICE_CACHE_TTL_SECONDS = 30 * 24 * 3600; // notices biblio quasi immuables.
+const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des tomes.
+const EDITION_MAX_RECORDS = 100; // une édition longue + bruit (rééditions, guides).
 
 // Throttle global poli (BnF ne publie pas de quota strict, mais c'est un service public).
 const RATE_LIMIT_BUCKET = 'bnf:global';
@@ -110,6 +118,120 @@ export class BnfService implements OnModuleInit {
     return { ok: true, notice };
   }
 
+  /**
+   * Énumère TOUS les tomes d'une édition (« récupérer toute la série d'un coup »).
+   * Recherche par titre FR + filtre sur l'édition (205), dédup par n° de tome.
+   * Best-effort : le catalogue est bruité (rééditions, guides, séries en cours) —
+   * on loggue le bruit et on renvoie ce qui est exploitable.
+   *
+   * @param titleFr  titre FR de la série (ex "L'attaque des titans")
+   * @param edition  mention d'édition 205 (ex "Éd. colossale") ; null = édition standard
+   */
+  async enumerateEdition(
+    titleFr: string,
+    edition: string | null = null,
+  ): Promise<EditionMapping> {
+    const empty: EditionMapping = {
+      titleFr,
+      edition,
+      tomeCount: 0,
+      tomes: [],
+      recordsScanned: 0,
+      ongoing: false,
+    };
+
+    const allowed = await this.bucket.consume(
+      RATE_LIMIT_BUCKET,
+      RATE_LIMIT_CAPACITY,
+      RATE_LIMIT_REFILL_PER_SEC,
+    );
+    if (!allowed) {
+      this.logger.warn(`bnf: edition rate limited title="${titleFr}"`);
+      return empty;
+    }
+
+    const params = new URLSearchParams({
+      version: '1.2',
+      operation: 'searchRetrieve',
+      recordSchema: 'unimarcxchange',
+      maximumRecords: String(EDITION_MAX_RECORDS),
+      query: `bib.title all "${titleFr}"`,
+    });
+    const url = `${this.baseUrl}?${params.toString()}`;
+    const cacheKey = `bnf:edition:${titleFr.toLowerCase()}:${(edition ?? 'standard').toLowerCase()}`;
+
+    let xml: string;
+    try {
+      xml = await this.cache.getOrFetch<string>(
+        cacheKey,
+        EDITION_CACHE_TTL_SECONDS,
+        async () => {
+          const res = await this.http.request<string>(url, { method: 'GET' });
+          return typeof res.data === 'string' ? res.data : String(res.data);
+        },
+      );
+    } catch {
+      this.logger.warn(`bnf: edition fetch failed title="${titleFr}"`);
+      return empty;
+    }
+
+    const parsed = parseUnimarc(xml);
+    const wantEdition = normalizeEdition(edition);
+
+    const byVolume = new Map<number, EditionTome>();
+    let ongoing = false;
+    for (const rec of parsed.records) {
+      const rec205 = normalizeEdition(firstSubfield(rec, '205', 'a') ?? null);
+      if (rec205 !== wantEdition) continue; // mauvaise édition (ou standard vs collector)
+
+      const volume = parseVolume(firstSubfield(rec, '200', 'h'));
+      if (volume === null) continue; // pas un tome numéroté → bruit (guide, intégrale…)
+
+      if (!byVolume.has(volume)) {
+        byVolume.set(volume, {
+          editionVolume: volume,
+          sourceVolumeRange: normalizeVolumeRange(
+            firstSubfield(rec, '454', 'h'),
+          ),
+          isbn: firstSubfield(rec, '010', 'a') ?? null,
+          titleFr: firstSubfield(rec, '200', 'a') ?? null,
+        });
+      }
+      const date =
+        firstSubfield(rec, '210', 'd') ??
+        firstSubfield(rec, '214', 'd') ??
+        null;
+      if (isOngoing(date)) ongoing = true;
+    }
+
+    const tomes = [...byVolume.values()].sort(
+      (a, b) => a.editionVolume - b.editionVolume,
+    );
+
+    this.logger.log(
+      `bnf: edition title="${titleFr}" edition="${edition ?? 'standard'}" recordsScanned=${parsed.records.length} tomesKept=${tomes.length}${ongoing ? ' ONGOING' : ''}`,
+    );
+    if (tomes.length === 0) {
+      this.logger.warn(
+        `bnf: edition NO tome matched title="${titleFr}" edition="${edition ?? 'standard'}" (titre/edition introuvables ou catalogage non exploitable)`,
+      );
+    }
+    if (ongoing) {
+      this.logger.warn(
+        `bnf: edition ONGOING title="${titleFr}" -> tomeCount potentiellement incomplet`,
+      );
+    }
+
+    return {
+      titleFr,
+      edition,
+      tomeCount: tomes.length,
+      tomes,
+      recordsScanned: parsed.records.length,
+      ongoing,
+    };
+  }
+
   private extractNotice(rec: UnimarcRecord, isbn: string): BnfNotice {
     const originalFrom454 = firstSubfield(rec, '454', 't');
     const originalFrom500 = firstSubfield(rec, '500', 'a');
@@ -191,6 +313,25 @@ function extractAuthors(rec: UnimarcRecord): BnfAuthor[] {
     if (f) authors.push({ full: f });
   }
   return authors;
+}
+
+/** "Éd. colossale" → "colossale" ; null/standard → "". Pour comparer les éditions. */
+function normalizeEdition(raw: string | null): string {
+  if (!raw) return '';
+  return raw
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/\b(ed|edition)\.?\b/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/** "1" → 1 ; "31" → 31 ; "T. 5" → 5 ; non numérique → null. */
+function parseVolume(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const m = raw.match(/\d+/);
+  return m ? Number(m[0]) : null;
 }
 
 /** "vol. 1-3" / "T. 1-3" / "1-3" → "1-3". null si rien d'exploitable. */
