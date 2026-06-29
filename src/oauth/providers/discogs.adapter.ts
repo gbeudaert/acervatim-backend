@@ -310,7 +310,7 @@ export class DiscogsAdapter
       source: 'discogs',
       sourceId: id,
       mediaType: 'vinyl',
-      title: r.title ?? '',
+      title: stripArtistFromTitle(r.title),
       creators: extractCreatorsFromTitle(r.title),
       releaseDate: r.year ? `${r.year}-01-01` : undefined,
       coverUrl: r.cover_image ?? r.thumb ?? undefined,
@@ -433,4 +433,14 @@ function extractCreatorsFromTitle(title: string | undefined): string[] {
   const idx = title.indexOf(' - ');
   if (idx === -1) return [];
   return [title.slice(0, idx).trim()].filter(Boolean);
+}
+
+function stripArtistFromTitle(title: string | undefined): string {
+  // Pendant de extractCreatorsFromTitle : retire le prefixe "Artist - " pour ne
+  // garder que le titre. Split au PREMIER " - " (un titre peut en contenir d'autres).
+  // Sans separateur, le titre est deja propre → renvoye tel quel.
+  if (!title) return '';
+  const idx = title.indexOf(' - ');
+  if (idx === -1) return title.trim();
+  return title.slice(idx + 3).trim();
 }

@@ -237,7 +237,8 @@ describe('DiscogsAdapter.search', () => {
       source: 'discogs',
       sourceId: '1',
       mediaType: 'vinyl',
-      title: 'Miles Davis - Kind of Blue',
+      // Le prefixe artiste "Miles Davis - " est retire du titre.
+      title: 'Kind of Blue',
       creators: ['Miles Davis'],
       releaseDate: '1959-01-01',
       coverUrl: 'https://img/cover.jpg',
@@ -331,8 +332,25 @@ describe('DiscogsAdapter.searchByBarcode', () => {
       source: 'discogs',
       sourceId: '7',
       mediaType: 'vinyl',
+      title: 'Discovery',
       creators: ['Daft Punk'],
     });
+  });
+
+  it('garde le titre tel quel quand il ne contient pas de separateur " - "', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        results: [{ id: 8, title: 'Untitled', year: 2020 }],
+        pagination: { page: 1, pages: 1 },
+      },
+    });
+
+    const res = await svc.search('untitled', { userId: USER, limit: 50 });
+
+    expect(res.items[0]).toMatchObject({ title: 'Untitled', creators: [] });
   });
 });
 
