@@ -1,6 +1,6 @@
 # Acervatim Backend — Règles dures pour l'agent IA
 
-Ce fichier est chargé automatiquement à chaque session Claude Code. Il contient les **règles non négociables**. Le contexte projet détaillé est dans [docs/interne/context-ia.md](docs/interne/context-ia.md). Les sprints à implémenter sont indexés dans [docs/interne/sprints/README.md](docs/interne/sprints/README.md).
+Ce fichier est chargé automatiquement à chaque session Claude Code. Il contient les **règles non négociables**. Le contexte projet détaillé est dans [docs/travail/context-ia.md](docs/travail/context-ia.md). Les sprints à implémenter sont indexés dans [docs/interne/sprints/README.md](docs/interne/sprints/README.md).
 
 ## Stack imposée
 

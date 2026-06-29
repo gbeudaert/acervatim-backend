@@ -37,7 +37,9 @@ prisma/*.db-journal
 openapi.json
 
 # Docs internes (non publiées)
+# docs/interne/ = sprints uniquement ; docs/travail/ = matière de travail (context-ia, specs, guides, reviews)
 docs/interne/
+docs/travail/
 
 # Claude Code config locale
 .claude/
