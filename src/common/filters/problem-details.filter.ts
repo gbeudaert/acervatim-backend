@@ -207,12 +207,25 @@ export class ProblemDetailsExceptionFilter implements ExceptionFilter {
       body.errors = zodIssuesToErrors(zodError.issues);
     }
 
+    // Log de toutes les erreurs HTTP renvoyees : 5xx en `error` (avec stack),
+    // 4xx en `warn`. Privacy by design : on logge le statut, le titre, le detail
+    // et le resume des champs invalides (nom + code Zod), jamais les valeurs du
+    // body ni les headers.
     if (mapped.status >= 500) {
       const stack =
         exception instanceof Error ? exception.stack : String(exception);
       this.logger.error(
-        `[${requestId}] ${mapped.title}: ${body.detail}`,
+        `[${requestId}] ${mapped.status} ${mapped.title}: ${body.detail}`,
         stack,
+      );
+    } else if (mapped.status >= 400) {
+      const fields = body.errors?.length
+        ? ` fields=[${body.errors
+            .map((e) => `${e.field}:${e.code}`)
+            .join(', ')}]`
+        : '';
+      this.logger.warn(
+        `[${requestId}] ${mapped.status} ${mapped.title}: ${body.detail}${fields}`,
       );
     }
 

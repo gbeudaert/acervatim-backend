@@ -5,6 +5,7 @@ import {
   HierarchyLevel,
   ItemProjectionRow,
   LightItem,
+  optionalUrl,
 } from './common';
 
 // TOME (item). `volume` est une colonne structurelle, pas dans unifiedData.
@@ -13,7 +14,7 @@ export const MangaItemSchema = z
   .object({
     type: z.literal('manga'),
     title: z.string().max(512).optional(),
-    coverUrl: z.string().url().nullable().default(null),
+    coverUrl: optionalUrl(),
     // Éditeur de l'édition française du tome.
     publisherFr: z.string().max(256).nullable().default(null),
     // Nombre de pages du tome.
@@ -41,7 +42,7 @@ export const MangaSerieSchema = z
       .nullable()
       .default(null),
     synopsis: z.string().max(4000).nullable().default(null),
-    coverUrl: z.string().url().nullable().default(null),
+    coverUrl: optionalUrl(),
   })
   .strip();
 

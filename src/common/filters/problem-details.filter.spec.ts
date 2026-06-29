@@ -158,6 +158,45 @@ describe('ProblemDetailsExceptionFilter', () => {
     });
   });
 
+  it('logge les erreurs 4xx en warn avec le resume des champs invalides', () => {
+    const filter = new ProblemDetailsExceptionFilter();
+    const warn = jest
+      .spyOn(
+        (filter as unknown as { logger: { warn: (m: string) => void } }).logger,
+        'warn',
+      )
+      .mockImplementation((_m: string) => undefined);
+    const res = makeRes();
+    const host = makeHost({ url: '/v1/x', requestId: 'r1' }, res);
+
+    const schema = z.object({ coverUrl: z.string().url() });
+    const parsed = schema.safeParse({ coverUrl: '' });
+    if (parsed.success) throw new Error('expected zod failure for test');
+    filter.catch(new ZodValidationException(parsed.error as ZodError), host);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('400');
+    expect(warn.mock.calls[0][0]).toContain('coverUrl:invalid_string');
+  });
+
+  it('logge les erreurs 5xx en error avec la stack', () => {
+    const filter = new ProblemDetailsExceptionFilter();
+    const error = jest
+      .spyOn(
+        (filter as unknown as { logger: { error: (m: string) => void } })
+          .logger,
+        'error',
+      )
+      .mockImplementation((_m: string) => undefined);
+    const res = makeRes();
+    const host = makeHost({ url: '/v1/boom', requestId: 'r2' }, res);
+
+    filter.catch(new Error('boom'), host);
+
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0][0]).toContain('500');
+  });
+
   it("génère un requestId si l'interceptor n'a pas tourné", () => {
     const filter = new ProblemDetailsExceptionFilter();
     const res = makeRes();

@@ -19,6 +19,32 @@ describe('VinylItemSchema — champs ajoutés', () => {
     expect(parsed.country).toBeNull();
   });
 
+  it('coerce coverUrl="" (client tolérant) en null', () => {
+    const parsed = VinylItemSchema.parse({
+      type: 'vinyl',
+      title: 'A',
+      coverUrl: '',
+    });
+    expect(parsed.coverUrl).toBeNull();
+  });
+
+  it('accepte une coverUrl valide et rejette une URL malformée', () => {
+    expect(
+      VinylItemSchema.parse({
+        type: 'vinyl',
+        title: 'A',
+        coverUrl: 'https://example.test/c.jpg',
+      }).coverUrl,
+    ).toBe('https://example.test/c.jpg');
+    expect(() =>
+      VinylItemSchema.parse({
+        type: 'vinyl',
+        title: 'A',
+        coverUrl: 'not-a-url',
+      }),
+    ).toThrow();
+  });
+
   it('rejette une recordingSpeed inconnue', () => {
     expect(() =>
       VinylItemSchema.parse({

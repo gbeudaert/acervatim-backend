@@ -1,5 +1,16 @@
-import { ZodType } from 'zod';
+import { z, ZodType } from 'zod';
 import { UnifiedItem } from '../../oauth/providers/types';
+
+/**
+ * URL optionnelle tolérante : accepte une URL valide, `null`, l'absence, ou la
+ * chaîne vide `""` (que certains clients envoient pour « pas de valeur »). `""`
+ * est coercé en `null` avant validation. Défaut `null`.
+ */
+export const optionalUrl = () =>
+  z.preprocess(
+    (v) => (v === '' ? null : v),
+    z.string().url().nullable().default(null),
+  );
 
 /** Référence d'une source candidate (provider + identifiant externe). */
 export interface SourceRef {

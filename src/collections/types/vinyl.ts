@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { CollectionTypeProfile, ItemProjectionRow, LightItem } from './common';
+import {
+  CollectionTypeProfile,
+  ItemProjectionRow,
+  LightItem,
+  optionalUrl,
+} from './common';
 
 // vinyl — type plat (pas de hiérarchie).
 export const VinylItemSchema = z
@@ -24,7 +29,7 @@ export const VinylItemSchema = z
     // Pays de pressage (libre, code ou nom).
     country: z.string().max(64).nullable().default(null),
     releaseDate: z.string().date().nullable().default(null),
-    coverUrl: z.string().url().nullable().default(null),
+    coverUrl: optionalUrl(),
   })
   .strict();
 
