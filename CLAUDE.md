@@ -2,6 +2,16 @@
 
 Ce fichier est chargé automatiquement à chaque session Claude Code. Il contient les **règles non négociables**. Le contexte projet détaillé est dans [docs/travail/context-ia.md](docs/travail/context-ia.md). Les sprints à implémenter sont indexés dans [docs/interne/sprints/README.md](docs/interne/sprints/README.md).
 
+## Documentation — où mettre à jour quoi
+
+Trois emplacements distincts, **ne pas les confondre** :
+
+- **Doc destinée à être lue** (utilisateur / développeur / légal) → dépôt **`acervatim-docs`** ([`../acervatim-docs`](../acervatim-docs)), site Jekyll public, espaces `utilisateur/` · `developpeur/` · `legal/`. Toute évolution qui change un contrat API, l'archi, le déploiement, l'auth, la confidentialité… se répercute **là**, dans la page concernée (ex. [`developpeur/api-reference.md`](../acervatim-docs/developpeur/api-reference.md), [`developpeur/deploiement-raspberry-pi.md`](../acervatim-docs/developpeur/deploiement-raspberry-pi.md), [`developpeur/auth-google.md`](../acervatim-docs/developpeur/auth-google.md), [`legal/confidentialite.md`](../acervatim-docs/legal/confidentialite.md)). Le **code reste la source de vérité** ; `acervatim-docs` en est la vue normalisée.
+- **Sprints** → `docs/interne/sprints/` (gitignored) : **statut et périmètre des sprints uniquement**.
+- **Matière de travail** → `docs/travail/` (gitignored) : `context-ia.md`, `api-mobile-spec.md`, guides d'implémentation (`archives/`), études, reviews. Notes internes, **non publiées**.
+
+Règle : ne pas recréer sous `docs/` une doc qui a sa place dans `acervatim-docs` ; ne pas publier dans `acervatim-docs` de la matière de travail (context-ia, reviews, brouillons). La politique de confidentialité **canonique** vit dans `acervatim-docs/legal/` — `docs/politique-confidentialite.md` n'est qu'un pointeur, ne pas l'éditer.
+
 ## Stack imposée
 
 - Node.js 24.x (LTS) · NestJS 10 · Prisma 6 · MariaDB 10.5+ (provider `mysql`)
