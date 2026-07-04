@@ -6,12 +6,14 @@ import { OauthCredentialsService } from './oauth.service';
 import { DiscogsAdapter } from './providers/discogs.adapter';
 import { MalAdapter } from './providers/mal.adapter';
 import { TmdbAdapter } from './providers/tmdb.adapter';
+import { TokenResolverService } from './token-resolver.service';
 
 @Module({
   imports: [AuthModule], // pour JwtAuthGuard
   controllers: [OauthController],
   providers: [
     OauthCredentialsService,
+    TokenResolverService,
     DiscogsAdapter,
     MalAdapter,
     TmdbAdapter,
@@ -23,6 +25,12 @@ import { TmdbAdapter } from './providers/tmdb.adapter';
       inject: [DiscogsAdapter, MalAdapter],
     },
   ],
-  exports: [OauthCredentialsService, DiscogsAdapter, MalAdapter, TmdbAdapter],
+  exports: [
+    OauthCredentialsService,
+    TokenResolverService,
+    DiscogsAdapter,
+    MalAdapter,
+    TmdbAdapter,
+  ],
 })
 export class OauthModule {}
