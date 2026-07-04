@@ -52,6 +52,10 @@ const MANGA_MEDIA_TYPES = new Set([
 
 const PIVOT_SEARCH_LIMIT = 10;
 
+// Seuil de similarité de titre (contenance/Dice) au-delà duquel un candidat manga
+// est retenu SANS match auteur (cf. §4 du brief, calibré ~0.85).
+const PIVOT_TITLE_STRONG = 0.85;
+
 interface PendingState {
   userId: string;
   codeVerifier: string;
@@ -91,6 +95,8 @@ interface PivotCandidate {
   rank: number;
   authorMatched: boolean;
   typeOk: boolean;
+  /** Similarité titre requête↔candidat ∈ [0,1] (1 = contenance exacte). */
+  titleScore: number;
   confidence: number;
 }
 
@@ -250,21 +256,30 @@ export class MalAdapter
     }
     const notice = resolution.notice;
 
-    if (!notice.originalTitle) {
-      // BnF a la fiche mais pas de titre original → pivot MAL impossible (cf. log BnF).
+    // Choix de la requête MAL et de sa validation :
+    //  - titre original (454$t romaji) présent → pont fiable, validation souple
+    //    (auteur OU type+rang0), resolutionPath 'bnf+mal'.
+    //  - sinon repli sur le titre FR (identique à l'original pour les titres en
+    //    graphie latine : Black torch, One Piece…). Le titre FR étant plus
+    //    générique (homonymes), on EXIGE le match auteur, resolutionPath 'bnf+mal-fr'.
+    const useOriginal = !!notice.originalTitle;
+    const query = notice.originalTitle ?? notice.titleFr ?? null;
+    if (!query) {
+      // Ni titre original ni titre FR exploitable → pivot MAL impossible (cf. log BnF).
       this.logger.warn(
-        `pivot: bnf_only isbn=${isbn} (pas de titre original) -> pas d'enrichissement MAL`,
+        `pivot: bnf_only isbn=${isbn} (ni titre original ni titre FR) -> pas d'enrichissement MAL`,
       );
       return { items: [], nextCursor: null };
     }
+    const requireAuthor = !useOriginal;
 
     this.logger.log(
-      `pivot: bnf->mal isbn=${isbn} query="${notice.originalTitle}" author="${notice.authors[0]?.surname ?? notice.authors[0]?.full ?? '-'}" edition="${notice.edition ?? '-'}" 454h="${notice.sourceVolumeRange ?? '-'}"`,
+      `pivot: bnf->mal isbn=${isbn} query="${query}" via=${useOriginal ? '454$t' : 'titleFr(fallback)'} requireAuthor=${requireAuthor} author="${notice.authors[0]?.surname ?? notice.authors[0]?.full ?? '-'}" edition="${notice.edition ?? '-'}" 454h="${notice.sourceVolumeRange ?? '-'}"`,
     );
 
     await this.consumeRate(ctx.userId);
-    const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(notice.originalTitle)}&limit=${PIVOT_SEARCH_LIMIT}&fields=${encodeURIComponent(MAL_PIVOT_FIELDS)}`;
-    const cacheKey = `mal:pivot:${notice.originalTitle.toLowerCase()}`;
+    const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(query)}&limit=${PIVOT_SEARCH_LIMIT}&fields=${encodeURIComponent(MAL_PIVOT_FIELDS)}`;
+    const cacheKey = `mal:pivot:${query.toLowerCase()}`;
 
     const raw = await this.cache.getOrFetch<MalSearchResponse>(
       cacheKey,
@@ -279,10 +294,15 @@ export class MalAdapter
         .join(' | ')}]`,
     );
 
-    const chosen = this.choosePivotCandidate(candidates, notice.authors);
+    const chosen = this.choosePivotCandidate(
+      candidates,
+      notice.authors,
+      query,
+      requireAuthor,
+    );
     if (!chosen) {
       this.logger.warn(
-        `pivot: no MAL candidate matched author/type isbn=${isbn} -> bnf_only`,
+        `pivot: no MAL candidate matched ${requireAuthor ? 'author (fallback titre FR)' : 'author/type'} isbn=${isbn} -> bnf_only`,
       );
       return { items: [], nextCursor: null };
     }
@@ -297,22 +317,31 @@ export class MalAdapter
     }
 
     this.logger.log(
-      `pivot: retained isbn=${isbn} mal_id=${chosen.node.id} title="${chosen.node.title}" media_type=${chosen.node.media_type} authorMatch=${chosen.authorMatched} typeOk=${chosen.typeOk} confidence=${chosen.confidence.toFixed(2)}`,
+      `pivot: retained isbn=${isbn} mal_id=${chosen.node.id} title="${chosen.node.title}" media_type=${chosen.node.media_type} titleSim=${chosen.titleScore.toFixed(2)} authorMatch=${chosen.authorMatched} typeOk=${chosen.typeOk} confidence=${chosen.confidence.toFixed(2)}`,
     );
 
     const item = this.mapNode(chosen.node);
+    // Synopsis : la note de résumé BnF (330$a) est en français quand présente ;
+    // on la privilégie, avec repli sur le synopsis MAL (anglais). Cf. §3 du brief :
+    // MAL ne fournit aucun synopsis localisé.
+    if (notice.noteFr) {
+      item.description = notice.noteFr;
+    }
     item.metadata = {
       ...item.metadata,
       pivot: {
         isbn,
         confidence: chosen.confidence,
         authorMatched: chosen.authorMatched,
-        resolutionPath: 'bnf+mal',
+        resolutionPath: useOriginal ? 'bnf+mal' : 'bnf+mal-fr',
       },
       // Données du tome scanné (à reporter dans le tome créé côté client).
       scannedTome: {
         isbn,
         titleFr: notice.titleFr,
+        // Titre de la SÉRIE (461$t) pour l'énumération des tomes et le nom de série —
+        // distinct de titleFr qui peut être le titre du tome (ex Ki-oon "Je vais te tuer").
+        seriesTitleFr: notice.seriesTitle,
         volume: notice.volume,
         edition: notice.edition,
         publisherFr: notice.publisherFr,
@@ -375,12 +404,23 @@ export class MalAdapter
 
   /**
    * Consolidation : choisit le meilleur candidat MAL pour les auteurs BnF.
-   * Critère d'acceptation : match auteur, OU (type manga ET premier résultat).
-   * Sinon → null (on préfère ne rien retenir plutôt qu'un faux positif silencieux).
+   * Critère d'acceptation par défaut : match auteur, OU (type manga ET premier
+   * résultat). Sinon → null (on préfère ne rien retenir plutôt qu'un faux positif).
+   *
+   * Score = combinaison de la similarité de titre (contenance/Dice, cf. §4 du brief),
+   * du match auteur et du type. La contenance du titre-requête dans le titre MAL
+   * (ex "Tokyo toritsu" ⊂ "Jujutsu Kaisen 0: Tokyo Toritsu…") est un signal fort ;
+   * conjuguée au match auteur elle donne un match ~certain (confidence ≈ 1).
+   *
+   * @param query        titre interrogé (454$t romaji, ou titleFr en repli).
+   * @param requireAuthor exige le match auteur (repli sur titre FR : le titre seul
+   *   ne suffit pas à valider, l'auteur est le garde-fou anti-homonyme).
    */
   private choosePivotCandidate(
     candidates: MalMangaNode[],
     bnfAuthors: BnfAuthor[],
+    query: string,
+    requireAuthor = false,
   ): PivotCandidate | null {
     let best: PivotCandidate | null = null;
 
@@ -389,16 +429,23 @@ export class MalAdapter
         ? MANGA_MEDIA_TYPES.has(node.media_type)
         : false;
       const authorMatched = matchesAuthor(bnfAuthors, node.authors);
+      const titleScore = titleSimilarity(query, node.title);
 
-      let confidence = rank === 0 ? 0.3 : Math.max(0, 0.3 - rank * 0.05);
-      if (authorMatched) confidence += 0.5;
-      if (typeOk) confidence += 0.2;
+      // Combinaison linéaire (max = 1.0) : titre 0.45, auteur 0.40, type 0.15.
+      // "titre contenu + auteur" ≈ 0.85+, +type → 1.0 (match certain). Le rang MAL
+      // ne sert que de départage infinitésimal entre scores égaux.
+      let confidence =
+        0.45 * titleScore +
+        0.4 * (authorMatched ? 1 : 0) +
+        0.15 * (typeOk ? 1 : 0);
+      confidence = Math.max(0, confidence - rank * 0.001);
 
       const cand: PivotCandidate = {
         node,
         rank,
         authorMatched,
         typeOk,
+        titleScore,
         confidence,
       };
       if (!best || cand.confidence > best.confidence) best = cand;
@@ -407,7 +454,16 @@ export class MalAdapter
     if (!best) return null;
     // Garde-fou anti faux-positif : exiger un signal fort.
     const b: PivotCandidate = best;
-    if (!b.authorMatched && !(b.typeOk && b.rank === 0)) {
+    if (requireAuthor) {
+      // Repli titre FR : l'auteur est le SEUL validateur fiable (le titre a pu
+      // matcher un homonyme). Pas de match auteur → on ne retient rien.
+      if (!b.authorMatched) return null;
+    } else if (
+      !b.authorMatched &&
+      !(b.typeOk && b.titleScore >= PIVOT_TITLE_STRONG)
+    ) {
+      // Sans auteur : on n'accepte qu'un manga dont le titre est fortement similaire
+      // (contenance / Dice ≥ seuil) — pas un simple « premier résultat » douteux.
       return null;
     }
     return b;
@@ -529,6 +585,50 @@ function matchesAuthor(
   ]);
 
   return bnfTokens.some((t) => malTokens.has(t));
+}
+
+/**
+ * Similarité titre requête↔candidat ∈ [0,1]. Contenance (une chaîne incluse dans
+ * l'autre, ex "tokyo toritsu" ⊂ "jujutsu kaisen 0: tokyo toritsu…") → 1.0 ; sinon
+ * coefficient de Dice sur bigrammes de caractères (fuzzy, tolère les variantes de
+ * romanisation BnF↔MAL type "jyouou"/"joou"). Normalisation : minuscules, sans
+ * diacritiques, espaces compactés.
+ */
+function titleSimilarity(query: string, candidate: string | undefined): number {
+  const q = normTitle(query);
+  const c = normTitle(candidate ?? '');
+  if (!q || !c) return 0;
+  if (c.includes(q) || q.includes(c)) return 1;
+  return diceCoefficient(q, c);
+}
+
+function normTitle(s: string): string {
+  return normName(s).replace(/\s+/g, ' ').trim();
+}
+
+/** Coefficient de Dice sur bigrammes de caractères ∈ [0,1]. */
+function diceCoefficient(a: string, b: string): number {
+  const baseA = a.replace(/\s+/g, '');
+  const baseB = b.replace(/\s+/g, '');
+  if (baseA.length < 2 || baseB.length < 2) return baseA === baseB ? 1 : 0;
+  const bigrams = new Map<string, number>();
+  for (let i = 0; i < baseA.length - 1; i++) {
+    const bg = baseA.slice(i, i + 2);
+    bigrams.set(bg, (bigrams.get(bg) ?? 0) + 1);
+  }
+  let overlap = 0;
+  let totalB = 0;
+  for (let i = 0; i < baseB.length - 1; i++) {
+    totalB++;
+    const bg = baseB.slice(i, i + 2);
+    const count = bigrams.get(bg) ?? 0;
+    if (count > 0) {
+      bigrams.set(bg, count - 1);
+      overlap++;
+    }
+  }
+  const totalA = baseA.length - 1;
+  return (2 * overlap) / (totalA + totalB);
 }
 
 function parseOffset(cursor: string | undefined): number {

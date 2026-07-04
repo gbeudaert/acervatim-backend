@@ -21,7 +21,12 @@ export interface BnfNotice {
   edition: string | null;
   /** 210$c | 214$c — éditeur de l'édition FR. */
   publisherFr: string | null;
-  /** 225$a — collection (peut être l'œuvre OU une collection éditeur). */
+  /**
+   * Titre de la **série** FR, pour énumérer tous les tomes et nommer la série.
+   * Source : `461$t` (lien « fait partie de », fiable) → `225$a` (collection) →
+   * `titleFr` (200$a) en dernier recours. Distinct de `titleFr` qui, chez certains
+   * éditeurs (Ki-oon), porte le titre du **tome** (ex "Je vais te tuer") et non de la série.
+   */
   seriesTitle: string | null;
   /** 454$t (fallback 500$a) — titre original (romaji), pont vers MAL. */
   originalTitle: string | null;
@@ -29,6 +34,8 @@ export interface BnfNotice {
   originalTitleSource: '454$t' | '500$a' | null;
   /** 454$h normalisé — plage de tomes source couverte (ex "1-3" pour une Colossale). */
   sourceVolumeRange: string | null;
+  /** 330$a — note de résumé (en français quand présente). Souvent absente pour les mangas. */
+  noteFr: string | null;
   authors: BnfAuthor[];
   /** 210$d | 214$d — date de publication brute. */
   publicationDate: string | null;

@@ -15,6 +15,7 @@ const COLOSSALE_XML = `<srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov
         <mxc:subfield code="c">Pika édition</mxc:subfield>
         <mxc:subfield code="d">DL 2015</mxc:subfield>
       </mxc:datafield>
+      <mxc:datafield tag="330" ind1=" " ind2=" "><mxc:subfield code="a">Dans un monde ravagé par les Titans, l'humanité se réfugie derrière de gigantesques murs.</mxc:subfield></mxc:datafield>
       <mxc:datafield tag="454" ind1=" " ind2="1">
         <mxc:subfield code="t">Shingeki no kyojin</mxc:subfield>
         <mxc:subfield code="h">vol. 1-3</mxc:subfield>
@@ -63,6 +64,7 @@ describe('BnfService', () => {
     expect(n.originalTitle).toBe('Shingeki no kyojin');
     expect(n.originalTitleSource).toBe('454$t');
     expect(n.sourceVolumeRange).toBe('1-3');
+    expect(n.noteFr).toContain('Titans'); // 330$a — note de résumé FR
     expect(n.edition).toBe('Éd. colossale');
     expect(n.publisherFr).toBe('Pika édition');
     expect(n.volume).toBe('1');
@@ -139,6 +141,51 @@ describe('BnfService', () => {
       isbn: '978-1',
     });
     expect(mapping.tomes[1].sourceVolumeRange).toBe('4-6');
+  });
+
+  it('énumère un catalogage Ki-oon : série en 461$t, n° en 225$v, 200$a = titre de tome', async () => {
+    // Chaque tome a un TITRE PROPRE en 200$a (pas le titre de série) et AUCUN 200$h ;
+    // le n° est en 225$v et la série en 225$a/461$t. Cf. Jujutsu kaisen (Ki-oon).
+    const tome = (
+      title: string,
+      vol: string,
+      isbn: string,
+    ) => `<srw:record><srw:recordData>
+      <mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2">
+        <mxc:datafield tag="010" ind1=" " ind2=" "><mxc:subfield code="a">${isbn}</mxc:subfield></mxc:datafield>
+        <mxc:datafield tag="200" ind1="1" ind2=" "><mxc:subfield code="a">${title}</mxc:subfield></mxc:datafield>
+        <mxc:datafield tag="225" ind1="1" ind2="9"><mxc:subfield code="a">Jujutsu kaisen</mxc:subfield><mxc:subfield code="v">${vol}</mxc:subfield></mxc:datafield>
+        <mxc:datafield tag="461" ind1=" " ind2="0"><mxc:subfield code="t">Jujutsu kaisen</mxc:subfield><mxc:subfield code="v">${parseInt(vol, 10)}</mxc:subfield></mxc:datafield>
+      </mxc:record></srw:recordData></srw:record>`;
+
+    // Bruit : notice d'ensemble (pas de n°) + one-shot séparé "Jujutsu Kaisen 0".
+    const ensemble = `<srw:record><srw:recordData><mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2">
+      <mxc:datafield tag="200" ind1="1" ind2=" "><mxc:subfield code="a">Jujutsu kaisen</mxc:subfield></mxc:datafield>
+      </mxc:record></srw:recordData></srw:record>`;
+    const zero = `<srw:record><srw:recordData><mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2">
+      <mxc:datafield tag="200" ind1="1" ind2=" "><mxc:subfield code="a">Jujutsu Kaisen 0</mxc:subfield></mxc:datafield>
+      </mxc:record></srw:recordData></srw:record>`;
+
+    const xml = `<srw:searchRetrieveResponse xmlns:srw="x">
+      <srw:numberOfRecords>5</srw:numberOfRecords>
+      <srw:records>
+        ${tome('Ryomen Sukuna', '01', '978-1')}
+        ${tome('Naissance de la matrice', '02', '978-2')}
+        ${tome('Je vais te tuer', '04', '978-4')}
+        ${ensemble}
+        ${zero}
+      </srw:records></srw:searchRetrieveResponse>`;
+
+    const { svc } = makeService(xml);
+    const mapping = await svc.enumerateEdition('Jujutsu kaisen');
+
+    expect(mapping.tomes.map((t) => t.editionVolume)).toEqual([1, 2, 4]); // ensemble + JJK 0 exclus
+    expect(mapping.tomes[0]).toMatchObject({
+      editionVolume: 1,
+      titleFr: 'Ryomen Sukuna',
+      isbn: '978-1',
+    });
+    expect(mapping.tomes[2].titleFr).toBe('Je vais te tuer');
   });
 
   it('tombe en 500$a quand 454$t est absent', async () => {

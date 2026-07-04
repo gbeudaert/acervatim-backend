@@ -313,10 +313,11 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     volume: '1',
     edition: 'Éd. colossale',
     publisherFr: 'Pika édition',
-    seriesTitle: 'Pika seinen',
+    seriesTitle: "L'attaque des titans",
     originalTitle: 'Shingeki no kyojin',
     originalTitleSource: '454$t' as const,
     sourceVolumeRange: '1-3',
+    noteFr: null,
     authors: [{ surname: 'Isayama', given: 'Hajime', full: 'Hajime Isayama' }],
     publicationDate: 'DL 2015',
     ongoing: false,
@@ -371,7 +372,72 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       edition: 'Éd. colossale',
       sourceVolumeRange: '1-3',
       volume: '1',
+      seriesTitleFr: "L'attaque des titans", // 461$t, pour énumérer les tomes
     });
+  });
+
+  it('sélectionne par contenance de titre + auteur même si un leurre est au rang 0 (Tokyo toritsu → JJK 0)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: {
+        ...NOTICE,
+        titleFr: "L'école d'exorcisme de Tokyo",
+        edition: null,
+        originalTitle: 'Tokyo toritsu',
+        sourceVolumeRange: null,
+        authors: [{ surname: 'Akutami', given: 'Gege', full: 'Gege Akutami' }],
+      },
+    });
+    // Rang 0 = leurre (bon type, mauvais auteur, titre non contenu) ; rang 1 = JJK 0
+    // (titre-requête contenu dans le titre MAL + auteur Akutami).
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        data: [
+          {
+            node: {
+              id: 63,
+              title: 'Tokyo Ghoul:re',
+              media_type: 'manga',
+              authors: [
+                {
+                  node: { first_name: 'Sui', last_name: 'Ishida' },
+                  role: 'Story & Art',
+                },
+              ],
+            },
+          },
+          {
+            node: {
+              id: 115710,
+              title:
+                'Jujutsu Kaisen 0: Tokyo Toritsu Jujutsu Koutou Senmon Gakkou',
+              media_type: 'manga',
+              authors: [
+                {
+                  node: { first_name: 'Gege', last_name: 'Akutami' },
+                  role: 'Story & Art',
+                },
+              ],
+            },
+          },
+        ],
+        paging: {},
+      },
+    });
+
+    const res = await svc.searchByBarcode('9791032706688', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].sourceId).toBe('115710'); // JJK, pas le leurre rang 0
+    const meta = res.items[0].metadata as Record<string, any>;
+    expect(meta.pivot.authorMatched).toBe(true);
+    expect(meta.pivot.confidence).toBeGreaterThan(0.9); // titre contenu + auteur + type
   });
 
   it('renvoie 0 item si BnF ne résout pas', async () => {
@@ -408,11 +474,94 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     expect(res.items).toHaveLength(0);
   });
 
-  it('bnf_only si la notice n’a pas de titre original', async () => {
+  it('fallback titre FR quand pas de titre original : interroge MAL avec titleFr, valide par auteur (resolutionPath bnf+mal-fr)', async () => {
+    const { deps, svc } = makeDeps();
+    // Cas "Black torch" : titre latin identique à l'original, mais 454$t/500$a absents.
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: {
+        ...NOTICE,
+        titleFr: 'Black torch',
+        originalTitle: null,
+        originalTitleSource: null,
+        authors: [{ surname: 'Takaki', full: 'Tsuyoshi Takaki' }],
+      },
+    });
+    deps.http.request.mockResolvedValue(
+      malManga({
+        id: 113399,
+        title: 'Black Torch',
+        media_type: 'manga',
+        authors: [
+          {
+            node: { first_name: 'Tsuyoshi', last_name: 'Takaki' },
+            role: 'Story & Art',
+          },
+        ],
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9791032701881', {
+      userId: USER,
+      limit: 50,
+    });
+
+    // MAL interrogé avec le titre FR (repli).
+    const [url] = deps.http.request.mock.calls[0];
+    expect(url).toContain('q=Black%20torch');
+
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].sourceId).toBe('113399');
+    const meta = res.items[0].metadata as Record<string, any>;
+    expect(meta.pivot).toMatchObject({
+      authorMatched: true,
+      resolutionPath: 'bnf+mal-fr',
+    });
+  });
+
+  it('fallback titre FR : rejette si aucun match auteur (le titre seul ne suffit pas, anti-homonyme)', async () => {
     const { deps, svc } = makeDeps();
     deps.bnf.resolveByIsbn.mockResolvedValue({
       ok: true,
-      notice: { ...NOTICE, originalTitle: null, originalTitleSource: null },
+      notice: {
+        ...NOTICE,
+        titleFr: 'Black torch',
+        originalTitle: null,
+        originalTitleSource: null,
+        authors: [{ surname: 'Takaki', full: 'Tsuyoshi Takaki' }],
+      },
+    });
+    // Premier résultat de bon type mais AUTRE auteur : accepté en pivot normal
+    // (type+rang0), refusé en fallback FR (requireAuthor).
+    deps.http.request.mockResolvedValue(
+      malManga({
+        id: 42,
+        title: 'Black Torch (homonyme)',
+        media_type: 'manga',
+        authors: [
+          { node: { first_name: 'Someone', last_name: 'Else' }, role: 'Story' },
+        ],
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9791032701881', {
+      userId: USER,
+      limit: 50,
+    });
+    expect(deps.http.request).toHaveBeenCalled(); // MAL bien interrogé…
+    expect(res.items).toHaveLength(0); // …mais rien retenu sans match auteur.
+  });
+
+  it('bnf_only si ni titre original ni titre FR (aucune requête MAL)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: {
+        ...NOTICE,
+        titleFr: null,
+        originalTitle: null,
+        originalTitleSource: null,
+      },
     });
     const res = await svc.searchByBarcode('9782811623258', {
       userId: USER,
@@ -420,5 +569,33 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
     expect(res.items).toHaveLength(0);
     expect(deps.http.request).not.toHaveBeenCalled();
+  });
+
+  it('privilégie la note BnF FR (330$a) comme description, sinon synopsis MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: { ...NOTICE, noteFr: 'Résumé en français depuis la BnF.' },
+    });
+    deps.http.request.mockResolvedValue(
+      malManga({
+        id: 23390,
+        title: 'Shingeki no Kyojin',
+        media_type: 'manga',
+        synopsis: 'English synopsis from MAL.',
+        authors: [
+          {
+            node: { first_name: 'Hajime', last_name: 'Isayama' },
+            role: 'Story & Art',
+          },
+        ],
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+    expect(res.items[0].description).toBe('Résumé en français depuis la BnF.');
   });
 });

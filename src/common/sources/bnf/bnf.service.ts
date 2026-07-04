@@ -22,7 +22,10 @@ import {
 const DEFAULT_BASE_URL = 'https://catalogue.bnf.fr/api/SRU';
 const NOTICE_CACHE_TTL_SECONDS = 30 * 24 * 3600; // notices biblio quasi immuables.
 const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des tomes.
-const EDITION_MAX_RECORDS = 100; // une édition longue + bruit (rééditions, guides).
+// Une notice par tome, mais le titre matche aussi le bruit (standard + collector +
+// spin-offs + guides + rééditions) : un titre populaire dépasse largement 100 notices.
+const EDITION_PAGE_SIZE = 100; // par requête SRU.
+const EDITION_MAX_RECORDS = 400; // plafond cumulé sur toutes les pages (garde-fou BnF).
 
 // Throttle global poli (BnF ne publie pas de quota strict, mais c'est un service public).
 const RATE_LIMIT_BUCKET = 'bnf:global';
@@ -140,51 +143,38 @@ export class BnfService implements OnModuleInit {
       ongoing: false,
     };
 
-    const allowed = await this.bucket.consume(
-      RATE_LIMIT_BUCKET,
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!allowed) {
-      this.logger.warn(`bnf: edition rate limited title="${titleFr}"`);
-      return empty;
-    }
+    const { records, total, complete } =
+      await this.fetchEditionRecords(titleFr);
+    if (records.length === 0) return empty;
 
-    const params = new URLSearchParams({
-      version: '1.2',
-      operation: 'searchRetrieve',
-      recordSchema: 'unimarcxchange',
-      maximumRecords: String(EDITION_MAX_RECORDS),
-      query: `bib.title all "${titleFr}"`,
-    });
-    const url = `${this.baseUrl}?${params.toString()}`;
-    const cacheKey = `bnf:edition:${titleFr.toLowerCase()}:${(edition ?? 'standard').toLowerCase()}`;
-
-    let xml: string;
-    try {
-      xml = await this.cache.getOrFetch<string>(
-        cacheKey,
-        EDITION_CACHE_TTL_SECONDS,
-        async () => {
-          const res = await this.http.request<string>(url, { method: 'GET' });
-          return typeof res.data === 'string' ? res.data : String(res.data);
-        },
-      );
-    } catch {
-      this.logger.warn(`bnf: edition fetch failed title="${titleFr}"`);
-      return empty;
-    }
-
-    const parsed = parseUnimarc(xml);
     const wantEdition = normalizeEdition(edition);
+    const wantSeries = normalizeSeriesKey(titleFr);
 
     const byVolume = new Map<number, EditionTome>();
     let ongoing = false;
-    for (const rec of parsed.records) {
+    for (const rec of records) {
+      // Appartenance à la série : le catalogage BnF varie (461$t « fait partie de »,
+      // sinon 225$a collection, sinon 200$a). Exclut les spin-offs et homonymes qui
+      // matchent le titre mais ne sont pas la même série (ex "…: Before the Fall").
+      const recSeries = normalizeSeriesKey(
+        firstSubfield(rec, '461', 't') ??
+          firstSubfield(rec, '225', 'a') ??
+          firstSubfield(rec, '200', 'a') ??
+          null,
+      );
+      if (recSeries !== wantSeries) continue;
+
       const rec205 = normalizeEdition(firstSubfield(rec, '205', 'a') ?? null);
       if (rec205 !== wantEdition) continue; // mauvaise édition (ou standard vs collector)
 
-      const volume = parseVolume(firstSubfield(rec, '200', 'h'));
+      // N° de tome : 461$v (ensemble) → 225$v (collection) → 200$h. Certains éditeurs
+      // (Ki-oon) ne mettent PAS le n° en 200$h mais en 225$v/461$v — le lire seul
+      // ne remontait qu'un tome.
+      const volume = parseVolume(
+        firstSubfield(rec, '461', 'v') ??
+          firstSubfield(rec, '225', 'v') ??
+          firstSubfield(rec, '200', 'h'),
+      );
       if (volume === null) continue; // pas un tome numéroté → bruit (guide, intégrale…)
 
       if (!byVolume.has(volume)) {
@@ -209,11 +199,16 @@ export class BnfService implements OnModuleInit {
     );
 
     this.logger.log(
-      `bnf: edition title="${titleFr}" edition="${edition ?? 'standard'}" recordsScanned=${parsed.records.length} tomesKept=${tomes.length}${ongoing ? ' ONGOING' : ''}`,
+      `bnf: edition title="${titleFr}" edition="${edition ?? 'standard'}" recordsScanned=${records.length} numberOfRecords=${total} tomesKept=${tomes.length}${complete ? '' : ' TRUNCATED'}${ongoing ? ' ONGOING' : ''}`,
     );
     if (tomes.length === 0) {
       this.logger.warn(
         `bnf: edition NO tome matched title="${titleFr}" edition="${edition ?? 'standard'}" (titre/edition introuvables ou catalogage non exploitable)`,
+      );
+    }
+    if (!complete) {
+      this.logger.warn(
+        `bnf: edition TRUNCATED title="${titleFr}" recordsScanned=${records.length}/${total} (plafond EDITION_MAX_RECORDS=${EDITION_MAX_RECORDS}) -> tomes potentiellement manquants`,
       );
     }
     if (ongoing) {
@@ -227,9 +222,81 @@ export class BnfService implements OnModuleInit {
       edition,
       tomeCount: tomes.length,
       tomes,
-      recordsScanned: parsed.records.length,
+      recordsScanned: records.length,
       ongoing,
     };
+  }
+
+  /**
+   * Récupère TOUTES les notices BnF d'un titre via pagination SRU (`startRecord`).
+   * Un seul page de 100 ne suffit pas pour un titre populaire (standard + collector
+   * + spin-offs + guides) : les tomes catalogués au-delà étaient silencieusement
+   * perdus. Best-effort : `complete=false` si on s'arrête sur plafond/erreur/quota.
+   */
+  private async fetchEditionRecords(titleFr: string): Promise<{
+    records: UnimarcRecord[];
+    total: number;
+    complete: boolean;
+  }> {
+    const all: UnimarcRecord[] = [];
+    let total = 0;
+    let complete = true;
+    let startRecord = 1; // SRU est indexé à partir de 1.
+
+    while (startRecord <= EDITION_MAX_RECORDS) {
+      const allowed = await this.bucket.consume(
+        RATE_LIMIT_BUCKET,
+        RATE_LIMIT_CAPACITY,
+        RATE_LIMIT_REFILL_PER_SEC,
+      );
+      if (!allowed) {
+        this.logger.warn(
+          `bnf: edition rate limited title="${titleFr}" startRecord=${startRecord}`,
+        );
+        complete = false;
+        break;
+      }
+
+      const params = new URLSearchParams({
+        version: '1.2',
+        operation: 'searchRetrieve',
+        recordSchema: 'unimarcxchange',
+        maximumRecords: String(EDITION_PAGE_SIZE),
+        startRecord: String(startRecord),
+        query: `bib.title all "${titleFr}"`,
+      });
+      const url = `${this.baseUrl}?${params.toString()}`;
+      const cacheKey = `bnf:edition-page:${titleFr.toLowerCase()}:${startRecord}`;
+
+      let xml: string;
+      try {
+        xml = await this.cache.getOrFetch<string>(
+          cacheKey,
+          EDITION_CACHE_TTL_SECONDS,
+          async () => {
+            const res = await this.http.request<string>(url, { method: 'GET' });
+            return typeof res.data === 'string' ? res.data : String(res.data);
+          },
+        );
+      } catch {
+        this.logger.warn(
+          `bnf: edition fetch failed title="${titleFr}" startRecord=${startRecord}`,
+        );
+        complete = false;
+        break;
+      }
+
+      const parsed = parseUnimarc(xml);
+      if (parsed.numberOfRecords > 0) total = parsed.numberOfRecords;
+      all.push(...parsed.records);
+
+      if (parsed.records.length === 0) break; // plus de notices à récupérer.
+      if (all.length >= total) break; // tout récupéré (selon le serveur).
+      startRecord += parsed.records.length;
+    }
+
+    if (all.length < total) complete = false; // plafond atteint avant la fin.
+    return { records: all, total, complete };
   }
 
   private extractNotice(rec: UnimarcRecord, isbn: string): BnfNotice {
@@ -255,10 +322,15 @@ export class BnfService implements OnModuleInit {
         firstSubfield(rec, '210', 'c') ??
         firstSubfield(rec, '214', 'c') ??
         null,
-      seriesTitle: firstSubfield(rec, '225', 'a') ?? null,
+      seriesTitle:
+        firstSubfield(rec, '461', 't') ??
+        firstSubfield(rec, '225', 'a') ??
+        firstSubfield(rec, '200', 'a') ??
+        null,
       originalTitle,
       originalTitleSource,
       sourceVolumeRange: normalizeVolumeRange(firstSubfield(rec, '454', 'h')),
+      noteFr: firstSubfield(rec, '330', 'a') ?? null,
       authors: extractAuthors(rec),
       publicationDate,
       ongoing: isOngoing(publicationDate),
@@ -313,6 +385,18 @@ function extractAuthors(rec: UnimarcRecord): BnfAuthor[] {
     if (f) authors.push({ full: f });
   }
   return authors;
+}
+
+/** Clé de série normalisée (minuscules, sans accents ni ponctuation) pour comparer
+ * l'appartenance : "Maid sama !" et "Maid sama" → "maid sama". */
+function normalizeSeriesKey(raw: string | null): string {
+  if (!raw) return '';
+  return raw
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }
 
 /** "Éd. colossale" → "colossale" ; null/standard → "". Pour comparer les éditions. */
