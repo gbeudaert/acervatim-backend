@@ -36,6 +36,8 @@ export const EnvSchema = z.object({
     .url()
     .default('http://localhost:3000/v1/oauth/mal/callback'),
   TMDB_API_KEY: z.string().optional(),
+  // Google Books — résolveur de jaquette par ISBN (clé optionnelle : quota réduit sans elle).
+  GOOGLE_BOOKS_API_KEY: z.string().optional(),
   // Catalogue général BnF (SRU) — résolveur ISBN→titre original pour le pivot manga.
   BNF_SRU_BASE_URL: z
     .string()

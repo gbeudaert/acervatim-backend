@@ -3,11 +3,11 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CursorPage } from '../common/pagination/paginate';
-import { EditionMapping } from '../common/sources/bnf/bnf.types';
 import { UnifiedItem } from '../oauth/providers/types';
+import { CoverQueryDto } from './dto/cover.query';
 import { EditionMappingQueryDto } from './dto/edition-mapping.query';
 import { SearchQueryDto } from './dto/search.query';
-import { SearchService } from './search.service';
+import { EditionMappingResponse, SearchService } from './search.service';
 
 @ApiTags('search')
 @ApiBearerAuth()
@@ -38,7 +38,18 @@ export class SearchController {
   @Get('edition-mapping')
   async editionMapping(
     @Query() query: EditionMappingQueryDto,
-  ): Promise<EditionMapping> {
+  ): Promise<EditionMappingResponse> {
     return this.search.editionMapping(query.title, query.edition);
+  }
+
+  /**
+   * Résout la jaquette d'un tome par ISBN via Google Books (et la met en cache serveur, ce qui
+   * alimente `edition-mapping`). Renvoie `{ coverUrl: null }` si aucune jaquette n'est trouvée.
+   */
+  @Get('cover')
+  async cover(
+    @Query() query: CoverQueryDto,
+  ): Promise<{ coverUrl: string | null }> {
+    return { coverUrl: await this.search.resolveCover(query.isbn) };
   }
 }

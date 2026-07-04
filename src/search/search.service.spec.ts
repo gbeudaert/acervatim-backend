@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { BnfService } from '../common/sources/bnf/bnf.service';
+import { GoogleBooksCoverService } from '../common/sources/googlebooks/googlebooks.service';
 import {
   AdapterSearchResult,
   SourceAdapter,
@@ -11,8 +12,16 @@ import { SearchService } from './search.service';
 const bnfMock = { enumerateEdition: jest.fn() };
 const bnf = bnfMock as unknown as BnfService;
 
+const gbooksMock = { cachedCover: jest.fn(), resolveCover: jest.fn() };
+const gbooks = gbooksMock as unknown as GoogleBooksCoverService;
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  gbooksMock.cachedCover.mockResolvedValue(null);
+});
+
 function makeService(adapters: SourceAdapter[]): SearchService {
-  return new SearchService(adapters, bnf);
+  return new SearchService(adapters, bnf, gbooks);
 }
 
 function makeAdapter(
@@ -131,16 +140,32 @@ describe('SearchService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('editionMapping délègue à BnfService.enumerateEdition (titre + édition)', async () => {
+  it('editionMapping délègue à la BnF et enrichit chaque tome avec la jaquette en cache (cache-only)', async () => {
     const mapping = {
       titleFr: "L'attaque des titans",
       edition: 'Éd. colossale',
-      tomeCount: 12,
-      tomes: [],
+      tomeCount: 2,
+      tomes: [
+        {
+          editionVolume: 1,
+          isbn: '111',
+          titleFr: 'T.1',
+          sourceVolumeRange: null,
+        },
+        {
+          editionVolume: 2,
+          isbn: null,
+          titleFr: 'T.2',
+          sourceVolumeRange: null,
+        },
+      ],
       recordsScanned: 30,
       ongoing: false,
     };
     bnfMock.enumerateEdition.mockResolvedValue(mapping);
+    gbooksMock.cachedCover.mockImplementation(async (isbn: string) =>
+      isbn === '111' ? 'https://img/1.jpg' : null,
+    );
     const svc = makeService([]);
 
     const res = await svc.editionMapping(
@@ -152,13 +177,42 @@ describe('SearchService', () => {
       "L'attaque des titans",
       'Éd. colossale',
     );
-    expect(res).toBe(mapping);
+    // Tome sans ISBN → aucune résolution tentée.
+    expect(gbooksMock.cachedCover).toHaveBeenCalledTimes(1);
+    expect(gbooksMock.cachedCover).toHaveBeenCalledWith('111');
+    expect(res.tomeCount).toBe(2);
+    expect(res.tomes).toEqual([
+      {
+        editionVolume: 1,
+        isbn: '111',
+        titleFr: 'T.1',
+        sourceVolumeRange: null,
+        coverUrl: 'https://img/1.jpg',
+      },
+      {
+        editionVolume: 2,
+        isbn: null,
+        titleFr: 'T.2',
+        sourceVolumeRange: null,
+        coverUrl: null,
+      },
+    ]);
   });
 
   it('editionMapping passe null quand aucune édition (standard)', async () => {
-    bnfMock.enumerateEdition.mockResolvedValue({ tomeCount: 34 });
+    bnfMock.enumerateEdition.mockResolvedValue({ tomeCount: 34, tomes: [] });
     const svc = makeService([]);
     await svc.editionMapping('Naruto');
     expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null);
+  });
+
+  it('resolveCover délègue à GoogleBooksCoverService', async () => {
+    gbooksMock.resolveCover.mockResolvedValue('https://img/x.jpg');
+    const svc = makeService([]);
+
+    const url = await svc.resolveCover('978-2-505-01194-3');
+
+    expect(gbooksMock.resolveCover).toHaveBeenCalledWith('978-2-505-01194-3');
+    expect(url).toBe('https://img/x.jpg');
   });
 });
