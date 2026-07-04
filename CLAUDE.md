@@ -1,16 +1,15 @@
 # Acervatim Backend — Règles dures pour l'agent IA
 
-Ce fichier est chargé automatiquement à chaque session Claude Code. Il contient les **règles non négociables**. Le contexte projet détaillé est dans [docs/travail/context-ia.md](docs/travail/context-ia.md). Les sprints à implémenter sont indexés dans [docs/interne/sprints/README.md](docs/interne/sprints/README.md).
+Ce fichier est chargé automatiquement à chaque session Claude Code. Il contient les **règles non négociables**. L'index de la base de code pour agents (endpoints, modèle de données, modules, flux) est dans [`../acervatim-docs/agent/INDEX.md`](../acervatim-docs/agent/INDEX.md) — le consulter avant d'explorer le code.
 
 ## Documentation — où mettre à jour quoi
 
-Trois emplacements distincts, **ne pas les confondre** :
+Toute la documentation vit dans le dépôt **`acervatim-docs`** ([`../acervatim-docs`](../acervatim-docs)), **uniquement** :
 
-- **Doc destinée à être lue** (utilisateur / développeur / légal) → dépôt **`acervatim-docs`** ([`../acervatim-docs`](../acervatim-docs)), site Jekyll public, espaces `utilisateur/` · `developpeur/` · `legal/`. Toute évolution qui change un contrat API, l'archi, le déploiement, l'auth, la confidentialité… se répercute **là**, dans la page concernée (ex. [`developpeur/api-reference.md`](../acervatim-docs/developpeur/api-reference.md), [`developpeur/deploiement-raspberry-pi.md`](../acervatim-docs/developpeur/deploiement-raspberry-pi.md), [`developpeur/auth-google.md`](../acervatim-docs/developpeur/auth-google.md), [`legal/confidentialite.md`](../acervatim-docs/legal/confidentialite.md)). Le **code reste la source de vérité** ; `acervatim-docs` en est la vue normalisée.
-- **Sprints** → `docs/interne/sprints/` (gitignored) : **statut et périmètre des sprints uniquement**.
-- **Matière de travail** → `docs/travail/` (gitignored) : `context-ia.md`, `api-mobile-spec.md`, guides d'implémentation (`archives/`), études, reviews. Notes internes, **non publiées**.
+- **Doc destinée à être lue** (utilisateur / développeur / légal) → racine du dépôt, site Jekyll public, espaces `utilisateur/` · `developpeur/` · `legal/`. Toute évolution qui change un contrat API, l'archi, le déploiement, l'auth, la confidentialité… se répercute **là**, dans la page concernée (ex. [`developpeur/api-reference.md`](../acervatim-docs/developpeur/api-reference.md), [`developpeur/deploiement-raspberry-pi.md`](../acervatim-docs/developpeur/deploiement-raspberry-pi.md), [`developpeur/auth-google.md`](../acervatim-docs/developpeur/auth-google.md)). La politique de confidentialité **canonique** vit dans [`legal/confidentialite.md`](../acervatim-docs/legal/confidentialite.md).
+- **Doc agent IA** (index de la base de code : endpoints, modèle de données, modules, flux) → dossier [`agent/`](../acervatim-docs/agent/INDEX.md) du même dépôt (exclu du site publié). À mettre à jour à chaque évolution structurante (nouvel endpoint, nouveau module, changement de schéma…).
 
-Règle : ne pas recréer sous `docs/` une doc qui a sa place dans `acervatim-docs` ; ne pas publier dans `acervatim-docs` de la matière de travail (context-ia, reviews, brouillons). La politique de confidentialité **canonique** vit dans `acervatim-docs/legal/` — `docs/politique-confidentialite.md` n'est qu'un pointeur, ne pas l'éditer.
+Règle : ne référencer et ne créer aucune autre documentation. Le **code reste la source de vérité** ; `acervatim-docs` en est la vue normalisée. Ne pas publier dans les espaces du site de la matière de travail (brouillons, reviews, runbooks).
 
 ## Stack imposée
 
@@ -47,7 +46,7 @@ Règle : ne pas recréer sous `docs/` une doc qui a sa place dans `acervatim-doc
 
 ## Contrats API V1 — règles dures
 
-Ces règles s'appliquent à **tout endpoint applicatif** (les webhooks publics font exception explicite). Détails et exemples dans [docs/interne/context-ia.md §10](docs/interne/context-ia.md#10-contrats-api-v1).
+Ces règles s'appliquent à **tout endpoint applicatif** (les webhooks publics font exception explicite).
 
 ### Versioning
 
@@ -123,7 +122,7 @@ Ces règles s'appliquent à **tout endpoint applicatif** (les webhooks publics f
 - Les champs filtrables doivent être **whitelistés par endpoint** (schéma Zod), pas de filtre arbitraire client → SQL.
 - **Deux familles d'opérateurs `[in]`/`[all]`** selon le helper (`src/common/filters/parse-filters.ts`) :
   - `filterIn` / `filterAll` : valeurs **whitelistées** (enum), **égalité exacte** (`WHERE IN`). Cas par défaut, c'est ce que décrivent les puces ci-dessus.
-  - `searchFilter` : valeurs **texte libre**, matchées en **substring (contains) insensible à la casse**. Ici `[in]`/`[all]` combinent des _termes de recherche_ en OR/AND — **pas** une appartenance exacte. Seul usage actuel : `GET /v1/collections?items[in]=...&items[all]=...` (recherche sur le contenu des items). Détails dans [docs/interne/context-ia.md §10.5](docs/interne/context-ia.md#105-filtres-fieldin--fieldall).
+  - `searchFilter` : valeurs **texte libre**, matchées en **substring (contains) insensible à la casse**. Ici `[in]`/`[all]` combinent des _termes de recherche_ en OR/AND — **pas** une appartenance exacte. Seul usage actuel : `GET /v1/collections?items[in]=...&items[all]=...` (recherche sur le contenu des items).
 - **Règle dure — recherche insensible à la casse sur JSON** : ne **jamais** utiliser le `string_contains` Prisma sur une colonne JSON pour un contains CI. Sur MariaDB, `JSON_UNQUOTE(...)` ressort en collation `utf8mb4_bin` (sensible à la casse) et MySQL n'a pas de `mode: 'insensitive'`. Passer par du SQL paramétré avec `COLLATE utf8mb4_general_ci` (référence : `CollectionsService.matchingCollectionIds`).
 
 ## Commandes — TOUJOURS via le wrapper, jamais en direct
