@@ -8,6 +8,7 @@ import { ZodValidationException } from 'nestjs-zod';
 import { z, ZodError } from 'zod';
 import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
+import { SourceTokenRequiredException } from '../../oauth/source-token-required.exception';
 import { PaymentRequiredException } from '../../premium/payment-required.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 import {
@@ -88,6 +89,15 @@ describe('mapException', () => {
     });
   });
 
+  it('mappe SourceTokenRequiredException sur /probs/source-token-required 403 (distinct de forbidden)', () => {
+    expect(
+      mapException(new SourceTokenRequiredException('discogs')),
+    ).toMatchObject({
+      type: expect.stringContaining('/probs/source-token-required'),
+      status: 403,
+    });
+  });
+
   it('mappe une ForbiddenException ordinaire sur /probs/forbidden 403', () => {
     expect(mapException(new ForbiddenException())).toMatchObject({
       type: expect.stringContaining('/probs/forbidden'),
@@ -155,6 +165,22 @@ describe('ProblemDetailsExceptionFilter', () => {
       errors: expect.arrayContaining([
         expect.objectContaining({ field: 'name', code: expect.any(String) }),
       ]),
+    });
+  });
+
+  it('expose provider dans le payload pour une SourceTokenRequiredException', () => {
+    const filter = new ProblemDetailsExceptionFilter();
+    const res = makeRes();
+    const host = makeHost({ url: '/v1/search', requestId: 'r-mal' }, res);
+
+    filter.catch(new SourceTokenRequiredException('mal'), host);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.headers['Content-Type']).toBe('application/problem+json');
+    expect(res.body).toMatchObject({
+      type: expect.stringContaining('/probs/source-token-required'),
+      status: 403,
+      provider: 'mal',
     });
   });
 

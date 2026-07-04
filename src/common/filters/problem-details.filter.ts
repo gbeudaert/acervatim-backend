@@ -18,6 +18,7 @@ import { ZodValidationException } from 'nestjs-zod';
 import { ZodIssue } from 'zod';
 import { InvitationExhaustedException } from '../../invitations/invitation-exhausted.exception';
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
+import { SourceTokenRequiredException } from '../../oauth/source-token-required.exception';
 import { PaymentRequiredException } from '../../premium/payment-required.exception';
 import { QuotaExceededException } from '../quota/quota-exceeded.exception';
 
@@ -31,6 +32,8 @@ interface ProblemDetails {
   instance: string;
   requestId: string;
   errors?: Array<{ field: string; code: string; message: string }>;
+  /** Extension member : source concernée par un `source-token-required`. */
+  provider?: string;
 }
 
 interface Mapped {
@@ -73,6 +76,13 @@ export function mapException(exception: unknown): Mapped {
       type: `${TYPE_BASE}/payment-required`,
       title: 'Payment required',
       status: 402,
+    };
+  }
+  if (exception instanceof SourceTokenRequiredException) {
+    return {
+      type: `${TYPE_BASE}/source-token-required`,
+      title: 'Source token required',
+      status: 403,
     };
   }
   if (exception instanceof ForbiddenException) {
@@ -205,6 +215,10 @@ export class ProblemDetailsExceptionFilter implements ExceptionFilter {
     if (exception instanceof ZodValidationException) {
       const zodError = exception.getZodError();
       body.errors = zodIssuesToErrors(zodError.issues);
+    }
+
+    if (exception instanceof SourceTokenRequiredException) {
+      body.provider = exception.provider;
     }
 
     // Log de toutes les erreurs HTTP renvoyees : 5xx en `error` (avec stack),
