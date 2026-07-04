@@ -4,6 +4,8 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { OauthCredentialsService } from '../oauth.service';
+import { SourceTokenRequiredException } from '../source-token-required.exception';
+import { TokenResolverService } from '../token-resolver.service';
 import { DiscogsAdapter } from './discogs.adapter';
 
 interface MockDeps {
@@ -22,6 +24,7 @@ interface MockDeps {
     remove: jest.Mock;
     listConnected: jest.Mock;
   };
+  tokenResolver: { resolve: jest.Mock };
 }
 
 function makeConfig(
@@ -60,15 +63,25 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     listConnected: jest.fn(),
   };
 
+  // Par défaut : repli premium (consumer-only) — les tests de connexion user ou de
+  // mode dégradé surchargent explicitement `resolve`.
+  const tokenResolver = {
+    resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
+  };
+
   const svc = new DiscogsAdapter(
     config,
     http as unknown as HttpClientService,
     cache as unknown as ApiCacheService,
     bucket as unknown as TokenBucketService,
     creds as unknown as OauthCredentialsService,
+    tokenResolver as unknown as TokenResolverService,
   );
   svc.onModuleInit();
-  return { deps: { config, http, cache, bucket, creds }, svc };
+  return {
+    deps: { config, http, cache, bucket, creds, tokenResolver },
+    svc,
+  };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -272,13 +285,16 @@ describe('DiscogsAdapter.search', () => {
     expect(deps.http.request).not.toHaveBeenCalled();
   });
 
-  it("utilise le tokenSecret stocké dans 'refreshToken' pour signer (OAuth 1.0a)", async () => {
+  it("utilise le tokenSecret stocké dans 'refreshToken' pour signer (OAuth 1.0a, jeton user résolu)", async () => {
     const { deps, svc } = makeDeps();
-    deps.creds.get.mockResolvedValue({
-      accessToken: 'user-access',
-      refreshToken: 'user-secret', // dans le schéma OAuth 1.0a, c'est le tokenSecret
-      expiresAtMs: 0,
-      scopes: [],
+    deps.tokenResolver.resolve.mockResolvedValue({
+      source: 'user',
+      credentials: {
+        accessToken: 'user-access',
+        refreshToken: 'user-secret', // dans le schéma OAuth 1.0a, c'est le tokenSecret
+        expiresAtMs: 0,
+        scopes: [],
+      },
     });
     deps.http.request.mockResolvedValue({
       status: 200,
@@ -290,6 +306,50 @@ describe('DiscogsAdapter.search', () => {
 
     const [, opts] = deps.http.request.mock.calls[0];
     expect(opts.headers.Authorization).toContain('oauth_token="user-access"');
+  });
+
+  it('repli premium (fallback) : signe en consumer-only, sans oauth_token utilisateur', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.search('x', { userId: USER, limit: 10 });
+
+    const [, opts] = deps.http.request.mock.calls[0];
+    expect(opts.headers.Authorization).toMatch(/^OAuth /);
+    expect(opts.headers.Authorization).toContain(
+      'oauth_consumer_key="ck-test"',
+    );
+    expect(opts.headers.Authorization).not.toContain('oauth_token=');
+  });
+
+  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun appel sortant', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    deps.cache.get.mockResolvedValue(null);
+
+    await expect(
+      svc.search('x', { userId: USER, limit: 10 }),
+    ).rejects.toBeInstanceOf(SourceTokenRequiredException);
+    expect(deps.http.request).not.toHaveBeenCalled();
+  });
+
+  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans appel', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    deps.cache.get.mockResolvedValue({
+      results: [{ id: 5, title: 'Air - Moon Safari' }],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    const res = await svc.search('air', { userId: USER, limit: 10 });
+
+    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(res.items[0].sourceId).toBe('5');
   });
 });
 

@@ -11,7 +11,13 @@ import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
-import { OauthCredentialsService, OauthProvider } from '../oauth.service';
+import {
+  DecryptedCredentials,
+  OauthCredentialsService,
+  OauthProvider,
+} from '../oauth.service';
+import { SourceTokenRequiredException } from '../source-token-required.exception';
+import { TokenResolverService } from '../token-resolver.service';
 import { OAuthFlowProvider } from './flow.types';
 import { buildOAuth1Header, OAuth1Credentials } from './oauth1';
 import {
@@ -94,6 +100,7 @@ export class DiscogsAdapter
     private readonly cache: ApiCacheService,
     private readonly bucket: TokenBucketService,
     private readonly creds: OauthCredentialsService,
+    private readonly tokenResolver: TokenResolverService,
   ) {}
 
   onModuleInit() {
@@ -228,12 +235,15 @@ export class DiscogsAdapter
     const mode = criteria.barcode
       ? `barcode:${criteria.barcode}`
       : `q:${criteria.q}`;
-    const cacheKey = `discogs:search:${ctx.userId}:${mode}:${page}:${ctx.limit}`;
+    // Clé de cache partagée (réponse Discogs publique) : pas de userId, pour que le
+    // repli premium et le mode dégradé (cache-only) profitent des hits inter-users.
+    const cacheKey = `discogs:search:${mode}:${page}:${ctx.limit}`;
 
-    const raw = await this.cache.getOrFetch<DiscogsSearchResponse>(
+    const raw = await this.discogsResolvedGet<DiscogsSearchResponse>(
+      url,
       cacheKey,
       SEARCH_CACHE_TTL_SECONDS,
-      async () => this.discogsGet<DiscogsSearchResponse>(url, ctx.userId),
+      ctx.userId,
     );
 
     const items = (raw.results ?? []).map((r) => this.mapSearchResult(r));
@@ -251,23 +261,53 @@ export class DiscogsAdapter
   async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
     await this.consumeRate(ctx.userId);
     const cacheKey = `discogs:release:${id}`;
-    const raw = await this.cache.getOrFetch<DiscogsReleaseResponse>(
+    const raw = await this.discogsResolvedGet<DiscogsReleaseResponse>(
+      `${DISCOGS_API_BASE}/releases/${encodeURIComponent(id)}`,
       cacheKey,
       DETAILS_CACHE_TTL_SECONDS,
-      async () =>
-        this.discogsGet<DiscogsReleaseResponse>(
-          `${DISCOGS_API_BASE}/releases/${encodeURIComponent(id)}`,
-          ctx.userId,
-        ),
+      ctx.userId,
     );
     return this.mapRelease(raw);
   }
 
   // ----- Helpers privés -----
 
-  private async discogsGet<T>(url: string, userId: string): Promise<T> {
+  /**
+   * GET Discogs avec résolution de jeton (cf. `TokenResolverService`) et mode dégradé.
+   *  - jeton user présent → OAuth 1.0a signé avec le token utilisateur ;
+   *  - premium sans jeton → repli Acervatim = OAuth 1.0a consumer-only (clé
+   *    consumer serveur, données publiques) ;
+   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
+   *    `SourceTokenRequiredException` (403 actionnable : connecter Discogs ou premium).
+   * Le repli consumer-only consomme le quota Discogs d'Acervatim : réservé au premium.
+   */
+  private async discogsResolvedGet<T>(
+    url: string,
+    cacheKey: string,
+    ttlSeconds: number,
+    userId: string,
+  ): Promise<T> {
+    const resolution = await this.tokenResolver.resolve(userId, 'discogs');
+
+    if (resolution.source === 'none') {
+      const cached = await this.cache.get<T>(cacheKey);
+      if (cached !== null && cached !== undefined) return cached;
+      throw new SourceTokenRequiredException('discogs');
+    }
+
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () =>
+      this.discogsFetch<T>(
+        url,
+        resolution.source === 'user' ? resolution.credentials : null,
+      ),
+    );
+  }
+
+  private async discogsFetch<T>(
+    url: string,
+    userCreds: DecryptedCredentials | null,
+  ): Promise<T> {
     const consumer = this.requireConsumer();
-    const userCreds = await this.creds.get(userId, 'discogs');
     const creds: OAuth1Credentials = userCreds
       ? {
           ...consumer,
