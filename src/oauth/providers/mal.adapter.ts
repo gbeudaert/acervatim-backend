@@ -15,6 +15,8 @@ import { TokenBucketService } from '../../common/rate-limit/token-bucket.service
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { BnfAuthor } from '../../common/sources/bnf/bnf.types';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
+import { SourceTokenRequiredException } from '../source-token-required.exception';
+import { TokenResolverService } from '../token-resolver.service';
 import { OAuthFlowProvider } from './flow.types';
 import { codeChallengePlain, generateCodeVerifier } from './pkce';
 import {
@@ -120,6 +122,7 @@ export class MalAdapter
     private readonly bucket: TokenBucketService,
     private readonly creds: OauthCredentialsService,
     private readonly bnf: BnfService,
+    private readonly tokenResolver: TokenResolverService,
   ) {}
 
   onModuleInit() {
@@ -218,12 +221,15 @@ export class MalAdapter
     await this.consumeRate(ctx.userId);
     const offset = parseOffset(ctx.cursor);
     const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(query)}&limit=${ctx.limit}&offset=${offset}&fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
-    const cacheKey = `mal:search:${ctx.userId}:${query}:${offset}:${ctx.limit}`;
+    // Clé de cache partagée (réponse MAL publique) : pas de userId, pour que le
+    // repli premium et le mode dégradé (cache-only) profitent des hits inter-users.
+    const cacheKey = `mal:search:${query}:${offset}:${ctx.limit}`;
 
-    const raw = await this.cache.getOrFetch<MalSearchResponse>(
+    const raw = await this.malResolvedGet<MalSearchResponse>(
+      url,
       cacheKey,
       SEARCH_CACHE_TTL_SECONDS,
-      async () => this.malGet<MalSearchResponse>(url, ctx.userId),
+      ctx.userId,
     );
 
     const items = (raw.data ?? []).map((d) => this.mapNode(d.node));
@@ -277,15 +283,39 @@ export class MalAdapter
       `pivot: bnf->mal isbn=${isbn} query="${query}" via=${useOriginal ? '454$t' : 'titleFr(fallback)'} requireAuthor=${requireAuthor} author="${notice.authors[0]?.surname ?? notice.authors[0]?.full ?? '-'}" edition="${notice.edition ?? '-'}" 454h="${notice.sourceVolumeRange ?? '-'}"`,
     );
 
-    await this.consumeRate(ctx.userId);
     const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(query)}&limit=${PIVOT_SEARCH_LIMIT}&fields=${encodeURIComponent(MAL_PIVOT_FIELDS)}`;
     const cacheKey = `mal:pivot:${query.toLowerCase()}`;
 
-    const raw = await this.cache.getOrFetch<MalSearchResponse>(
-      cacheKey,
-      SEARCH_CACHE_TTL_SECONDS,
-      async () => this.malPublicGet<MalSearchResponse>(url),
-    );
+    // Jeton MAL : Bearer user si connecté (validé Q-b : les endpoints publics
+    // servent le même corps en Bearer et en X-MAL-CLIENT-ID), sinon repli
+    // X-MAL-CLIENT-ID si premium. Non-premium sans jeton → mode dégradé (Q-c) :
+    // AUCUN appel MAL sortant, on sert un hit de cache partagé s'il existe, sinon
+    // la notice BnF seule (bnf_only).
+    const tokenResolution = await this.tokenResolver.resolve(ctx.userId, 'mal');
+    let raw: MalSearchResponse;
+    if (tokenResolution.source === 'none') {
+      const cached = await this.cache.get<MalSearchResponse>(cacheKey);
+      if (!cached) {
+        this.logger.warn(
+          `pivot: mode degrade (pas de jeton MAL, pas de cache) isbn=${isbn} -> bnf seule`,
+        );
+        return { items: [], nextCursor: null };
+      }
+      raw = cached;
+    } else {
+      await this.consumeRate(ctx.userId);
+      raw = await this.cache.getOrFetch<MalSearchResponse>(
+        cacheKey,
+        SEARCH_CACHE_TTL_SECONDS,
+        async () =>
+          tokenResolution.source === 'user'
+            ? this.malBearerGet<MalSearchResponse>(
+                url,
+                tokenResolution.credentials.accessToken,
+              )
+            : this.malPublicGet<MalSearchResponse>(url),
+      );
+    }
     const candidates = (raw.data ?? []).map((d) => d.node);
     this.logger.log(
       `pivot: mal candidates isbn=${isbn} count=${candidates.length} titles=[${candidates
@@ -360,10 +390,11 @@ export class MalAdapter
     const url = `${MAL_API_BASE}/manga/${encodeURIComponent(id)}?fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
     const cacheKey = `mal:manga:${id}`;
 
-    const raw = await this.cache.getOrFetch<MalMangaNode>(
+    const raw = await this.malResolvedGet<MalMangaNode>(
+      url,
       cacheKey,
       DETAILS_CACHE_TTL_SECONDS,
-      async () => this.malGet<MalMangaNode>(url, ctx.userId),
+      ctx.userId,
     );
 
     return this.mapNode(raw);
@@ -371,18 +402,42 @@ export class MalAdapter
 
   // ----- Helpers privés -----
 
-  private async malGet<T>(url: string, userId: string): Promise<T> {
-    const userCreds = await this.creds.get(userId, 'mal');
-    if (!userCreds) {
-      throw new BadRequestException(
-        'mal: user not connected — call /v1/oauth/mal/start first',
-      );
-    }
+  private async malBearerGet<T>(url: string, accessToken: string): Promise<T> {
     const res = await this.http.request<T>(url, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${userCreds.accessToken}` },
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
     return res.data;
+  }
+
+  /**
+   * GET MAL avec résolution de jeton (cf. `TokenResolverService`) et mode dégradé.
+   *  - jeton user présent → Bearer utilisateur ;
+   *  - premium sans jeton → repli `X-MAL-CLIENT-ID` (données publiques) ;
+   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
+   *    `SourceTokenRequiredException` (403 actionnable : connecter MAL ou premium).
+   * Cache partagé sur clé publique : un hit d'un autre user est réutilisable sans
+   * fuite (données MAL interrogées ici publiques).
+   */
+  private async malResolvedGet<T>(
+    url: string,
+    cacheKey: string,
+    ttlSeconds: number,
+    userId: string,
+  ): Promise<T> {
+    const resolution = await this.tokenResolver.resolve(userId, 'mal');
+
+    if (resolution.source === 'none') {
+      const cached = await this.cache.get<T>(cacheKey);
+      if (cached !== null && cached !== undefined) return cached;
+      throw new SourceTokenRequiredException('mal');
+    }
+
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () =>
+      resolution.source === 'user'
+        ? this.malBearerGet<T>(url, resolution.credentials.accessToken)
+        : this.malPublicGet<T>(url),
+    );
   }
 
   /**
