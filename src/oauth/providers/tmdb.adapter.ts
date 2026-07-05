@@ -9,6 +9,8 @@ import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
+import { SourceTokenRequiredException } from '../source-token-required.exception';
+import { TokenResolverService } from '../token-resolver.service';
 import {
   AdapterContext,
   AdapterSearchResult,
@@ -67,6 +69,7 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
     private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
     private readonly bucket: TokenBucketService,
+    private readonly tokenResolver: TokenResolverService,
   ) {}
 
   onModuleInit() {
@@ -80,18 +83,16 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
     await this.consumeRate();
     const page = parsePage(ctx.cursor);
     // TMDB ignore `limit` côté API (20/page imposé). On respecte donc 20 et on documente.
-    const url = `${TMDB_API_BASE}/search/movie?api_key=${this.requireApiKey()}&query=${encodeURIComponent(query)}&page=${page}`;
-    // Le cacheKey EXCLUT l'apiKey — sinon une rotation invaliderait tout le cache. Et il est partagé
-    // entre users car TMDB n'a pas d'OAuth user.
+    // Le cacheKey EXCLUT l'apiKey — sinon une rotation invaliderait tout le cache. Et il est
+    // partagé entre users (données TMDB publiques : clé user ou serveur, même réponse).
     const cacheKey = `tmdb:search:${query}:${page}`;
 
-    const raw = await this.cache.getOrFetch<TmdbSearchResponse>(
+    const raw = await this.tmdbResolvedGet<TmdbSearchResponse>(
+      (apiKey) =>
+        `${TMDB_API_BASE}/search/movie?api_key=${apiKey}&query=${encodeURIComponent(query)}&page=${page}`,
       cacheKey,
       SEARCH_CACHE_TTL_SECONDS,
-      async () => {
-        const res = await this.http.request<TmdbSearchResponse>(url);
-        return res.data;
-      },
+      ctx.userId,
     );
 
     const items = (raw.results ?? []).map((r) => this.mapResult(r));
@@ -105,21 +106,53 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
     };
   }
 
-  async fetchDetails(id: string, _ctx: AdapterContext): Promise<UnifiedItem> {
+  async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
     await this.consumeRate();
-    const url = `${TMDB_API_BASE}/movie/${encodeURIComponent(id)}?api_key=${this.requireApiKey()}&append_to_response=credits`;
     const cacheKey = `tmdb:movie:${id}`;
 
-    const raw = await this.cache.getOrFetch<TmdbMovieDetails>(
+    const raw = await this.tmdbResolvedGet<TmdbMovieDetails>(
+      (apiKey) =>
+        `${TMDB_API_BASE}/movie/${encodeURIComponent(id)}?api_key=${apiKey}&append_to_response=credits`,
       cacheKey,
       DETAILS_CACHE_TTL_SECONDS,
-      async () => {
-        const res = await this.http.request<TmdbMovieDetails>(url);
-        return res.data;
-      },
+      ctx.userId,
     );
 
     return this.mapDetails(raw);
+  }
+
+  /**
+   * GET TMDB avec résolution de la clé API (cf. `TokenResolverService`) et mode dégradé.
+   *  - clé perso user présente → clé API personnelle (BYOT, saisie via
+   *    `PUT /v1/sources/tmdb/token`, stockée chiffrée dans `oauth_credentials`) ;
+   *  - premium sans clé perso → repli `TMDB_API_KEY` serveur (Acervatim) ;
+   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
+   *    `SourceTokenRequiredException` (403 actionnable : saisir sa clé ou premium).
+   * La clé n'apparaît jamais dans le cacheKey (partagé, insensible à la rotation).
+   */
+  private async tmdbResolvedGet<T>(
+    buildUrl: (apiKey: string) => string,
+    cacheKey: string,
+    ttlSeconds: number,
+    userId: string,
+  ): Promise<T> {
+    const resolution = await this.tokenResolver.resolve(userId, 'tmdb');
+
+    if (resolution.source === 'none') {
+      const cached = await this.cache.get<T>(cacheKey);
+      if (cached !== null && cached !== undefined) return cached;
+      throw new SourceTokenRequiredException('tmdb');
+    }
+
+    const apiKey =
+      resolution.source === 'user'
+        ? resolution.credentials.accessToken
+        : this.requireApiKey();
+
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
+      const res = await this.http.request<T>(buildUrl(apiKey));
+      return res.data;
+    });
   }
 
   private mapResult(r: TmdbMovieResult): UnifiedItem {

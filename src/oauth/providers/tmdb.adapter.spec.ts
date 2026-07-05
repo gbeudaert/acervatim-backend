@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
+import { SourceTokenRequiredException } from '../source-token-required.exception';
+import { TokenResolverService } from '../token-resolver.service';
 import { TmdbAdapter } from './tmdb.adapter';
 
 function makeConfig(apiKey: string | null): ConfigService {
@@ -25,14 +27,20 @@ function makeDeps(apiKey: string | null = 'tmdb-key') {
     delete: jest.fn(),
   };
   const bucket = { consume: jest.fn().mockResolvedValue(true) };
+  // Par défaut : repli premium (clé serveur TMDB_API_KEY) — les tests de clé perso
+  // ou de mode dégradé surchargent explicitement `resolve`.
+  const tokenResolver = {
+    resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
+  };
   const svc = new TmdbAdapter(
     makeConfig(apiKey),
     http as unknown as HttpClientService,
     cache as unknown as ApiCacheService,
     bucket as unknown as TokenBucketService,
+    tokenResolver as unknown as TokenResolverService,
   );
   svc.onModuleInit();
-  return { http, cache, bucket, svc };
+  return { http, cache, bucket, tokenResolver, svc };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -122,6 +130,50 @@ describe('TmdbAdapter.search', () => {
     const p = svc.search('x', { userId: USER, limit: 20 });
     await expect(p).rejects.toBeInstanceOf(HttpException);
     await p.catch((e) => expect(e.getStatus()).toBe(429));
+  });
+
+  it('clé perso user (BYOT) : interroge TMDB avec la clé de l’utilisateur', async () => {
+    const { http, tokenResolver, svc } = makeDeps();
+    tokenResolver.resolve.mockResolvedValue({
+      source: 'user',
+      credentials: { accessToken: 'user-tmdb-key', expiresAtMs: 0, scopes: [] },
+    });
+    http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { page: 1, total_pages: 1, results: [] },
+    });
+
+    await svc.search('q', { userId: USER, limit: 20 });
+
+    const url = http.request.mock.calls[0][0];
+    expect(url).toContain('api_key=user-tmdb-key');
+  });
+
+  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun appel sortant', async () => {
+    const { http, tokenResolver, cache, svc } = makeDeps();
+    tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    cache.get.mockResolvedValue(null);
+
+    await expect(
+      svc.search('q', { userId: USER, limit: 20 }),
+    ).rejects.toBeInstanceOf(SourceTokenRequiredException);
+    expect(http.request).not.toHaveBeenCalled();
+  });
+
+  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans appel', async () => {
+    const { http, tokenResolver, cache, svc } = makeDeps();
+    tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    cache.get.mockResolvedValue({
+      page: 1,
+      total_pages: 1,
+      results: [{ id: 12, title: 'Cached Movie' }],
+    });
+
+    const res = await svc.search('q', { userId: USER, limit: 20 });
+
+    expect(http.request).not.toHaveBeenCalled();
+    expect(res.items[0].sourceId).toBe('12');
   });
 
   it("cache key EXCLUT l'apiKey (rotation ne nuke pas le cache)", async () => {
