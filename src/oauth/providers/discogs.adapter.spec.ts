@@ -351,6 +351,21 @@ describe('DiscogsAdapter.search', () => {
     expect(deps.http.request).not.toHaveBeenCalled();
     expect(res.items[0].sourceId).toBe('5');
   });
+
+  it('clé de cache search partagée (provider:mode, SANS userId) — repli/dégradé mutualisables, pas de fuite', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.search('jazz', { userId: USER, limit: 10 });
+
+    const cacheKey = deps.cache.getOrFetch.mock.calls[0][0] as string;
+    expect(cacheKey).toBe('discogs:search:q:jazz:1:10');
+    expect(cacheKey).not.toContain(USER);
+  });
 });
 
 describe('DiscogsAdapter.searchByBarcode', () => {

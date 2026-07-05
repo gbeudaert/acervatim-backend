@@ -350,6 +350,21 @@ describe('MalAdapter.search', () => {
     const res = await svc.search('x', { userId: USER, limit: 50 });
     expect(res.nextCursor).toBe('50'); // 0 + 50
   });
+
+  it('clé de cache search partagée (provider:query, SANS userId) — repli/dégradé mutualisables, pas de fuite', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { data: [], paging: {} },
+    });
+
+    await svc.search('one piece', { userId: USER, limit: 50 });
+
+    const cacheKey = deps.cache.getOrFetch.mock.calls[0][0] as string;
+    expect(cacheKey).toBe('mal:search:one piece:0:50');
+    expect(cacheKey).not.toContain(USER);
+  });
 });
 
 describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
