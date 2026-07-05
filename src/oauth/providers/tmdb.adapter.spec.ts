@@ -118,10 +118,25 @@ describe('TmdbAdapter.search', () => {
     await svc.search('x', { userId: USER, limit: 20 });
     const otherUser = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
     await svc.search('x', { userId: otherUser, limit: 20 });
-    // Les deux utilisent la même bucket key
-    expect(bucket.consume).toHaveBeenCalledTimes(2);
-    expect(bucket.consume.mock.calls[0][0]).toBe('tmdb:global');
-    expect(bucket.consume.mock.calls[1][0]).toBe('tmdb:global');
+    // Le bucket par-requête est global (une conso par recherche, même clé pour les
+    // deux users) — indépendamment du bucket de repli acervatim:tmdb.
+    const globalCalls = bucket.consume.mock.calls.filter(
+      (c) => c[0] === 'tmdb:global',
+    );
+    expect(globalCalls).toHaveLength(2);
+  });
+
+  it('repli premium (fallback) : consomme le bucket partagé acervatim:tmdb', async () => {
+    const { bucket, http, svc } = makeDeps();
+    http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { page: 1, total_pages: 1, results: [] },
+    });
+
+    await svc.search('q', { userId: USER, limit: 20 });
+
+    expect(bucket.consume).toHaveBeenCalledWith('acervatim:tmdb', 200, 20);
   });
 
   it('throw 429 si bucket plein', async () => {

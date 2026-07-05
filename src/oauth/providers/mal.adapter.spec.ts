@@ -324,6 +324,34 @@ describe('MalAdapter.search', () => {
     expect(res.items[0].sourceId).toBe('9');
   });
 
+  it('repli premium (fallback) : consomme le bucket partagé acervatim:mal', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { data: [], paging: {} },
+    });
+
+    await svc.search('x', { userId: USER, limit: 10 });
+
+    expect(deps.bucket.consume).toHaveBeenCalledWith('acervatim:mal', 120, 2);
+  });
+
+  it('429 si le bucket partagé acervatim:mal est épuisé (repli)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    // Épuise UNIQUEMENT le bucket partagé Acervatim (le bucket user passe).
+    deps.bucket.consume.mockImplementation((key: string) =>
+      Promise.resolve(key !== 'acervatim:mal'),
+    );
+
+    const p = svc.search('x', { userId: USER, limit: 10 });
+    await expect(p).rejects.toBeInstanceOf(HttpException);
+    await p.catch((e) => expect(e.getStatus()).toBe(429));
+    expect(deps.http.request).not.toHaveBeenCalled();
+  });
+
   it('throw 429 HttpException si bucket plein', async () => {
     const { deps, svc } = makeDeps();
     deps.bucket.consume.mockResolvedValue(false);

@@ -29,6 +29,12 @@ const DETAILS_CACHE_TTL_SECONDS = 86_400;
 const RATE_LIMIT_CAPACITY = 200;
 const RATE_LIMIT_REFILL_PER_SEC = 20;
 
+// Bucket PARTAGÉ entre tous les premiums servis en repli (TMDB_API_KEY Acervatim) :
+// plafonne le débit sortant total sur la clé serveur, distinct du bucket global
+// (qui couvre aussi les clés perso). À calibrer sur la limite du compte Acervatim.
+const ACERVATIM_RATE_LIMIT_CAPACITY = 200;
+const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 20;
+
 interface TmdbSearchResponse {
   page?: number;
   total_pages?: number;
@@ -150,6 +156,11 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
         : this.requireApiKey();
 
     return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
+      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
+      // uniquement — un hit ne tape pas la clé serveur Acervatim).
+      if (resolution.source === 'fallback') {
+        await this.consumeAcervatimRate();
+      }
       const res = await this.http.request<T>(buildUrl(apiKey));
       return res.data;
     });
@@ -203,6 +214,21 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
     );
     if (!ok) {
       throw new HttpException('tmdb: rate limit exceeded', 429);
+    }
+  }
+
+  /** Bucket partagé des replis Acervatim (clé serveur, tous premiums confondus). */
+  private async consumeAcervatimRate(): Promise<void> {
+    const ok = await this.bucket.consume(
+      `acervatim:${this.source}`,
+      ACERVATIM_RATE_LIMIT_CAPACITY,
+      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
+    );
+    if (!ok) {
+      throw new HttpException(
+        'tmdb: repli Acervatim rate limited (capacité partagée épuisée)',
+        429,
+      );
     }
   }
 

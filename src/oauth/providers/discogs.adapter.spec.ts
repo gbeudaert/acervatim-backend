@@ -327,6 +327,24 @@ describe('DiscogsAdapter.search', () => {
     expect(opts.headers.Authorization).not.toContain('oauth_token=');
   });
 
+  it('repli premium (fallback) : consomme le bucket partagé acervatim:discogs', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.search('x', { userId: USER, limit: 10 });
+
+    expect(deps.bucket.consume).toHaveBeenCalledWith(
+      'acervatim:discogs',
+      60,
+      1,
+    );
+  });
+
   it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun appel sortant', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });

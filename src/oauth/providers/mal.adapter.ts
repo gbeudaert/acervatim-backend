@@ -37,6 +37,12 @@ const DETAILS_CACHE_TTL_SECONDS = 86_400;
 const RATE_LIMIT_CAPACITY = 60;
 const RATE_LIMIT_REFILL_PER_SEC = 1;
 
+// Bucket PARTAGÉ entre tous les premiums servis en repli (X-MAL-CLIENT-ID Acervatim) :
+// plafonne le débit sortant total sur le compte Acervatim, pour ne pas se faire
+// throttler/bannir par MAL. À calibrer sur la limite réelle du compte Acervatim.
+const ACERVATIM_RATE_LIMIT_CAPACITY = 120;
+const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 2;
+
 const MAL_MANGA_FIELDS =
   'id,title,main_picture,start_date,synopsis,authors{first_name,last_name},mean,media_type,status,num_volumes';
 
@@ -307,13 +313,16 @@ export class MalAdapter
       raw = await this.cache.getOrFetch<MalSearchResponse>(
         cacheKey,
         SEARCH_CACHE_TTL_SECONDS,
-        async () =>
-          tokenResolution.source === 'user'
-            ? this.malBearerGet<MalSearchResponse>(
-                url,
-                tokenResolution.credentials.accessToken,
-              )
-            : this.malPublicGet<MalSearchResponse>(url),
+        async () => {
+          if (tokenResolution.source === 'user') {
+            return this.malBearerGet<MalSearchResponse>(
+              url,
+              tokenResolution.credentials.accessToken,
+            );
+          }
+          await this.consumeAcervatimRate();
+          return this.malPublicGet<MalSearchResponse>(url);
+        },
       );
     }
     const candidates = (raw.data ?? []).map((d) => d.node);
@@ -433,11 +442,15 @@ export class MalAdapter
       throw new SourceTokenRequiredException('mal');
     }
 
-    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () =>
-      resolution.source === 'user'
-        ? this.malBearerGet<T>(url, resolution.credentials.accessToken)
-        : this.malPublicGet<T>(url),
-    );
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
+      if (resolution.source === 'user') {
+        return this.malBearerGet<T>(url, resolution.credentials.accessToken);
+      }
+      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
+      // uniquement — un hit ne tape pas le compte Acervatim).
+      await this.consumeAcervatimRate();
+      return this.malPublicGet<T>(url);
+    });
   }
 
   /**
@@ -533,6 +546,21 @@ export class MalAdapter
     if (!ok) {
       throw new HttpException(
         'mal: rate limit exceeded (60 req/min/user)',
+        429,
+      );
+    }
+  }
+
+  /** Bucket partagé des replis Acervatim (tous premiums confondus). */
+  private async consumeAcervatimRate(): Promise<void> {
+    const ok = await this.bucket.consume(
+      `acervatim:${this.source}`,
+      ACERVATIM_RATE_LIMIT_CAPACITY,
+      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
+    );
+    if (!ok) {
+      throw new HttpException(
+        'mal: repli Acervatim rate limited (capacité partagée épuisée)',
         429,
       );
     }

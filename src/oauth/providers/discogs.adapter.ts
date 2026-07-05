@@ -39,6 +39,13 @@ const DETAILS_CACHE_TTL_SECONDS = 86_400;
 const RATE_LIMIT_CAPACITY = 60;
 const RATE_LIMIT_REFILL_PER_SEC = 1;
 
+// Bucket PARTAGÉ entre tous les premiums servis en repli (consumer key Acervatim) :
+// plafonne le débit sortant total sur le compte Acervatim, pour ne pas se faire
+// throttler par Discogs. À calibrer sur la limite réelle du compte Acervatim
+// (Discogs : ~60 req/min en authentifié consumer).
+const ACERVATIM_RATE_LIMIT_CAPACITY = 60;
+const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 1;
+
 interface PendingRequestToken {
   userId: string;
   requestTokenSecret: string;
@@ -295,12 +302,17 @@ export class DiscogsAdapter
       throw new SourceTokenRequiredException('discogs');
     }
 
-    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () =>
-      this.discogsFetch<T>(
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
+      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
+      // uniquement — un hit ne tape pas le compte Acervatim).
+      if (resolution.source === 'fallback') {
+        await this.consumeAcervatimRate();
+      }
+      return this.discogsFetch<T>(
         url,
         resolution.source === 'user' ? resolution.credentials : null,
-      ),
-    );
+      );
+    });
   }
 
   private async discogsFetch<T>(
@@ -339,6 +351,21 @@ export class DiscogsAdapter
     if (!ok) {
       throw new HttpException(
         'discogs: rate limit exceeded (60 req/min/user)',
+        429,
+      );
+    }
+  }
+
+  /** Bucket partagé des replis Acervatim (tous premiums confondus). */
+  private async consumeAcervatimRate(): Promise<void> {
+    const ok = await this.bucket.consume(
+      `acervatim:${this.source}`,
+      ACERVATIM_RATE_LIMIT_CAPACITY,
+      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
+    );
+    if (!ok) {
+      throw new HttpException(
+        'discogs: repli Acervatim rate limited (capacité partagée épuisée)',
         429,
       );
     }
