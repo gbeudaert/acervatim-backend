@@ -9,6 +9,7 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
+import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
@@ -32,6 +33,7 @@ interface MockDeps {
   };
   bnf: { resolveByIsbn: jest.Mock };
   tokenResolver: { resolve: jest.Mock };
+  googleBooks: { resolveCover: jest.Mock; cachedCover: jest.Mock };
 }
 
 function makeConfig(
@@ -74,6 +76,12 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
+  // Par défaut : pas de jaquette Google Books (best-effort) — les tests bnf_only
+  // qui vérifient l'enrichissement jaquette surchargent `resolveCover`.
+  const googleBooks = {
+    resolveCover: jest.fn().mockResolvedValue(null),
+    cachedCover: jest.fn().mockResolvedValue(null),
+  };
 
   const svc = new MalAdapter(
     config,
@@ -83,10 +91,20 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     creds as unknown as OauthCredentialsService,
     bnf as unknown as BnfService,
     tokenResolver as unknown as TokenResolverService,
+    googleBooks as unknown as GoogleBooksCoverService,
   );
   svc.onModuleInit();
   return {
-    deps: { config, http, cache, bucket, creds, bnf, tokenResolver },
+    deps: {
+      config,
+      http,
+      cache,
+      bucket,
+      creds,
+      bnf,
+      tokenResolver,
+      googleBooks,
+    },
     svc,
   };
 }
@@ -498,11 +516,55 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     expect(res.items[0].sourceId).toBe('23390');
   });
 
-  it('mode dégradé (non-premium sans jeton, pas de cache) : notice BnF seule, aucun appel MAL', async () => {
+  it('mode dégradé (non-premium sans jeton, pas de cache) : renvoie la notice BnF (bnf_only) + jaquette Google Books, aucun appel MAL', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     deps.cache.get.mockResolvedValue(null);
     deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
+    // Jaquette du tome scanné résolue par ISBN via Google Books (backend#2, étage ②).
+    deps.googleBooks.resolveCover.mockResolvedValue(
+      'https://books.google.com/cover.jpg',
+    );
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+
+    // Régression backend#2 : la notice BnF ne doit plus être jetée. On sert un
+    // item bnf_only (série + tome scanné) sans jamais appeler MAL.
+    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.bucket.consume).not.toHaveBeenCalled();
+    expect(deps.googleBooks.resolveCover).toHaveBeenCalledWith('9782811623258');
+    expect(res.items).toHaveLength(1);
+    const item = res.items[0];
+    expect(item.source).toBe('bnf');
+    expect(item.sourceId).toBe(NOTICE.ark);
+    expect(item.title).toBe("L'attaque des titans");
+    expect(item.creators).toEqual(['Hajime Isayama']);
+    expect(item.coverUrl).toBe('https://books.google.com/cover.jpg');
+    const meta = item.metadata as Record<string, any>;
+    expect(meta.pivot).toMatchObject({
+      resolutionPath: 'bnf_only',
+      authorMatched: false,
+    });
+    expect(meta.scannedTome).toMatchObject({
+      isbn: '9782811623258',
+      seriesTitleFr: "L'attaque des titans",
+      volume: '1',
+      edition: 'Éd. colossale',
+      sourceVolumeRange: '1-3',
+    });
+  });
+
+  it('mode dégradé sur notice sans aucun titre exploitable : rien à afficher (0 item)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    deps.cache.get.mockResolvedValue(null);
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: { ...NOTICE, seriesTitle: null, titleFr: null },
+    });
 
     const res = await svc.searchByBarcode('9782811623258', {
       userId: USER,
@@ -511,7 +573,6 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
 
     expect(res.items).toHaveLength(0);
     expect(deps.http.request).not.toHaveBeenCalled();
-    expect(deps.bucket.consume).not.toHaveBeenCalled();
   });
 
   it('sélectionne par contenance de titre + auteur même si un leurre est au rang 0 (Tokyo toritsu → JJK 0)', async () => {
@@ -592,7 +653,7 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     expect(deps.http.request).not.toHaveBeenCalled();
   });
 
-  it('rejette un candidat sans match auteur ni type (anti faux-positif)', async () => {
+  it('rejette un candidat sans match auteur ni type (anti faux-positif) → repli bnf_only', async () => {
     const { deps, svc } = makeDeps();
     deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
     deps.http.request.mockResolvedValue(
@@ -609,7 +670,13 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       userId: USER,
       limit: 50,
     });
-    expect(res.items).toHaveLength(0);
+    // Le leurre MAL est bien écarté, mais la notice BnF est conservée (backend#2).
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].source).toBe('bnf');
+    expect(res.items[0].sourceId).not.toBe('999');
+    expect((res.items[0].metadata as any).pivot.resolutionPath).toBe(
+      'bnf_only',
+    );
   });
 
   it('fallback titre FR quand pas de titre original : interroge MAL avec titleFr, valide par auteur (resolutionPath bnf+mal-fr)', async () => {
@@ -687,10 +754,15 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       limit: 50,
     });
     expect(deps.http.request).toHaveBeenCalled(); // MAL bien interrogé…
-    expect(res.items).toHaveLength(0); // …mais rien retenu sans match auteur.
+    // …l'homonyme est écarté (pas de match auteur), mais on garde la notice BnF.
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].source).toBe('bnf');
+    expect((res.items[0].metadata as any).pivot.resolutionPath).toBe(
+      'bnf_only',
+    );
   });
 
-  it('bnf_only si ni titre original ni titre FR (aucune requête MAL)', async () => {
+  it('bnf_only via seriesTitle si ni titre original ni titre FR (aucune requête MAL)', async () => {
     const { deps, svc } = makeDeps();
     deps.bnf.resolveByIsbn.mockResolvedValue({
       ok: true,
@@ -699,14 +771,20 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
         titleFr: null,
         originalTitle: null,
         originalTitleSource: null,
+        // seriesTitle (461$t) subsiste → titre exploitable, pas de pivot MAL possible.
       },
     });
     const res = await svc.searchByBarcode('9782811623258', {
       userId: USER,
       limit: 50,
     });
-    expect(res.items).toHaveLength(0);
     expect(deps.http.request).not.toHaveBeenCalled();
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].source).toBe('bnf');
+    expect(res.items[0].title).toBe("L'attaque des titans");
+    expect((res.items[0].metadata as any).pivot.resolutionPath).toBe(
+      'bnf_only',
+    );
   });
 
   it('privilégie la note BnF FR (330$a) comme description, sinon synopsis MAL', async () => {

@@ -13,7 +13,8 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
-import { BnfAuthor } from '../../common/sources/bnf/bnf.types';
+import { BnfAuthor, BnfNotice } from '../../common/sources/bnf/bnf.types';
+import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
@@ -129,6 +130,7 @@ export class MalAdapter
     private readonly creds: OauthCredentialsService,
     private readonly bnf: BnfService,
     private readonly tokenResolver: TokenResolverService,
+    private readonly googleBooks: GoogleBooksCoverService,
   ) {}
 
   onModuleInit() {
@@ -278,10 +280,11 @@ export class MalAdapter
     const query = notice.originalTitle ?? notice.titleFr ?? null;
     if (!query) {
       // Ni titre original ni titre FR exploitable → pivot MAL impossible (cf. log BnF).
+      // On renvoie tout de même la notice BnF (bnf_only) au lieu de rien (backend#2).
       this.logger.warn(
         `pivot: bnf_only isbn=${isbn} (ni titre original ni titre FR) -> pas d'enrichissement MAL`,
       );
-      return { items: [], nextCursor: null };
+      return this.bnfOnlyResult(notice, isbn);
     }
     const requireAuthor = !useOriginal;
 
@@ -305,7 +308,7 @@ export class MalAdapter
         this.logger.warn(
           `pivot: mode degrade (pas de jeton MAL, pas de cache) isbn=${isbn} -> bnf seule`,
         );
-        return { items: [], nextCursor: null };
+        return this.bnfOnlyResult(notice, isbn);
       }
       raw = cached;
     } else {
@@ -343,7 +346,7 @@ export class MalAdapter
       this.logger.warn(
         `pivot: no MAL candidate matched ${requireAuthor ? 'author (fallback titre FR)' : 'author/type'} isbn=${isbn} -> bnf_only`,
       );
-      return { items: [], nextCursor: null };
+      return this.bnfOnlyResult(notice, isbn);
     }
 
     if (
@@ -375,20 +378,7 @@ export class MalAdapter
         resolutionPath: useOriginal ? 'bnf+mal' : 'bnf+mal-fr',
       },
       // Données du tome scanné (à reporter dans le tome créé côté client).
-      scannedTome: {
-        isbn,
-        titleFr: notice.titleFr,
-        // Titre de la SÉRIE (461$t) pour l'énumération des tomes et le nom de série —
-        // distinct de titleFr qui peut être le titre du tome (ex Ki-oon "Je vais te tuer").
-        seriesTitleFr: notice.seriesTitle,
-        volume: notice.volume,
-        edition: notice.edition,
-        publisherFr: notice.publisherFr,
-        sourceVolumeRange: notice.sourceVolumeRange,
-        // Libellé de correspondance dérivé (ex "Tomes 1, 2, 3"). Présentation —
-        // séparé de la note privée userData, à afficher en tête côté app.
-        sourceVolumeLabel: volumeRangeLabel(notice.sourceVolumeRange),
-      },
+      scannedTome: buildScannedTomeMeta(notice, isbn),
     };
 
     return { items: [item], nextCursor: null };
@@ -566,6 +556,51 @@ export class MalAdapter
     }
   }
 
+  /**
+   * Repli bnf_only : MAL n'a pas (ou pas pu) enrichir, mais la notice BnF est
+   * disponible. On la mappe en item plutôt que de renvoyer vide (backend#2) — un
+   * scan sans jeton MAL affiche enfin la notice. La **jaquette du tome scanné** est
+   * résolue par ISBN via Google Books (best-effort : `null` si absente/indisponible,
+   * ne fait jamais échouer le repli — la BnF, elle, n'en fournit pas). Description =
+   * note FR (330$a) si présente, `resolutionPath: 'bnf_only'`. Le tome scanné voyage
+   * dans `metadata.scannedTome`, comme le chemin enrichi, pour que l'app crée le
+   * tome/la série.
+   *
+   * Si la notice n'a aucun titre exploitable (ni série ni tome FR), il n'y a rien
+   * à afficher → résultat vide.
+   */
+  private async bnfOnlyResult(
+    notice: BnfNotice,
+    isbn: string,
+  ): Promise<AdapterSearchResult> {
+    const title = notice.seriesTitle ?? notice.titleFr;
+    if (!title) {
+      return { items: [], nextCursor: null };
+    }
+    const coverUrl = (await this.googleBooks.resolveCover(isbn)) ?? undefined;
+    const item: UnifiedItem = {
+      source: 'bnf',
+      sourceId: notice.ark ?? isbn,
+      mediaType: 'manga',
+      title,
+      creators: bnfCreators(notice.authors),
+      releaseDate: notice.publicationDate ?? undefined,
+      coverUrl,
+      description: notice.noteFr ?? undefined,
+      metadata: {
+        pivot: {
+          isbn,
+          confidence: 0,
+          authorMatched: false,
+          resolutionPath: 'bnf_only',
+        },
+        scannedTome: buildScannedTomeMeta(notice, isbn),
+      },
+      rawData: notice,
+    };
+    return { items: [item], nextCursor: null };
+  }
+
   private mapNode(node: MalMangaNode): UnifiedItem {
     const id = node.id !== undefined ? String(node.id) : '';
     const creators = (node.authors ?? [])
@@ -603,6 +638,35 @@ export class MalAdapter
 
 function pendingKey(state: string): string {
   return `oauth-mal-pending:${state}`;
+}
+
+/**
+ * Métadonnées du tome scanné, à reporter dans le tome créé côté client. Partagé
+ * par le chemin enrichi (bnf+mal) et le repli bnf_only pour garantir le même
+ * contrat de sortie quelle que soit la réussite de l'enrichissement MAL.
+ */
+function buildScannedTomeMeta(notice: BnfNotice, isbn: string) {
+  return {
+    isbn,
+    titleFr: notice.titleFr,
+    // Titre de la SÉRIE (461$t) pour l'énumération des tomes et le nom de série —
+    // distinct de titleFr qui peut être le titre du tome (ex Ki-oon "Je vais te tuer").
+    seriesTitleFr: notice.seriesTitle,
+    volume: notice.volume,
+    edition: notice.edition,
+    publisherFr: notice.publisherFr,
+    sourceVolumeRange: notice.sourceVolumeRange,
+    // Libellé de correspondance dérivé (ex "Tomes 1, 2, 3"). Présentation —
+    // séparé de la note privée userData, à afficher en tête côté app.
+    sourceVolumeLabel: volumeRangeLabel(notice.sourceVolumeRange),
+  };
+}
+
+/** Noms d'auteurs BnF → chaînes affichables (forme complète, sinon "prénom nom"). */
+function bnfCreators(authors: BnfAuthor[]): string[] {
+  return (authors ?? [])
+    .map((a) => a.full?.trim() || `${a.given ?? ''} ${a.surname ?? ''}`.trim())
+    .filter((s) => s.length > 0);
 }
 
 /**
