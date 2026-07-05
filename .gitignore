@@ -43,3 +43,6 @@ docs/travail/
 
 # Claude Code config locale
 .claude/
+
+# Images conteneur construites localement (artefacts de déploiement)
+*.tar
