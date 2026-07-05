@@ -327,6 +327,37 @@ describe('DiscogsAdapter.search', () => {
     expect(opts.headers.Authorization).not.toContain('oauth_token=');
   });
 
+  it('repli premium avec DISCOGS_ACERVATIM_TOKEN : Authorization: Discogs token= (images)', async () => {
+    const { deps, svc } = makeDeps({ DISCOGS_ACERVATIM_TOKEN: 'perso-tok' });
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.search('x', { userId: USER, limit: 10 });
+
+    const [, opts] = deps.http.request.mock.calls[0];
+    expect(opts.headers.Authorization).toBe('Discogs token=perso-tok');
+  });
+
+  it('repli premium sans DISCOGS_ACERVATIM_TOKEN : retombe sur la signature consumer-only', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: { results: [], pagination: { page: 1, pages: 1 } },
+    });
+
+    await svc.search('x', { userId: USER, limit: 10 });
+
+    const [, opts] = deps.http.request.mock.calls[0];
+    expect(opts.headers.Authorization).toMatch(/^OAuth /);
+    expect(opts.headers.Authorization).not.toContain('Discogs token=');
+  });
+
   it('repli premium (fallback) : consomme le bucket partagé acervatim:discogs', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });

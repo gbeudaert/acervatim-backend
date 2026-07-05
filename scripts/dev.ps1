@@ -53,6 +53,7 @@ Scripts :
                            ex: ./scripts/dev.ps1 mint-jwt [--sub <label>] [--user <id>] [--expires 7d]
   test-mal-bearer <args...> Compare X-MAL-CLIENT-ID et Bearer utilisateur sur l'API publique MAL (Q-b)
                            ex: ./scripts/dev.ps1 test-mal-bearer --user <userId>
+  test-discogs-consumer    Verifie le repli Discogs (consumer-only vs personal token : rate-limit + images) (T8)
 
 Passe-plats (exécutés dans app) :
   npm <args...>      ex: ./scripts/dev.ps1 npm install zod
@@ -118,6 +119,7 @@ switch ($Command) {
     'grant-premium'  { Invoke-Compose exec app npx ts-node --transpile-only scripts/grant-premium.ts @Rest }
     'mint-jwt'       { Invoke-Compose exec app npx ts-node --transpile-only scripts/mint-jwt.ts @Rest }
     'test-mal-bearer' { Invoke-Compose exec app npx ts-node --transpile-only scripts/test-mal-bearer.ts @Rest }
+    'test-discogs-consumer' { Invoke-Compose exec app npx ts-node --transpile-only scripts/test-discogs-consumer.ts @Rest }
     'npm'            { Invoke-Compose exec app npm @Rest }
     'npx'            { Invoke-Compose exec app npx @Rest }
     'exec'           { Invoke-Compose exec app @Rest }

@@ -100,6 +100,8 @@ export class DiscogsAdapter
   private consumerKey?: string;
   private consumerSecret?: string;
   private callbackUrl!: string;
+  /** Personal access token d'un compte Acervatim, pour le repli premium (images). */
+  private acervatimToken?: string;
 
   constructor(
     private readonly config: ConfigService,
@@ -114,6 +116,7 @@ export class DiscogsAdapter
     this.consumerKey = this.config.get<string>('DISCOGS_CONSUMER_KEY');
     this.consumerSecret = this.config.get<string>('DISCOGS_CONSUMER_SECRET');
     this.callbackUrl = this.config.get<string>('DISCOGS_CALLBACK_URL')!;
+    this.acervatimToken = this.config.get<string>('DISCOGS_ACERVATIM_TOKEN');
   }
 
   // ----- OAuthFlowProvider -----
@@ -319,6 +322,30 @@ export class DiscogsAdapter
     url: string,
     userCreds: DecryptedCredentials | null,
   ): Promise<T> {
+    // Repli premium (pas de jeton user) avec un personal access token Acervatim :
+    // `Authorization: Discogs token=` — authentifié ET renvoie les images (la
+    // signature consumer-only, elle, authentifie sans jaquettes). Vérifié via
+    // scripts/test-discogs-consumer.ts (T8).
+    const authHeader =
+      userCreds === null && this.acervatimToken
+        ? `Discogs token=${this.acervatimToken}`
+        : this.buildSignedHeader(url, userCreds);
+
+    const res = await this.http.request<T>(url, {
+      method: 'GET',
+      headers: { Authorization: authHeader },
+    });
+    return res.data;
+  }
+
+  /**
+   * En-tête OAuth 1.0a : signé avec le token user si présent, sinon consumer-only
+   * (repli premium sans personal token — authentifié mais sans images).
+   */
+  private buildSignedHeader(
+    url: string,
+    userCreds: DecryptedCredentials | null,
+  ): string {
     const consumer = this.requireConsumer();
     const creds: OAuth1Credentials = userCreds
       ? {
@@ -328,18 +355,7 @@ export class DiscogsAdapter
           tokenSecret: userCreds.refreshToken,
         }
       : consumer;
-
-    const authHeader = buildOAuth1Header(
-      'GET',
-      stripQuery(url),
-      creds,
-      queryParams(url),
-    );
-    const res = await this.http.request<T>(url, {
-      method: 'GET',
-      headers: { Authorization: authHeader },
-    });
-    return res.data;
+    return buildOAuth1Header('GET', stripQuery(url), creds, queryParams(url));
   }
 
   private async consumeRate(userId: string): Promise<void> {

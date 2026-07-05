@@ -20,6 +20,11 @@ export const EnvSchema = z.object({
   GOOGLE_CLIENT_ID: z.string().min(1),
   DISCOGS_CONSUMER_KEY: z.string().optional(),
   DISCOGS_CONSUMER_SECRET: z.string().optional(),
+  // Personal access token d'un compte Discogs Acervatim, pour le repli premium :
+  // donne 60 req/min ET les images (la signature consumer-seule authentifie mais
+  // ne renvoie pas les jaquettes). Optionnel : sans lui, le repli retombe sur la
+  // signature consumer-only (sans images).
+  DISCOGS_ACERVATIM_TOKEN: z.string().optional(),
   DISCOGS_CALLBACK_URL: z
     .string()
     .url()
