@@ -2,7 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 
-const CAS_MAX_ATTEMPTS = 5;
+// Nombre de reprises du CAS optimiste avant d'abandonner (renvoie `false` = « rate limited »).
+// Relevé de 5 → 10 : sous une rafale de writers concurrents sur le même bucket (ex. résolution de
+// jaquettes d'une édition), 5 tours laissaient le writer le plus malchanceux perdre toutes ses
+// courses et abandonner alors que le bucket avait des tokens. Les appelants bursty bornent aussi
+// leur concurrence en amont (cf. COVER_RESOLUTION_CONCURRENCY), ceci est la ceinture-bretelles.
+const CAS_MAX_ATTEMPTS = 10;
 const BUCKET_IDLE_TTL_MS = 60 * 60 * 1000;
 
 @Injectable()

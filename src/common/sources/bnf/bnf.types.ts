@@ -63,6 +63,11 @@ export interface EditionTome {
   isbn: string | null;
   /** 200$a — titre FR. */
   titleFr: string | null;
+  /**
+   * 330$a — note de résumé **propre au tome** (en français quand présente). Souvent absente pour
+   * les mangas ; c'est la source primaire du résumé par tome (repli Google Books côté search).
+   */
+  description: string | null;
 }
 
 /** Mapping complet d'une édition (énumération BnF « toute la série d'un coup »). */

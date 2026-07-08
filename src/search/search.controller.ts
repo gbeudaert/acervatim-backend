@@ -45,11 +45,22 @@ export class SearchController {
   /**
    * Résout la jaquette d'un tome par ISBN via Google Books (et la met en cache serveur, ce qui
    * alimente `edition-mapping`). Renvoie `{ coverUrl: null }` si aucune jaquette n'est trouvée.
+   *
+   * Passer `title`+`volume` (et `edition` si spéciale) arme le repli `intitle:` quand la notice ISBN
+   * n'a pas d'image — indispensable pour les ISBN papier FR sans jaquette (cf. `resolveCover`).
    */
   @Get('cover')
   async cover(
     @Query() query: CoverQueryDto,
   ): Promise<{ coverUrl: string | null }> {
-    return { coverUrl: await this.search.resolveCover(query.isbn) };
+    const hint =
+      query.title != null && query.volume != null
+        ? {
+            title: query.title,
+            volume: query.volume,
+            edition: query.edition ?? null,
+          }
+        : undefined;
+    return { coverUrl: await this.search.resolveCover(query.isbn, hint) };
   }
 }

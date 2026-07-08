@@ -19,11 +19,16 @@ services:
       # Override l'hôte DB pour pointer sur le service "db" du réseau compose.
       # Le .env peut garder DATABASE_URL avec host=localhost pour les commandes Prisma exécutées hors compose.
       DATABASE_URL: 'mysql://${MARIADB_USER:-acervatim}:${MARIADB_PASSWORD:-changeme}@db:3306/${MARIADB_DATABASE:-acervatim}'
+      # Override l'hôte Redis pour pointer sur le service "redis" du réseau compose.
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     volumes:
       - .:/app
       - /app/node_modules # anonymous volume pour préserver le node_modules du container
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     # Régénère le client Prisma à chaque démarrage (schéma monté en volume après build).
     command: sh -c "npx prisma generate && npm run start:dev"
@@ -47,6 +52,19 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: acervatim-redis
+    ports:
+      - '6379:6379'
+    # noeviction : les jobs BullMQ ne doivent jamais être évincés sous pression mémoire.
+    command: ['redis-server', '--maxmemory-policy', 'noeviction']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   adminer:
     image: adminer:latest

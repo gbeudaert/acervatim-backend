@@ -7,7 +7,8 @@
 #        podman build -t acervatim-api:latest .
 #   2. Copier ce fichier dans :
 #        ~/.config/containers/systemd/acervatim-api.container
-#   3. Déposer le .env (avec DATABASE_URL=mysql://user:pass@<ip-nas>:3306/acervatim
+#   3. Déposer le .env (avec DATABASE_URL=mysql://user:pass@<ip-nas>:3306/acervatim,
+#      REDIS_HOST=acervatim-redis / REDIS_PORT=6379 (cf. acervatim-redis.container),
 #      et les secrets SUB_HASH_PEPPER / ENCRYPTION_KEY / JWT_PRIVATE_KEY / ...) dans :
 #        ~/acervatim/.env       (chmod 600)
 #   4. Recharger et démarrer :
@@ -40,6 +41,9 @@ ContainerName=acervatim-api
 # le signal et l'arrêt attend le SIGKILL.
 RunInit=true
 PublishPort=3000:3000
+# Réseau partagé avec Redis (cf. acervatim.network / acervatim-redis.container) :
+# permet de joindre Redis par son nom → REDIS_HOST=acervatim-redis dans le .env.
+Network=acervatim.network
 # DATABASE_URL (NAS) + secrets. NODE_ENV=production est déjà posé dans l'image.
 EnvironmentFile=%h/acervatim/.env
 # Le healthcheck (/health) est défini dans l'image ; Podman le planifie via un

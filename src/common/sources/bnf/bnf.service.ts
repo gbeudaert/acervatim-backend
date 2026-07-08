@@ -185,6 +185,8 @@ export class BnfService implements OnModuleInit {
           ),
           isbn: firstSubfield(rec, '010', 'a') ?? null,
           titleFr: firstSubfield(rec, '200', 'a') ?? null,
+          // 330$a — résumé propre au tome (souvent absent) ; repli Google Books côté search.
+          description: firstSubfield(rec, '330', 'a') ?? null,
         });
       }
       const date =

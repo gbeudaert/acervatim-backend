@@ -12,12 +12,20 @@ import { SearchService } from './search.service';
 const bnfMock = { enumerateEdition: jest.fn() };
 const bnf = bnfMock as unknown as BnfService;
 
-const gbooksMock = { cachedCover: jest.fn(), resolveCover: jest.fn() };
+const gbooksMock = {
+  cachedCover: jest.fn(),
+  resolveCover: jest.fn(),
+  resolveCoverAndDescription: jest.fn(),
+};
 const gbooks = gbooksMock as unknown as GoogleBooksCoverService;
 
 beforeEach(() => {
   jest.clearAllMocks();
-  gbooksMock.cachedCover.mockResolvedValue(null);
+  gbooksMock.resolveCover.mockResolvedValue(null);
+  gbooksMock.resolveCoverAndDescription.mockResolvedValue({
+    coverUrl: null,
+    description: null,
+  });
 });
 
 function makeService(adapters: SourceAdapter[]): SearchService {
@@ -140,7 +148,7 @@ describe('SearchService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('editionMapping délègue à la BnF et enrichit chaque tome avec la jaquette en cache (cache-only)', async () => {
+  it('editionMapping délègue à la BnF et résout jaquette + résumé de chaque tome (isbn + hint)', async () => {
     const mapping = {
       titleFr: "L'attaque des titans",
       edition: 'Éd. colossale',
@@ -151,20 +159,25 @@ describe('SearchService', () => {
           isbn: '111',
           titleFr: 'T.1',
           sourceVolumeRange: null,
+          description: 'Résumé BnF du tome 1',
         },
         {
           editionVolume: 2,
           isbn: null,
           titleFr: 'T.2',
           sourceVolumeRange: null,
+          description: null,
         },
       ],
       recordsScanned: 30,
       ongoing: false,
     };
     bnfMock.enumerateEdition.mockResolvedValue(mapping);
-    gbooksMock.cachedCover.mockImplementation(async (isbn: string) =>
-      isbn === '111' ? 'https://img/1.jpg' : null,
+    gbooksMock.resolveCoverAndDescription.mockImplementation(
+      async (isbn: string) =>
+        isbn === '111'
+          ? { coverUrl: 'https://img/1.jpg', description: 'Résumé GB ignoré' }
+          : { coverUrl: null, description: null },
     );
     const svc = makeService([]);
 
@@ -177,9 +190,13 @@ describe('SearchService', () => {
       "L'attaque des titans",
       'Éd. colossale',
     );
-    // Tome sans ISBN → aucune résolution tentée.
-    expect(gbooksMock.cachedCover).toHaveBeenCalledTimes(1);
-    expect(gbooksMock.cachedCover).toHaveBeenCalledWith('111');
+    // Tome sans ISBN → aucune résolution tentée. Le hint porte titre série + n° tome + édition.
+    expect(gbooksMock.resolveCoverAndDescription).toHaveBeenCalledTimes(1);
+    expect(gbooksMock.resolveCoverAndDescription).toHaveBeenCalledWith('111', {
+      title: "L'attaque des titans",
+      volume: 1,
+      edition: 'Éd. colossale',
+    });
     expect(res.tomeCount).toBe(2);
     expect(res.tomes).toEqual([
       {
@@ -187,6 +204,8 @@ describe('SearchService', () => {
         isbn: '111',
         titleFr: 'T.1',
         sourceVolumeRange: null,
+        // 330$a BnF prioritaire : le résumé Google Books est ignoré quand la BnF en a un.
+        description: 'Résumé BnF du tome 1',
         coverUrl: 'https://img/1.jpg',
       },
       {
@@ -194,9 +213,38 @@ describe('SearchService', () => {
         isbn: null,
         titleFr: 'T.2',
         sourceVolumeRange: null,
+        description: null,
         coverUrl: null,
       },
     ]);
+  });
+
+  it('editionMapping: repli sur le résumé Google Books quand la BnF (330$a) est absente', async () => {
+    bnfMock.enumerateEdition.mockResolvedValue({
+      titleFr: 'X',
+      edition: null,
+      tomeCount: 1,
+      tomes: [
+        {
+          editionVolume: 1,
+          isbn: '111',
+          titleFr: 'T.1',
+          sourceVolumeRange: null,
+          description: null,
+        },
+      ],
+      recordsScanned: 1,
+      ongoing: false,
+    });
+    gbooksMock.resolveCoverAndDescription.mockResolvedValue({
+      coverUrl: null,
+      description: 'Résumé Google Books',
+    });
+    const svc = makeService([]);
+
+    const res = await svc.editionMapping('X');
+
+    expect(res.tomes[0].description).toBe('Résumé Google Books');
   });
 
   it('editionMapping passe null quand aucune édition (standard)', async () => {
@@ -206,13 +254,27 @@ describe('SearchService', () => {
     expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null);
   });
 
-  it('resolveCover délègue à GoogleBooksCoverService', async () => {
+  it('resolveCover délègue à GoogleBooksCoverService (sans hint)', async () => {
     gbooksMock.resolveCover.mockResolvedValue('https://img/x.jpg');
     const svc = makeService([]);
 
     const url = await svc.resolveCover('978-2-505-01194-3');
 
-    expect(gbooksMock.resolveCover).toHaveBeenCalledWith('978-2-505-01194-3');
+    expect(gbooksMock.resolveCover).toHaveBeenCalledWith(
+      '978-2-505-01194-3',
+      undefined,
+    );
     expect(url).toBe('https://img/x.jpg');
+  });
+
+  it('resolveCover transmet le hint de repli (titre/tome/édition) à GoogleBooks', async () => {
+    gbooksMock.resolveCover.mockResolvedValue('https://img/y.jpg');
+    const svc = makeService([]);
+    const hint = { title: 'Jujutsu kaisen', volume: 6, edition: null };
+
+    const url = await svc.resolveCover('9791032706343', hint);
+
+    expect(gbooksMock.resolveCover).toHaveBeenCalledWith('9791032706343', hint);
+    expect(url).toBe('https://img/y.jpg');
   });
 });

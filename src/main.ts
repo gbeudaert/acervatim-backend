@@ -57,6 +57,10 @@ async function bootstrap() {
     SwaggerModule.setup('docs', app, document);
   }
 
+  // Ferme proprement les workers BullMQ (et autres ressources) au SIGTERM :
+  // sans ça, les jobs en cours ne sont pas drainés à l'arrêt du conteneur.
+  app.enableShutdownHooks();
+
   const port = config.get<number>('PORT', 3000);
 
   await app.listen(port);

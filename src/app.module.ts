@@ -4,7 +4,8 @@ import {
   NestModule,
   RequestMethod,
 } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { BullModule } from '@nestjs/bullmq';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
@@ -41,16 +42,28 @@ import { UsersModule } from './users/users.module';
       validate: validateEnv,
     }),
     ThrottlerModule.forRoot({
-      throttlers: [
-        { name: 'default', ttl: 60_000, limit: 100 },
-        { name: 'auth', ttl: 60_000, limit: 10 },
-        { name: 'admin', ttl: 60_000, limit: 5 },
-      ],
+      // Un seul bucket global : 100 req/min/IP. Avec @nestjs/throttler v6, TOUT
+      // throttler nommé ici s'applique à TOUTES les routes — un bucket « admin »
+      // à 5/min bridait donc l'API entière (cf. fan-out des jaquettes manga).
+      // Les routes sensibles resserrent ce bucket via @Throttle (auth 10, admin 5).
+      throttlers: [{ name: 'default', ttl: 60_000, limit: 100 }],
       // Désactivé en NODE_ENV=test : les e2e logent ~10x depuis 127.0.0.1
-      // et exploseraient le bucket auth.
+      // et exploseraient le bucket.
       skipIf: () => process.env.NODE_ENV === 'test',
     }),
     ScheduleModule.forRoot(),
+    // BullMQ : backing Redis des files sortantes (throttle global + single-flight).
+    // La connexion se reconnecte seule si Redis est indisponible au boot ; les
+    // producteurs best-effort (jaquettes) dégradent en null plutôt que d'échouer.
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        connection: {
+          host: config.get<string>('REDIS_HOST', 'localhost'),
+          port: config.get<number>('REDIS_PORT', 6379),
+        },
+      }),
+    }),
     CryptoModule,
     PrismaModule,
     HttpModule,

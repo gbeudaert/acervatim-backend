@@ -64,7 +64,11 @@ interface DiscogsSearchResult {
   cover_image?: string;
   thumb?: string;
   uri?: string;
+  // En recherche, `format` est un tableau plat qui mêle le nom du format ET ses
+  // descriptions ("Vinyl", "LP", "Album", "33 ⅓ RPM") — d'où on dérive la vitesse.
   format?: string[];
+  genre?: string[];
+  style?: string[];
   label?: string[];
   country?: string;
 }
@@ -81,7 +85,11 @@ interface DiscogsReleaseResponse {
   thumb?: string;
   uri?: string;
   notes?: string;
-  formats?: { name: string }[];
+  // `descriptions` porte les qualificatifs du pressage, dont la vitesse ("33 ⅓ RPM").
+  formats?: { name: string; descriptions?: string[] }[];
+  // Discogs distingue `genres` (large : "Rock") de `styles` (fin : "Grunge").
+  genres?: string[];
+  styles?: string[];
   labels?: { name: string }[];
   country?: string;
   tracklist?: unknown;
@@ -399,6 +407,9 @@ export class DiscogsAdapter
       coverUrl: r.cover_image ?? r.thumb ?? undefined,
       metadata: {
         format: r.format,
+        genres: r.genre,
+        styles: r.style,
+        recordingSpeed: deriveRecordingSpeed(r.format),
         label: r.label,
         country: r.country,
         uri: r.uri,
@@ -422,6 +433,9 @@ export class DiscogsAdapter
       description: r.notes,
       metadata: {
         formats: r.formats?.map((f) => f.name),
+        genres: r.genres,
+        styles: r.styles,
+        recordingSpeed: deriveRecordingSpeed(releaseFormatDescriptors(r.formats)),
         labels: r.labels?.map((l) => l.name),
         country: r.country,
         barcode: extractBarcode(r.identifiers),
@@ -507,6 +521,38 @@ function extractBarcode(
   if (!found?.value) return undefined;
   const digits = found.value.replace(/\D/g, '');
   return digits.length > 0 ? digits : undefined;
+}
+
+function releaseFormatDescriptors(
+  formats: DiscogsReleaseResponse['formats'],
+): string[] {
+  // Aplati nom + descriptions de chaque format pour y chercher la vitesse RPM.
+  return (formats ?? [])
+    .flatMap((f) => [f.name, ...(f.descriptions ?? [])])
+    .filter((s): s is string => Boolean(s));
+}
+
+function deriveRecordingSpeed(
+  descriptors: string[] | undefined,
+): 'RPM_33' | 'RPM_45' | 'RPM_78' | 'OTHER' | undefined {
+  // Discogs note la vitesse en clair dans les descriptions ("33 ⅓ RPM", "45 RPM",
+  // "78 RPM", parfois "16 ⅔"/"80"). On ne renseigne que si un token RPM est présent —
+  // sinon undefined (le média n'est pas un disque à vitesse connue, ex. CD).
+  if (!descriptors?.length) return undefined;
+  const m = descriptors
+    .join(' ')
+    .match(/\b(16|33|45|78|80)\b[^A-Za-z]*RPM\b/i);
+  if (!m) return undefined;
+  switch (m[1]) {
+    case '33':
+      return 'RPM_33';
+    case '45':
+      return 'RPM_45';
+    case '78':
+      return 'RPM_78';
+    default:
+      return 'OTHER';
+  }
 }
 
 function extractCreatorsFromTitle(title: string | undefined): string[] {

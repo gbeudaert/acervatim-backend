@@ -1,0 +1,40 @@
+# Quadlet systemd pour Redis (backing store BullMQ) sous Podman.
+# Cible : Raspberry Pi 4 (arm64), Podman rootless — même hôte que l'API.
+#
+# Redis porte les files BullMQ (throttle sortant + single-flight des appels sources).
+# Les jobs sont IDEMPOTENTS/rejouables (réchauffeurs de cache) : la durabilité AOF est
+# un confort, pas une exigence — un redémarrage qui perd des jobs ne fait que re-déclencher
+# une résolution au prochain scan. On garde tout de même une persistance légère.
+#
+# Installation (rootless) :
+#   1. Copier ce fichier dans :
+#        ~/.config/containers/systemd/acervatim-redis.container
+#   2. systemctl --user daemon-reload && systemctl --user start acervatim-redis
+#   3. Dans le .env de l'API : REDIS_HOST=acervatim-redis  REDIS_PORT=6379
+#      (résolu via le réseau Podman ; les deux conteneurs partagent le même réseau).
+
+[Unit]
+Description=Acervatim Redis (BullMQ backing store)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/library/redis:7-alpine
+ContainerName=acervatim-redis
+# noeviction : ne jamais évincer un job BullMQ sous pression mémoire.
+# appendonly : persistance légère (rejouable de toute façon).
+Exec=redis-server --maxmemory-policy noeviction --appendonly yes
+# Pas de PublishPort : seul l'API (même réseau Podman) accède à Redis. On expose le
+# conteneur par son nom via un réseau partagé plutôt qu'un port sur l'hôte.
+Network=acervatim.network
+Volume=acervatim-redis-data:/data
+HealthCmd=redis-cli ping
+HealthInterval=10s
+HealthRetries=5
+
+[Service]
+Restart=always
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default.target

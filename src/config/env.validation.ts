@@ -11,6 +11,10 @@ export const EnvSchema = z.object({
     .enum(['development', 'production', 'test'])
     .default('development'),
   DATABASE_URL: z.string().url(),
+  // Redis — backing store des files BullMQ (throttle sortant + single-flight des
+  // appels sources). En prod : conteneur Redis dédié sur le Pi (cf. deploy/).
+  REDIS_HOST: z.string().min(1).default('localhost'),
+  REDIS_PORT: z.coerce.number().int().default(6379),
   SUB_HASH_PEPPER: z.string().min(32),
   ENCRYPTION_KEY: base64Length(32),
   INVITE_CODE_PEPPER: z.string().min(32),

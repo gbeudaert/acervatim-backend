@@ -1,137 +1,123 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Queue, QueueEvents } from 'bullmq';
 import { ApiCacheService } from '../../cache/api-cache.service';
-import { HttpClientService } from '../../http/http-client.service';
-import { TokenBucketService } from '../../rate-limit/token-bucket.service';
-import { GoogleBooksVolumesResponse } from './googlebooks.types';
+import {
+  CachedCover,
+  CoverHint,
+  CoverJobData,
+  CoverResult,
+  GBOOKS_COVER_JOB,
+  GBOOKS_QUEUE,
+  coverCacheKey,
+  normalizeIsbn,
+} from './googlebooks.types';
 
-const BASE_URL = 'https://www.googleapis.com/books/v1/volumes';
+export type { CoverHint, CoverResult } from './googlebooks.types';
 
-// Une jaquette est stable ; une absence peut être comblée plus tard (nouvelle notice Google).
-const HIT_TTL_SECONDS = 90 * 24 * 3600;
-const MISS_TTL_SECONDS = 7 * 24 * 3600;
+const EMPTY: CoverResult = { coverUrl: null, description: null };
 
-// Throttle poli pour rester sous le quota Google Books (par défaut ~1000 req/jour).
-const RATE_LIMIT_BUCKET = 'gbooks:global';
-const RATE_LIMIT_CAPACITY = 100;
-const RATE_LIMIT_REFILL_PER_SEC = 1;
-
-/**
- * Enveloppe de cache : distingue « ISBN jamais résolu » (absent du cache) de
- * « résolu, pas de jaquette » (`{ url: null }`), pour ne pas re-taper Google Books à chaque fois.
- */
-interface CachedCover {
-  url: string | null;
-}
+// Plafond d'attente d'une résolution (best-effort) : au-delà on rend `null` sans casser l'appelant.
+// Couvre le cas Redis lent/indisponible et une file engorgée.
+const WAIT_TIMEOUT_MS = 15_000;
 
 /**
- * Résolution de jaquette **par ISBN** via Google Books — seule source d'illustration par
- * tome/volume (la BnF est bibliographique, MAL ne fournit qu'un visuel de série). Utilisé pour
- * enrichir l'énumération d'édition manga (cf. issue backend#1) et par l'endpoint `/v1/search/cover`.
+ * **Producteur** de résolutions de jaquette Google Books — seule source d'illustration par
+ * tome/volume (la BnF est bibliographique, MAL ne fournit qu'un visuel de série).
  *
- * Best-effort : ne jette jamais — renvoie `null` en cas d'échec réseau, de rate limit ou d'absence
- * de jaquette, pour ne pas casser les flux appelants.
+ * Pipeline : cache (`ApiCache`) → sinon **enqueue** sur la file BullMQ `gbooks` (throttle sortant
+ * global + **single-flight** via `jobId`) → attente du résultat du worker. Best-effort : ne jette
+ * jamais (Redis down, échec Google, timeout → `null`), pour ne pas casser l'énumération d'édition.
  */
 @Injectable()
-export class GoogleBooksCoverService {
+export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(GoogleBooksCoverService.name);
-  private warnedMissingKey = false;
+  private queueEvents!: QueueEvents;
 
   constructor(
+    @InjectQueue(GBOOKS_QUEUE)
+    private readonly queue: Queue<CoverJobData, CoverResult>,
     private readonly config: ConfigService,
-    private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
-    private readonly bucket: TokenBucketService,
   ) {}
 
+  onModuleInit(): void {
+    // QueueEvents a besoin de sa propre connexion pour recevoir les événements de complétion
+    // sur lesquels `waitUntilFinished` s'appuie.
+    this.queueEvents = new QueueEvents(GBOOKS_QUEUE, {
+      connection: {
+        host: this.config.get<string>('REDIS_HOST', 'localhost'),
+        port: this.config.get<number>('REDIS_PORT', 6379),
+      },
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.queueEvents?.close();
+  }
+
   /**
-   * Lecture **cache-only** (jamais de réseau) : renvoie la jaquette déjà résolue pour cet ISBN,
-   * `null` si absente du cache ou résolue sans image. Utilisé par `edition-mapping` pour rester rapide.
+   * Lecture **cache-only** (jamais de réseau ni de file) : renvoie la jaquette déjà résolue pour cet
+   * ISBN, `null` si absente du cache ou résolue sans image. Utilisé par `edition-mapping` pour rester
+   * rapide sur les tomes déjà chauds.
    */
   async cachedCover(isbn: string): Promise<string | null> {
     const norm = normalizeIsbn(isbn);
     if (!norm) return null;
-    const hit = await this.cache.get<CachedCover>(cacheKey(norm));
+    const hit = await this.cache.get<CachedCover>(coverCacheKey(norm));
     return hit?.url ?? null;
   }
 
+  /** {@link resolveCoverAndDescription} en ne renvoyant que l'URL de jaquette. */
+  async resolveCover(isbn: string, hint?: CoverHint): Promise<string | null> {
+    return (await this.resolveCoverAndDescription(isbn, hint)).coverUrl;
+  }
+
   /**
-   * Résout la jaquette par ISBN via Google Books (réseau, best-effort) et met le résultat en cache
-   * (positif ET négatif). Un hit de cache court-circuite l'appel réseau.
+   * Résout jaquette + résumé d'un tome. Hit de cache → immédiat. Sinon on enfile un job `gbooks`
+   * (dédup par `jobId` = clé de cache → deux demandes identiques concurrentes ne déclenchent qu'un
+   * seul appel sortant) et on attend son résultat. Le worker met en cache (2xx uniquement).
    */
-  async resolveCover(isbn: string): Promise<string | null> {
+  async resolveCoverAndDescription(
+    isbn: string,
+    hint?: CoverHint,
+  ): Promise<CoverResult> {
     const norm = normalizeIsbn(isbn);
-    if (!norm) return null;
+    if (!norm) return EMPTY;
 
-    const key = cacheKey(norm);
+    const key = coverCacheKey(norm);
     const cached = await this.cache.get<CachedCover>(key);
-    if (cached) return cached.url;
-
-    const allowed = await this.bucket.consume(
-      RATE_LIMIT_BUCKET,
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!allowed) {
-      this.logger.warn(`gbooks: rate limited isbn=${norm}`);
-      return null; // pas de mise en cache : on retentera au prochain appel.
+    if (cached) {
+      return { coverUrl: cached.url, description: cached.description ?? null };
     }
 
-    let url: string | null;
     try {
-      url = await this.fetchCover(norm);
-    } catch {
-      this.logger.warn(`gbooks: fetch failed isbn=${norm}`);
-      return null; // échec réseau → pas de cache négatif (on retentera).
-    }
-
-    await this.cache.set<CachedCover>(
-      key,
-      { url },
-      url ? HIT_TTL_SECONDS : MISS_TTL_SECONDS,
-    );
-    return url;
-  }
-
-  private async fetchCover(normIsbn: string): Promise<string | null> {
-    const params = new URLSearchParams({
-      q: `isbn:${normIsbn}`,
-      country: 'FR',
-    });
-    const apiKey = this.config.get<string>('GOOGLE_BOOKS_API_KEY');
-    if (apiKey) {
-      params.set('key', apiKey);
-    } else if (!this.warnedMissingKey) {
-      this.warnedMissingKey = true;
-      this.logger.warn(
-        'gbooks: GOOGLE_BOOKS_API_KEY absent — appels non authentifiés (quota réduit)',
+      const job = await this.queue.add(
+        GBOOKS_COVER_JOB,
+        { isbn: norm, hint: hint ?? null },
+        {
+          // Single-flight : un job par ISBN. Complétion gardée quelques secondes pour que
+          // `waitUntilFinished` lise l'état même si l'événement a été manqué (le cache long TTL
+          // court-circuite tout ré-enqueue dans cette fenêtre). En revanche, un échec est retiré
+          // IMMÉDIATEMENT (`removeOnFail: true`) : un échec Google transitoire doit rester
+          // re-tentable au prochain scan, or garder le job échoué sous ce jobId le bloquerait.
+          jobId: key,
+          removeOnComplete: { age: 60, count: 500 },
+          removeOnFail: true,
+        },
       );
+      return await job.waitUntilFinished(this.queueEvents, WAIT_TIMEOUT_MS);
+    } catch {
+      // Redis indisponible, worker en échec (réseau/quota Google) ou timeout d'attente :
+      // best-effort → null, jamais d'exception (ne casse pas l'énumération d'édition).
+      this.logger.warn(`gbooks: resolve failed isbn=${norm}`);
+      return EMPTY;
     }
-
-    const res = await this.http.request<GoogleBooksVolumesResponse>(
-      `${BASE_URL}?${params.toString()}`,
-      { method: 'GET' },
-    );
-    const links = res.data?.items?.[0]?.volumeInfo?.imageLinks;
-    const raw = links?.thumbnail ?? links?.smallThumbnail;
-    return raw ? toHttpsCover(raw) : null;
   }
-}
-
-/** ISBN-10/13 ou EAN → forme normalisée (chiffres + X), ou null si trop court pour être un ISBN. */
-function normalizeIsbn(isbn: string): string | null {
-  const norm = isbn.replace(/[^0-9Xx]/g, '').toUpperCase();
-  return norm.length >= 10 ? norm : null;
-}
-
-function cacheKey(normIsbn: string): string {
-  return `gbooks:cover:${normIsbn}`;
-}
-
-/**
- * Google renvoie souvent l'URL en `http://` et avec un effet de page (`&edge=curl`) :
- * on force `https://` et on retire le curl pour une jaquette propre.
- */
-function toHttpsCover(url: string): string {
-  return url.replace(/^http:\/\//i, 'https://').replace(/&edge=curl/i, '');
 }

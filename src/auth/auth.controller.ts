@@ -18,7 +18,7 @@ export class AuthController {
 
   @Post('google')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ auth: { ttl: 60_000, limit: 10 } })
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
   async loginWithGoogle(@Body() dto: GoogleLoginDto) {
     return this.authService.loginWithProvider('google', dto);
   }

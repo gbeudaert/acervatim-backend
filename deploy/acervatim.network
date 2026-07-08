@@ -1,0 +1,12 @@
+# Quadlet réseau Podman partagé par l'API et Redis.
+# Permet à `acervatim-api` de joindre Redis par son nom de conteneur (`acervatim-redis`)
+# via le DNS interne Podman (aardvark-dns) — d'où REDIS_HOST=acervatim-redis dans le .env.
+#
+# Installation (rootless) :
+#   cp acervatim.network ~/.config/containers/systemd/acervatim.network
+#   systemctl --user daemon-reload
+# Le réseau est créé automatiquement au démarrage des conteneurs qui le référencent
+# (Network=acervatim.network).
+
+[Network]
+NetworkName=acervatim

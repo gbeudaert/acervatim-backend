@@ -263,6 +263,35 @@ describe('DiscogsAdapter.search', () => {
     expect(opts.headers.Authorization).toMatch(/^OAuth /);
   });
 
+  it('mappe genre/style et dérive recordingSpeed depuis le tableau format plat', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        results: [
+          {
+            id: 2,
+            type: 'release',
+            title: 'Nirvana - Nevermind',
+            genre: ['Rock'],
+            style: ['Grunge', 'Alternative Rock'],
+            format: ['Vinyl', 'LP', 'Album', '33 ⅓ RPM'],
+          },
+        ],
+        pagination: { page: 1, pages: 1 },
+      },
+    });
+
+    const res = await svc.search('nirvana', { userId: USER, limit: 50 });
+
+    expect(res.items[0].metadata).toMatchObject({
+      genres: ['Rock'],
+      styles: ['Grunge', 'Alternative Rock'],
+      recordingSpeed: 'RPM_33',
+    });
+  });
+
   it('propage nextCursor quand pagination.pages > pagination.page', async () => {
     const { deps, svc } = makeDeps();
     deps.http.request.mockResolvedValue({
@@ -492,7 +521,9 @@ describe('DiscogsAdapter.fetchDetails', () => {
         images: [
           { uri: 'https://img/full.jpg', uri150: 'https://img/thumb.jpg' },
         ],
-        formats: [{ name: 'Vinyl' }],
+        formats: [{ name: 'Vinyl', descriptions: ['LP', 'Album', '33 ⅓ RPM'] }],
+        genres: ['Jazz'],
+        styles: ['Modal', 'Cool Jazz'],
         labels: [{ name: 'Columbia' }],
         country: 'US',
       },
@@ -511,9 +542,45 @@ describe('DiscogsAdapter.fetchDetails', () => {
     });
     expect(item.metadata).toMatchObject({
       formats: ['Vinyl'],
+      genres: ['Jazz'],
+      styles: ['Modal', 'Cool Jazz'],
+      // Dérivée des descriptions du format ("33 ⅓ RPM").
+      recordingSpeed: 'RPM_33',
       labels: ['Columbia'],
       country: 'US',
     });
+  });
+
+  it('dérive recordingSpeed=45 depuis les descriptions du format', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        id: 43,
+        title: 'Single',
+        formats: [{ name: 'Vinyl', descriptions: ['7"', 'Single', '45 RPM'] }],
+      },
+    });
+
+    const item = await svc.fetchDetails('43', { userId: USER, limit: 50 });
+    expect(item.metadata).toMatchObject({ recordingSpeed: 'RPM_45' });
+  });
+
+  it('recordingSpeed undefined pour un format sans vitesse (ex. CD)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.http.request.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        id: 44,
+        title: 'Album CD',
+        formats: [{ name: 'CD', descriptions: ['Album'] }],
+      },
+    });
+
+    const item = await svc.fetchDetails('44', { userId: USER, limit: 50 });
+    expect(item.metadata?.recordingSpeed).toBeUndefined();
   });
 
   it('multi-auteurs : prefere anv, strip le suffixe homonyme " (N)"', async () => {
