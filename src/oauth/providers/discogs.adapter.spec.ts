@@ -1,12 +1,12 @@
-import { HttpException, ServiceUnavailableException } from '@nestjs/common';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import { DiscogsAdapter } from './discogs.adapter';
+import { DISCOGS_FETCH_JOB } from './discogs.types';
 
 interface MockDeps {
   config: ConfigService;
@@ -17,7 +17,6 @@ interface MockDeps {
     delete: jest.Mock;
     getOrFetch: jest.Mock;
   };
-  bucket: { consume: jest.Mock };
   creds: {
     store: jest.Mock;
     get: jest.Mock;
@@ -25,27 +24,25 @@ interface MockDeps {
     listConnected: jest.Mock;
   };
   tokenResolver: { resolve: jest.Mock };
-}
-
-function makeConfig(
-  overrides: Record<string, string | undefined> = {},
-): ConfigService {
-  const env: Record<string, string | undefined> = {
-    DISCOGS_CONSUMER_KEY: 'ck-test',
-    DISCOGS_CONSUMER_SECRET: 'cs-test',
-    DISCOGS_CALLBACK_URL: 'http://localhost:3000/v1/oauth/discogs/callback',
-    ...overrides,
-  };
-  return { get: jest.fn((k: string) => env[k]) } as unknown as ConfigService;
+  queue: { add: jest.Mock };
+  waitUntilFinished: jest.Mock;
 }
 
 function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   deps: MockDeps;
   svc: DiscogsAdapter;
 } {
-  const config = makeConfig(configOverrides);
+  const env: Record<string, string | undefined> = {
+    DISCOGS_CONSUMER_KEY: 'ck-test',
+    DISCOGS_CONSUMER_SECRET: 'cs-test',
+    DISCOGS_CALLBACK_URL: 'http://localhost:3000/v1/oauth/discogs/callback',
+    ...configOverrides,
+  };
+  const config = {
+    get: jest.fn((k: string) => env[k]),
+  } as unknown as ConfigService;
   const http = { request: jest.fn() };
-  // getOrFetch : par défaut on cache-miss et on appelle le fetcher (comportement réel souhaité dans les tests).
+  // getOrFetch : par défaut on cache-miss et on appelle le fetcher (comportement réel souhaité).
   const cache = {
     get: jest.fn(),
     set: jest.fn(),
@@ -55,31 +52,52 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
         fetcher(),
     ),
   };
-  const bucket = { consume: jest.fn().mockResolvedValue(true) };
   const creds = {
     store: jest.fn(),
     get: jest.fn().mockResolvedValue(null),
     remove: jest.fn(),
     listConnected: jest.fn(),
   };
-
-  // Par défaut : repli premium (consumer-only) — les tests de connexion user ou de
-  // mode dégradé surchargent explicitement `resolve`.
+  // Par défaut : repli premium — les tests user ou dégradé surchargent explicitement `resolve`.
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
+  const waitUntilFinished = jest.fn();
+  const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
 
   const svc = new DiscogsAdapter(
     config,
     http as unknown as HttpClientService,
     cache as unknown as ApiCacheService,
-    bucket as unknown as TokenBucketService,
     creds as unknown as OauthCredentialsService,
     tokenResolver as unknown as TokenResolverService,
+    queue as never,
   );
-  svc.onModuleInit();
+  // Court-circuite onModuleInit (qui ouvrirait une connexion Redis via QueueEvents) : on pose les
+  // champs à la main depuis la même config.
+  const s = svc as unknown as {
+    consumerKey?: string;
+    consumerSecret?: string;
+    callbackUrl?: string;
+    acervatimToken?: string;
+    queueEvents: unknown;
+  };
+  s.consumerKey = env.DISCOGS_CONSUMER_KEY;
+  s.consumerSecret = env.DISCOGS_CONSUMER_SECRET;
+  s.callbackUrl = env.DISCOGS_CALLBACK_URL;
+  s.acervatimToken = env.DISCOGS_ACERVATIM_TOKEN;
+  s.queueEvents = {};
+
   return {
-    deps: { config, http, cache, bucket, creds, tokenResolver },
+    deps: {
+      config,
+      http,
+      cache,
+      creds,
+      tokenResolver,
+      queue,
+      waitUntilFinished,
+    },
     svc,
   };
 }
@@ -109,7 +127,7 @@ describe('DiscogsAdapter.start (OAuth 1.0a request_token)', () => {
 
     const res = await svc.start(USER);
 
-    // 1. Appel HTTP correct
+    // 1. Appel HTTP correct (le flux OAuth reste un appel direct, hors file)
     expect(deps.http.request).toHaveBeenCalledTimes(1);
     const [url, opts] = deps.http.request.mock.calls[0];
     expect(url).toBe('https://api.discogs.com/oauth/request_token');
@@ -118,7 +136,6 @@ describe('DiscogsAdapter.start (OAuth 1.0a request_token)', () => {
     expect(opts.headers.Authorization).toContain(
       'oauth_consumer_key="ck-test"',
     );
-    // oauth_callback DOIT être dans la signature (cf. piège §17.9.2)
     expect(opts.headers.Authorization).toContain('oauth_signature=');
 
     // 2. Pending persisté avec TTL 600s, indexé par requestToken
@@ -167,17 +184,14 @@ describe('DiscogsAdapter.callback (OAuth 1.0a access_token)', () => {
 
     expect(res).toEqual({ userId: USER });
 
-    // 1. Cache lookup sur le bon pending
     expect(deps.cache.get).toHaveBeenCalledWith(
       'oauth-discogs-pending:req-tok-123',
     );
 
-    // 2. HTTP POST /oauth/access_token, signé avec request_token_secret
     const [, opts] = deps.http.request.mock.calls[0];
     expect(opts.method).toBe('POST');
     expect(opts.headers.Authorization).toContain('oauth_token="req-tok-123"');
 
-    // 3. Credentials stockés (en clair, le chiffrement est fait dans OauthCredentialsService)
     expect(deps.creds.store).toHaveBeenCalledWith(USER, 'discogs', {
       accessToken: 'access-tok-789',
       refreshToken: 'access-secret-xyz',
@@ -185,7 +199,6 @@ describe('DiscogsAdapter.callback (OAuth 1.0a access_token)', () => {
       scopes: [],
     });
 
-    // 4. Pending nettoyé
     expect(deps.cache.delete).toHaveBeenCalledWith(
       'oauth-discogs-pending:req-tok-123',
     );
@@ -214,35 +227,36 @@ describe('DiscogsAdapter.callback (OAuth 1.0a access_token)', () => {
 });
 
 describe('DiscogsAdapter.search', () => {
-  it("consume le token bucket avant l'appel (60/min/user) et signe l'URL avec query params", async () => {
+  it('enfile un job (single-flight, sans secret) et mappe le corps du worker vers UnifiedItem', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        results: [
-          {
-            id: 1,
-            type: 'release',
-            title: 'Miles Davis - Kind of Blue',
-            year: 1959,
-            cover_image: 'https://img/cover.jpg',
-          },
-        ],
-        pagination: { page: 1, pages: 1 },
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [
+        {
+          id: 1,
+          type: 'release',
+          title: 'Miles Davis - Kind of Blue',
+          year: 1959,
+          cover_image: 'https://img/cover.jpg',
+        },
+      ],
+      pagination: { page: 1, pages: 1 },
     });
 
-    const res = await svc.search('miles davis', {
+    const res = await svc.search('miles davis', { userId: USER, limit: 50 });
+
+    // Job enfilé : nom, payload (userId + URL SANS secret), jobId hashé.
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
+    const [jobName, payload, opts] = deps.queue.add.mock.calls[0];
+    expect(jobName).toBe(DISCOGS_FETCH_JOB);
+    expect(payload).toEqual({
       userId: USER,
-      limit: 50,
+      url: expect.stringContaining('/database/search'),
     });
-
-    // Rate limit consumé
-    expect(deps.bucket.consume).toHaveBeenCalledWith(`discogs:${USER}`, 60, 1);
-
-    // Cache hit OR fetch — par défaut getOrFetch appelle fetcher
-    expect(deps.cache.getOrFetch).toHaveBeenCalledTimes(1);
+    expect(opts).toEqual(
+      expect.objectContaining({ jobId: expect.any(String) }),
+    );
+    // Aucun appel HTTP direct côté adapter (c'est le worker qui appelle Discogs).
+    expect(deps.http.request).not.toHaveBeenCalled();
 
     // Mapping vers UnifiedItem
     expect(res.items).toHaveLength(1);
@@ -250,37 +264,29 @@ describe('DiscogsAdapter.search', () => {
       source: 'discogs',
       sourceId: '1',
       mediaType: 'vinyl',
-      // Le prefixe artiste "Miles Davis - " est retire du titre.
+      // Le prefixe artiste "Miles Davis - " est retiré du titre.
       title: 'Kind of Blue',
       creators: ['Miles Davis'],
       releaseDate: '1959-01-01',
       coverUrl: 'https://img/cover.jpg',
     });
     expect(res.nextCursor).toBeNull();
-
-    // Authorization OAuth présent
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toMatch(/^OAuth /);
   });
 
   it('mappe genre/style et dérive recordingSpeed depuis le tableau format plat', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        results: [
-          {
-            id: 2,
-            type: 'release',
-            title: 'Nirvana - Nevermind',
-            genre: ['Rock'],
-            style: ['Grunge', 'Alternative Rock'],
-            format: ['Vinyl', 'LP', 'Album', '33 ⅓ RPM'],
-          },
-        ],
-        pagination: { page: 1, pages: 1 },
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [
+        {
+          id: 2,
+          type: 'release',
+          title: 'Nirvana - Nevermind',
+          genre: ['Rock'],
+          style: ['Grunge', 'Alternative Rock'],
+          format: ['Vinyl', 'LP', 'Album', '33 ⅓ RPM'],
+        },
+      ],
+      pagination: { page: 1, pages: 1 },
     });
 
     const res = await svc.search('nirvana', { userId: USER, limit: 50 });
@@ -294,118 +300,55 @@ describe('DiscogsAdapter.search', () => {
 
   it('propage nextCursor quand pagination.pages > pagination.page', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 3 } },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 3 },
     });
 
     const res = await svc.search('jazz', { userId: USER, limit: 10 });
     expect(res.nextCursor).toBe('2');
   });
 
-  it('throw 429 HttpException si le token bucket refuse', async () => {
-    const { deps, svc } = makeDeps();
-    deps.bucket.consume.mockResolvedValue(false);
-
-    const promise = svc.search('x', { userId: USER, limit: 10 });
-    await expect(promise).rejects.toBeInstanceOf(HttpException);
-    await promise.catch((e) => expect(e.getStatus()).toBe(429));
-    expect(deps.http.request).not.toHaveBeenCalled();
-  });
-
-  it("utilise le tokenSecret stocké dans 'refreshToken' pour signer (OAuth 1.0a, jeton user résolu)", async () => {
+  it('jeton user résolu : enfile le job (le worker signera) sans appel direct', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({
       source: 'user',
       credentials: {
         accessToken: 'user-access',
-        refreshToken: 'user-secret', // dans le schéma OAuth 1.0a, c'est le tokenSecret
+        refreshToken: 'user-secret',
         expiresAtMs: 0,
         scopes: [],
       },
     });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 1 },
     });
 
     await svc.search('x', { userId: USER, limit: 10 });
 
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toContain('oauth_token="user-access"');
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
+    // Le payload ne contient AUCUN secret (ni token user, ni consumer) — juste userId + URL.
+    const [, payload] = deps.queue.add.mock.calls[0];
+    expect(JSON.stringify(payload)).not.toContain('user-access');
+    expect(JSON.stringify(payload)).not.toContain('user-secret');
   });
 
-  it('repli premium (fallback) : signe en consumer-only, sans oauth_token utilisateur', async () => {
-    const { deps, svc } = makeDeps();
+  it('repli premium (fallback) sans aucun credential serveur : ServiceUnavailable, aucun enqueue', async () => {
+    const { deps, svc } = makeDeps({
+      DISCOGS_CONSUMER_KEY: undefined,
+      DISCOGS_CONSUMER_SECRET: undefined,
+      DISCOGS_ACERVATIM_TOKEN: undefined,
+    });
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
-    });
 
-    await svc.search('x', { userId: USER, limit: 10 });
-
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toMatch(/^OAuth /);
-    expect(opts.headers.Authorization).toContain(
-      'oauth_consumer_key="ck-test"',
-    );
-    expect(opts.headers.Authorization).not.toContain('oauth_token=');
+    await expect(
+      svc.search('x', { userId: USER, limit: 10 }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
-  it('repli premium avec DISCOGS_ACERVATIM_TOKEN : Authorization: Discogs token= (images)', async () => {
-    const { deps, svc } = makeDeps({ DISCOGS_ACERVATIM_TOKEN: 'perso-tok' });
-    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
-    });
-
-    await svc.search('x', { userId: USER, limit: 10 });
-
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toBe('Discogs token=perso-tok');
-  });
-
-  it('repli premium sans DISCOGS_ACERVATIM_TOKEN : retombe sur la signature consumer-only', async () => {
-    const { deps, svc } = makeDeps();
-    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
-    });
-
-    await svc.search('x', { userId: USER, limit: 10 });
-
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toMatch(/^OAuth /);
-    expect(opts.headers.Authorization).not.toContain('Discogs token=');
-  });
-
-  it('repli premium (fallback) : consomme le bucket partagé acervatim:discogs', async () => {
-    const { deps, svc } = makeDeps();
-    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
-    });
-
-    await svc.search('x', { userId: USER, limit: 10 });
-
-    expect(deps.bucket.consume).toHaveBeenCalledWith(
-      'acervatim:discogs',
-      60,
-      1,
-    );
-  });
-
-  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun appel sortant', async () => {
+  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun enqueue', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     deps.cache.get.mockResolvedValue(null);
@@ -413,10 +356,10 @@ describe('DiscogsAdapter.search', () => {
     await expect(
       svc.search('x', { userId: USER, limit: 10 }),
     ).rejects.toBeInstanceOf(SourceTokenRequiredException);
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
-  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans appel', async () => {
+  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans enqueue', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     deps.cache.get.mockResolvedValue({
@@ -426,16 +369,15 @@ describe('DiscogsAdapter.search', () => {
 
     const res = await svc.search('air', { userId: USER, limit: 10 });
 
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
     expect(res.items[0].sourceId).toBe('5');
   });
 
-  it('clé de cache search partagée (provider:mode, SANS userId) — repli/dégradé mutualisables, pas de fuite', async () => {
+  it('clé de cache search partagée (provider:mode, SANS userId) — repli/dégradé mutualisables', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 1 },
     });
 
     await svc.search('jazz', { userId: USER, limit: 10 });
@@ -449,30 +391,24 @@ describe('DiscogsAdapter.search', () => {
 describe('DiscogsAdapter.searchByBarcode', () => {
   it('interroge Discogs avec le paramètre `barcode=` (pas `q=`)', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { results: [], pagination: { page: 1, pages: 1 } },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 1 },
     });
 
     await svc.searchByBarcode('0888072024557', { userId: USER, limit: 50 });
 
-    expect(deps.bucket.consume).toHaveBeenCalledWith(`discogs:${USER}`, 60, 1);
-    const [url] = deps.http.request.mock.calls[0];
-    expect(url).toContain('barcode=0888072024557');
-    expect(url).toContain('type=release');
-    expect(url).not.toContain('q=');
+    const [, payload] = deps.queue.add.mock.calls[0];
+    expect(payload.url).toContain('barcode=0888072024557');
+    expect(payload.url).toContain('type=release');
+    expect(payload.url).not.toContain('q=');
   });
 
   it('mappe les résultats vers UnifiedItem comme la recherche texte', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        results: [{ id: 7, title: 'Daft Punk - Discovery', year: 2001 }],
-        pagination: { page: 1, pages: 1 },
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [{ id: 7, title: 'Daft Punk - Discovery', year: 2001 }],
+      pagination: { page: 1, pages: 1 },
     });
 
     const res = await svc.searchByBarcode('0888072024557', {
@@ -492,13 +428,9 @@ describe('DiscogsAdapter.searchByBarcode', () => {
 
   it('garde le titre tel quel quand il ne contient pas de separateur " - "', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        results: [{ id: 8, title: 'Untitled', year: 2020 }],
-        pagination: { page: 1, pages: 1 },
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [{ id: 8, title: 'Untitled', year: 2020 }],
+      pagination: { page: 1, pages: 1 },
     });
 
     const res = await svc.search('untitled', { userId: USER, limit: 50 });
@@ -510,23 +442,19 @@ describe('DiscogsAdapter.searchByBarcode', () => {
 describe('DiscogsAdapter.fetchDetails', () => {
   it('mappe artists + images + released vers UnifiedItem', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 42,
-        title: 'Kind of Blue',
-        released: '1959-08-17',
-        artists: [{ name: 'Miles Davis' }, { name: 'John Coltrane' }],
-        images: [
-          { uri: 'https://img/full.jpg', uri150: 'https://img/thumb.jpg' },
-        ],
-        formats: [{ name: 'Vinyl', descriptions: ['LP', 'Album', '33 ⅓ RPM'] }],
-        genres: ['Jazz'],
-        styles: ['Modal', 'Cool Jazz'],
-        labels: [{ name: 'Columbia' }],
-        country: 'US',
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      id: 42,
+      title: 'Kind of Blue',
+      released: '1959-08-17',
+      artists: [{ name: 'Miles Davis' }, { name: 'John Coltrane' }],
+      images: [
+        { uri: 'https://img/full.jpg', uri150: 'https://img/thumb.jpg' },
+      ],
+      formats: [{ name: 'Vinyl', descriptions: ['LP', 'Album', '33 ⅓ RPM'] }],
+      genres: ['Jazz'],
+      styles: ['Modal', 'Cool Jazz'],
+      labels: [{ name: 'Columbia' }],
+      country: 'US',
     });
 
     const item = await svc.fetchDetails('42', { userId: USER, limit: 50 });
@@ -544,7 +472,6 @@ describe('DiscogsAdapter.fetchDetails', () => {
       formats: ['Vinyl'],
       genres: ['Jazz'],
       styles: ['Modal', 'Cool Jazz'],
-      // Dérivée des descriptions du format ("33 ⅓ RPM").
       recordingSpeed: 'RPM_33',
       labels: ['Columbia'],
       country: 'US',
@@ -553,14 +480,10 @@ describe('DiscogsAdapter.fetchDetails', () => {
 
   it('dérive recordingSpeed=45 depuis les descriptions du format', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 43,
-        title: 'Single',
-        formats: [{ name: 'Vinyl', descriptions: ['7"', 'Single', '45 RPM'] }],
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      id: 43,
+      title: 'Single',
+      formats: [{ name: 'Vinyl', descriptions: ['7"', 'Single', '45 RPM'] }],
     });
 
     const item = await svc.fetchDetails('43', { userId: USER, limit: 50 });
@@ -569,14 +492,10 @@ describe('DiscogsAdapter.fetchDetails', () => {
 
   it('recordingSpeed undefined pour un format sans vitesse (ex. CD)', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 44,
-        title: 'Album CD',
-        formats: [{ name: 'CD', descriptions: ['Album'] }],
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      id: 44,
+      title: 'Album CD',
+      formats: [{ name: 'CD', descriptions: ['Album'] }],
     });
 
     const item = await svc.fetchDetails('44', { userId: USER, limit: 50 });
@@ -585,18 +504,14 @@ describe('DiscogsAdapter.fetchDetails', () => {
 
   it('multi-auteurs : prefere anv, strip le suffixe homonyme " (N)"', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 100,
-        title: 'Split',
-        artists: [
-          { name: 'Artiste1' },
-          { name: 'Nirvana (2)' },
-          { name: 'The Beatles', anv: 'Beatles' },
-        ],
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      id: 100,
+      title: 'Split',
+      artists: [
+        { name: 'Artiste1' },
+        { name: 'Nirvana (2)' },
+        { name: 'The Beatles', anv: 'Beatles' },
+      ],
     });
 
     const item = await svc.fetchDetails('100', { userId: USER, limit: 50 });
@@ -606,17 +521,13 @@ describe('DiscogsAdapter.fetchDetails', () => {
 
   it('extrait le barcode depuis identifiers (type "Barcode", digits only)', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 99,
-        title: 'Discovery',
-        identifiers: [
-          { type: 'Barcode', value: '0 888072 024557', description: 'Text' },
-          { type: 'Matrix / Runout', value: 'ABC-123' },
-        ],
-      },
+    deps.waitUntilFinished.mockResolvedValue({
+      id: 99,
+      title: 'Discovery',
+      identifiers: [
+        { type: 'Barcode', value: '0 888072 024557', description: 'Text' },
+        { type: 'Matrix / Runout', value: 'ABC-123' },
+      ],
     });
 
     const item = await svc.fetchDetails('99', { userId: USER, limit: 50 });

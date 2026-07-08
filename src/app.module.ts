@@ -21,7 +21,6 @@ import { HttpModule } from './common/http/http.module';
 import { BnfModule } from './common/sources/bnf/bnf.module';
 import { GoogleBooksModule } from './common/sources/googlebooks/googlebooks.module';
 import { QuotaModule } from './common/quota/quota.module';
-import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
@@ -68,7 +67,6 @@ import { UsersModule } from './users/users.module';
     PrismaModule,
     HttpModule,
     ApiCacheModule,
-    RateLimitModule,
     BnfModule,
     GoogleBooksModule,
     QuotaModule,

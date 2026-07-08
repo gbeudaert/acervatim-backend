@@ -1,23 +1,26 @@
+import { InjectQueue } from '@nestjs/bullmq';
 import {
   BadGatewayException,
   BadRequestException,
-  HttpException,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Queue, QueueEvents } from 'bullmq';
+import { createHash } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
-import {
-  DecryptedCredentials,
-  OauthCredentialsService,
-  OauthProvider,
-} from '../oauth.service';
+import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
+import {
+  DISCOGS_FETCH_JOB,
+  DISCOGS_QUEUE,
+  DiscogsFetchJobData,
+} from './discogs.types';
 import { OAuthFlowProvider } from './flow.types';
 import { buildOAuth1Header, OAuth1Credentials } from './oauth1';
 import {
@@ -36,15 +39,8 @@ const PENDING_TTL_SECONDS = 600;
 const SEARCH_CACHE_TTL_SECONDS = 3600;
 const DETAILS_CACHE_TTL_SECONDS = 86_400;
 
-const RATE_LIMIT_CAPACITY = 60;
-const RATE_LIMIT_REFILL_PER_SEC = 1;
-
-// Bucket PARTAGÉ entre tous les premiums servis en repli (consumer key Acervatim) :
-// plafonne le débit sortant total sur le compte Acervatim, pour ne pas se faire
-// throttler par Discogs. À calibrer sur la limite réelle du compte Acervatim
-// (Discogs : ~60 req/min en authentifié consumer).
-const ACERVATIM_RATE_LIMIT_CAPACITY = 60;
-const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 1;
+// Plafond d'attente d'un appel Discogs via la file (au-delà → BadGateway).
+const DISCOGS_WAIT_MS = 15_000;
 
 interface PendingRequestToken {
   userId: string;
@@ -98,7 +94,7 @@ interface DiscogsReleaseResponse {
 
 @Injectable()
 export class DiscogsAdapter
-  implements SourceAdapter, OAuthFlowProvider, OnModuleInit
+  implements SourceAdapter, OAuthFlowProvider, OnModuleInit, OnModuleDestroy
 {
   readonly source = 'discogs' as const;
   readonly mediaType = 'vinyl' as const;
@@ -108,16 +104,22 @@ export class DiscogsAdapter
   private consumerKey?: string;
   private consumerSecret?: string;
   private callbackUrl!: string;
-  /** Personal access token d'un compte Acervatim, pour le repli premium (images). */
+  /**
+   * Personal access token d'un compte Acervatim (repli premium avec images). Connu du producteur
+   * uniquement pour le fast-fail typé (repli demandé mais aucun credential serveur) ; la signature/
+   * l'appel réel se font dans `DiscogsProcessor`.
+   */
   private acervatimToken?: string;
+  private queueEvents!: QueueEvents;
 
   constructor(
     private readonly config: ConfigService,
     private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
-    private readonly bucket: TokenBucketService,
     private readonly creds: OauthCredentialsService,
     private readonly tokenResolver: TokenResolverService,
+    @InjectQueue(DISCOGS_QUEUE)
+    private readonly queue: Queue<DiscogsFetchJobData, unknown>,
   ) {}
 
   onModuleInit() {
@@ -125,6 +127,16 @@ export class DiscogsAdapter
     this.consumerSecret = this.config.get<string>('DISCOGS_CONSUMER_SECRET');
     this.callbackUrl = this.config.get<string>('DISCOGS_CALLBACK_URL')!;
     this.acervatimToken = this.config.get<string>('DISCOGS_ACERVATIM_TOKEN');
+    this.queueEvents = new QueueEvents(DISCOGS_QUEUE, {
+      connection: {
+        host: this.config.get<string>('REDIS_HOST', 'localhost'),
+        port: this.config.get<number>('REDIS_PORT', 6379),
+      },
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.queueEvents?.close();
   }
 
   // ----- OAuthFlowProvider -----
@@ -236,7 +248,6 @@ export class DiscogsAdapter
     criteria: { q?: string; barcode?: string },
     ctx: AdapterContext,
   ): Promise<AdapterSearchResult> {
-    await this.consumeRate(ctx.userId);
     const page = parsePage(ctx.cursor);
 
     const params = new URLSearchParams({ type: 'release' });
@@ -277,7 +288,6 @@ export class DiscogsAdapter
   }
 
   async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
-    await this.consumeRate(ctx.userId);
     const cacheKey = `discogs:release:${id}`;
     const raw = await this.discogsResolvedGet<DiscogsReleaseResponse>(
       `${DISCOGS_API_BASE}/releases/${encodeURIComponent(id)}`,
@@ -291,13 +301,16 @@ export class DiscogsAdapter
   // ----- Helpers privés -----
 
   /**
-   * GET Discogs avec résolution de jeton (cf. `TokenResolverService`) et mode dégradé.
-   *  - jeton user présent → OAuth 1.0a signé avec le token utilisateur ;
-   *  - premium sans jeton → repli Acervatim = OAuth 1.0a consumer-only (clé
-   *    consumer serveur, données publiques) ;
-   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
-   *    `SourceTokenRequiredException` (403 actionnable : connecter Discogs ou premium).
-   * Le repli consumer-only consomme le quota Discogs d'Acervatim : réservé au premium.
+   * GET Discogs via la file `discogs` (throttle sortant global + single-flight sur la clé de cache),
+   * avec résolution/signature du jeton **dans le worker** (cf. `DiscogsProcessor`) et mode dégradé
+   * côté producteur.
+   *  - jeton user présent → OAuth 1.0a signé au token utilisateur (worker) ;
+   *  - premium sans jeton → repli Acervatim (`Discogs token=` personal ou signature consumer-only)
+   *    (worker) ;
+   *  - sinon (dégradé) → cache-only, aucun enqueue ; à défaut de hit, `SourceTokenRequiredException`
+   *    (403 actionnable : connecter Discogs ou premium).
+   * Clé de cache partagée sur clé publique : un hit d'un autre user est réutilisable sans fuite
+   * (données Discogs publiques). Aucun secret ne transite par le cacheKey ni le payload du job.
    */
   private async discogsResolvedGet<T>(
     url: string,
@@ -313,85 +326,51 @@ export class DiscogsAdapter
       throw new SourceTokenRequiredException('discogs');
     }
 
-    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
-      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
-      // uniquement — un hit ne tape pas le compte Acervatim).
-      if (resolution.source === 'fallback') {
-        await this.consumeAcervatimRate();
-      }
-      return this.discogsFetch<T>(
-        url,
-        resolution.source === 'user' ? resolution.credentials : null,
+    // Fast-fail typé : repli premium demandé mais aucun credential serveur (ni personal token
+    // Acervatim, ni consumer key/secret pour la signature consumer-only). Évite d'enfiler un job
+    // voué à échouer et préserve le 503 « not configured » attendu.
+    if (
+      resolution.source === 'fallback' &&
+      !this.acervatimToken &&
+      (!this.consumerKey || !this.consumerSecret)
+    ) {
+      this.logger.error(
+        'DISCOGS repli premium impossible : aucun credential serveur',
       );
-    });
-  }
+      throw new ServiceUnavailableException('discogs: not configured');
+    }
 
-  private async discogsFetch<T>(
-    url: string,
-    userCreds: DecryptedCredentials | null,
-  ): Promise<T> {
-    // Repli premium (pas de jeton user) avec un personal access token Acervatim :
-    // `Authorization: Discogs token=` — authentifié ET renvoie les images (la
-    // signature consumer-only, elle, authentifie sans jaquettes). Vérifié via
-    // scripts/test-discogs-consumer.ts (T8).
-    const authHeader =
-      userCreds === null && this.acervatimToken
-        ? `Discogs token=${this.acervatimToken}`
-        : this.buildSignedHeader(url, userCreds);
-
-    const res = await this.http.request<T>(url, {
-      method: 'GET',
-      headers: { Authorization: authHeader },
-    });
-    return res.data;
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, () =>
+      this.enqueueFetch<T>(url, cacheKey, userId),
+    );
   }
 
   /**
-   * En-tête OAuth 1.0a : signé avec le token user si présent, sinon consumer-only
-   * (repli premium sans personal token — authentifié mais sans images).
+   * Enfile un GET Discogs et attend le worker. Single-flight sur la clé de cache publique (hashée car
+   * BullMQ interdit `:` et les espaces dans un jobId, or la clé en contient). Échec worker (Discogs
+   * indispo) / Redis / timeout → `BadGatewayException` (pas de mise en cache → re-tentable).
    */
-  private buildSignedHeader(
+  private async enqueueFetch<T>(
     url: string,
-    userCreds: DecryptedCredentials | null,
-  ): string {
-    const consumer = this.requireConsumer();
-    const creds: OAuth1Credentials = userCreds
-      ? {
-          ...consumer,
-          tokenKey: userCreds.accessToken,
-          // Stocké dans refreshToken — cf. callback().
-          tokenSecret: userCreds.refreshToken,
-        }
-      : consumer;
-    return buildOAuth1Header('GET', stripQuery(url), creds, queryParams(url));
-  }
-
-  private async consumeRate(userId: string): Promise<void> {
-    const ok = await this.bucket.consume(
-      `discogs:${userId}`,
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException(
-        'discogs: rate limit exceeded (60 req/min/user)',
-        429,
+    cacheKey: string,
+    userId: string,
+  ): Promise<T> {
+    try {
+      const job = await this.queue.add(
+        DISCOGS_FETCH_JOB,
+        { userId, url },
+        {
+          jobId: createHash('sha1').update(cacheKey).digest('hex'),
+          removeOnComplete: { age: 60, count: 500 },
+          removeOnFail: true,
+        },
       );
-    }
-  }
-
-  /** Bucket partagé des replis Acervatim (tous premiums confondus). */
-  private async consumeAcervatimRate(): Promise<void> {
-    const ok = await this.bucket.consume(
-      `acervatim:${this.source}`,
-      ACERVATIM_RATE_LIMIT_CAPACITY,
-      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException(
-        'discogs: repli Acervatim rate limited (capacité partagée épuisée)',
-        429,
-      );
+      return (await job.waitUntilFinished(
+        this.queueEvents,
+        DISCOGS_WAIT_MS,
+      )) as T;
+    } catch {
+      throw new BadGatewayException('discogs: upstream unavailable');
     }
   }
 
@@ -435,7 +414,9 @@ export class DiscogsAdapter
         formats: r.formats?.map((f) => f.name),
         genres: r.genres,
         styles: r.styles,
-        recordingSpeed: deriveRecordingSpeed(releaseFormatDescriptors(r.formats)),
+        recordingSpeed: deriveRecordingSpeed(
+          releaseFormatDescriptors(r.formats),
+        ),
         labels: r.labels?.map((l) => l.name),
         country: r.country,
         barcode: extractBarcode(r.identifiers),
@@ -487,22 +468,6 @@ function parsePage(cursor: string | undefined): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
-function stripQuery(url: string): string {
-  const q = url.indexOf('?');
-  return q === -1 ? url : url.slice(0, q);
-}
-
-function queryParams(url: string): Record<string, string> {
-  const q = url.indexOf('?');
-  if (q === -1) return {};
-  const params = new URLSearchParams(url.slice(q + 1));
-  const out: Record<string, string> = {};
-  params.forEach((v, k) => {
-    out[k] = v;
-  });
-  return out;
-}
-
 function cleanArtistName(a: { name?: string; anv?: string }): string {
   // Prefere le nom credite (anv) si present, sinon le nom canonique.
   // Strip le suffixe de desambiguisation Discogs " (N)" final ("Nirvana (2)").
@@ -539,9 +504,7 @@ function deriveRecordingSpeed(
   // "78 RPM", parfois "16 ⅔"/"80"). On ne renseigne que si un token RPM est présent —
   // sinon undefined (le média n'est pas un disque à vitesse connue, ex. CD).
   if (!descriptors?.length) return undefined;
-  const m = descriptors
-    .join(' ')
-    .match(/\b(16|33|45|78|80)\b[^A-Za-z]*RPM\b/i);
+  const m = descriptors.join(' ').match(/\b(16|33|45|78|80)\b[^A-Za-z]*RPM\b/i);
   if (!m) return undefined;
   switch (m[1]) {
     case '33':

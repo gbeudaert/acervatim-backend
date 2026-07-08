@@ -23,17 +23,15 @@ export interface SearchCriteria {
 /**
  * Résolutions de jaquette Google Books menées de front pendant l'énumération d'édition.
  *
- * Volontairement bas, et pour une raison **interne** avant d'être une histoire de quota Google : le
- * bucket de débit `gbooks:global` est une unique ligne SQL à CAS optimiste (`TokenBucketService`).
- * Sous un `Promise.all` large (30+ tomes) tous les `consume` lisent le même `lastRefill` et se
- * disputent la même ligne — un seul writer gagne par tour, les autres réessaient puis abandonnent
- * (`token-bucket: CAS gave up`) et renvoient « rate limited » alors que le bucket est plein.
- * Résultat observé : `editionMapping` résolvait ZÉRO jaquette (le seul chemin portant le repli
- * `intitle:`), l'app retombait sur `/cover` sans repli → jaquettes manquantes. Les 503 Google en
- * rafale ne sont que l'effet secondaire une fois quelques appels passés.
+ * Volontairement bas : l'énumération d'une édition (30+ tomes) enfile autant de résolutions dans la
+ * file `gbooks` (throttlée par un limiter global) ; un `Promise.all` non borné n'accélère rien (le
+ * limiter sérialise le débit sortant) et ne ferait que gonfler le backlog Redis. Un petit palier
+ * suffit à réchauffer le cache sans saturer la file ni les 503 Google en rafale.
  *
- * Gardé < `CAS_MAX_ATTEMPTS` pour que le writer le plus malchanceux gagne sa course avant d'épuiser
- * ses tentatives. Un petit palier suffit à fiabiliser le 1er passage sans ralentir l'énumération.
+ * Historique : avant la passerelle BullMQ (P0), le débit `gbooks:global` passait par une unique ligne
+ * SQL à CAS optimiste — sous un `Promise.all` large les writers se livelockaient et l'énumération
+ * résolvait ZÉRO jaquette. Le bucket SQL a été supprimé ; le limiter de file le remplace, mais la
+ * concurrence bornée reste la bonne hygiène côté producteur.
  */
 const COVER_RESOLUTION_CONCURRENCY = 4;
 

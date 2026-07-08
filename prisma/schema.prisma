@@ -151,9 +151,13 @@ model OauthCredential {
   @@map("oauth_credentials")
 }
 
-// ---------- Cache & rate limit ----------
+// ---------- Cache ----------
 // Pas de TTL natif sur MariaDB pour les rows.
 // Un cron applicatif supprime les rows expirées (job NestJS @Cron).
+//
+// NB : le modèle `RateLimitBucket` (buckets à jetons SQL) a été retiré — le throttle des appels
+// sortants est désormais assuré par les limiters BullMQ (cf. src/oauth/providers/*.processor.ts,
+// src/common/sources/googlebooks/*). Migration de drop : voir prisma/migrations/*_drop_rate_limit_buckets.
 
 model ApiCache {
   cacheKey  String   @id @map("cache_key") @db.VarChar(255)
@@ -163,16 +167,6 @@ model ApiCache {
 
   @@index([expiresAt])
   @@map("api_cache")
-}
-
-model RateLimitBucket {
-  bucketKey  String   @id @map("bucket_key") @db.VarChar(255)
-  tokens     Float    @default(0)
-  lastRefill BigInt   @default(0) @map("last_refill") // epoch ms
-  expiresAt  DateTime @map("expires_at")
-
-  @@index([expiresAt])
-  @@map("rate_limit_buckets")
 }
 
 // ---------- Premium (subscriptions + grants) ----------
