@@ -25,6 +25,7 @@ import { RedisHealthModule } from './common/redis/redis-health.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
+import { QueueMetricsModule } from './metrics/queue-metrics.module';
 import { NodesModule } from './nodes/nodes.module';
 import { OauthModule } from './oauth/oauth.module';
 import { PremiumModule } from './premium/premium.module';
@@ -84,6 +85,7 @@ import { UsersModule } from './users/users.module';
     SearchModule,
     SourcesModule,
     SubscriptionsModule,
+    QueueMetricsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
