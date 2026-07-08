@@ -1,17 +1,18 @@
+import { InjectQueue } from '@nestjs/bullmq';
 import {
   BadGatewayException,
   BadRequestException,
-  HttpException,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomBytes } from 'crypto';
+import { Queue, QueueEvents } from 'bullmq';
+import { createHash, randomBytes } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { BnfAuthor, BnfNotice } from '../../common/sources/bnf/bnf.types';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
@@ -19,6 +20,7 @@ import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import { OAuthFlowProvider } from './flow.types';
+import { MAL_FETCH_JOB, MAL_QUEUE, MalFetchJobData } from './mal.types';
 import { codeChallengePlain, generateCodeVerifier } from './pkce';
 import {
   AdapterContext,
@@ -35,14 +37,8 @@ const PENDING_TTL_SECONDS = 600;
 const SEARCH_CACHE_TTL_SECONDS = 3600;
 const DETAILS_CACHE_TTL_SECONDS = 86_400;
 
-const RATE_LIMIT_CAPACITY = 60;
-const RATE_LIMIT_REFILL_PER_SEC = 1;
-
-// Bucket PARTAGÉ entre tous les premiums servis en repli (X-MAL-CLIENT-ID Acervatim) :
-// plafonne le débit sortant total sur le compte Acervatim, pour ne pas se faire
-// throttler/bannir par MAL. À calibrer sur la limite réelle du compte Acervatim.
-const ACERVATIM_RATE_LIMIT_CAPACITY = 120;
-const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 2;
+// Plafond d'attente d'un appel MAL via la file (au-delà → BadGateway ; le pivot dégrade en bnf_only).
+const MAL_WAIT_MS = 15_000;
 
 const MAL_MANGA_FIELDS =
   'id,title,main_picture,start_date,synopsis,authors{first_name,last_name},mean,media_type,status,num_volumes';
@@ -111,7 +107,7 @@ interface PivotCandidate {
 
 @Injectable()
 export class MalAdapter
-  implements SourceAdapter, OAuthFlowProvider, OnModuleInit
+  implements SourceAdapter, OAuthFlowProvider, OnModuleInit, OnModuleDestroy
 {
   readonly source = 'mal' as const;
   readonly mediaType = 'manga' as const;
@@ -121,22 +117,34 @@ export class MalAdapter
   private clientId?: string;
   private clientSecret?: string;
   private callbackUrl!: string;
+  private queueEvents!: QueueEvents;
 
   constructor(
     private readonly config: ConfigService,
     private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
-    private readonly bucket: TokenBucketService,
     private readonly creds: OauthCredentialsService,
     private readonly bnf: BnfService,
     private readonly tokenResolver: TokenResolverService,
     private readonly googleBooks: GoogleBooksCoverService,
+    @InjectQueue(MAL_QUEUE)
+    private readonly queue: Queue<MalFetchJobData, unknown>,
   ) {}
 
   onModuleInit() {
     this.clientId = this.config.get<string>('MAL_CLIENT_ID');
     this.clientSecret = this.config.get<string>('MAL_CLIENT_SECRET');
     this.callbackUrl = this.config.get<string>('MAL_CALLBACK_URL')!;
+    this.queueEvents = new QueueEvents(MAL_QUEUE, {
+      connection: {
+        host: this.config.get<string>('REDIS_HOST', 'localhost'),
+        port: this.config.get<number>('REDIS_PORT', 6379),
+      },
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.queueEvents?.close();
   }
 
   // ----- OAuthFlowProvider -----
@@ -226,7 +234,6 @@ export class MalAdapter
     query: string,
     ctx: AdapterContext,
   ): Promise<AdapterSearchResult> {
-    await this.consumeRate(ctx.userId);
     const offset = parseOffset(ctx.cursor);
     const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(query)}&limit=${ctx.limit}&offset=${offset}&fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
     // Clé de cache partagée (réponse MAL publique) : pas de userId, pour que le
@@ -312,20 +319,20 @@ export class MalAdapter
       }
       raw = cached;
     } else {
-      await this.consumeRate(ctx.userId);
+      // Fast-fail typé : repli premium demandé mais client-id serveur absent (le worker
+      // échouerait de toute façon en X-MAL-CLIENT-ID).
+      if (tokenResolution.source === 'fallback' && !this.clientId) {
+        this.logger.error(
+          'MAL_CLIENT_ID not configured — pivot repli impossible',
+        );
+        throw new ServiceUnavailableException('mal: not configured');
+      }
+      // Appel sortant via la file (throttle global + single-flight sur la clé de cache) ; le worker
+      // résout le jeton (Bearer user ou X-MAL-CLIENT-ID serveur) et l'injecte.
       raw = await this.cache.getOrFetch<MalSearchResponse>(
         cacheKey,
         SEARCH_CACHE_TTL_SECONDS,
-        async () => {
-          if (tokenResolution.source === 'user') {
-            return this.malBearerGet<MalSearchResponse>(
-              url,
-              tokenResolution.credentials.accessToken,
-            );
-          }
-          await this.consumeAcervatimRate();
-          return this.malPublicGet<MalSearchResponse>(url);
-        },
+        () => this.enqueueFetch<MalSearchResponse>(url, cacheKey, ctx.userId),
       );
     }
     const candidates = (raw.data ?? []).map((d) => d.node);
@@ -385,7 +392,6 @@ export class MalAdapter
   }
 
   async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
-    await this.consumeRate(ctx.userId);
     const url = `${MAL_API_BASE}/manga/${encodeURIComponent(id)}?fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
     const cacheKey = `mal:manga:${id}`;
 
@@ -401,22 +407,15 @@ export class MalAdapter
 
   // ----- Helpers privés -----
 
-  private async malBearerGet<T>(url: string, accessToken: string): Promise<T> {
-    const res = await this.http.request<T>(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    return res.data;
-  }
-
   /**
-   * GET MAL avec résolution de jeton (cf. `TokenResolverService`) et mode dégradé.
-   *  - jeton user présent → Bearer utilisateur ;
-   *  - premium sans jeton → repli `X-MAL-CLIENT-ID` (données publiques) ;
-   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
-   *    `SourceTokenRequiredException` (403 actionnable : connecter MAL ou premium).
-   * Cache partagé sur clé publique : un hit d'un autre user est réutilisable sans
-   * fuite (données MAL interrogées ici publiques).
+   * GET MAL via la file `mal` (throttle sortant global + single-flight sur la clé de cache), avec
+   * résolution du jeton **dans le worker** (cf. `MalProcessor`) et mode dégradé côté producteur.
+   *  - jeton user présent → Bearer utilisateur (worker) ;
+   *  - premium sans jeton → repli `X-MAL-CLIENT-ID` serveur (worker) ;
+   *  - sinon (dégradé) → cache-only, aucun enqueue ; à défaut de hit, `SourceTokenRequiredException`
+   *    (403 actionnable : connecter MAL ou premium).
+   * Cache partagé sur clé publique : un hit d'un autre user est réutilisable sans fuite (données MAL
+   * interrogées ici publiques). Le jeton n'apparaît ni dans le cacheKey ni dans le payload du job.
    */
   private async malResolvedGet<T>(
     url: string,
@@ -432,32 +431,42 @@ export class MalAdapter
       throw new SourceTokenRequiredException('mal');
     }
 
-    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
-      if (resolution.source === 'user') {
-        return this.malBearerGet<T>(url, resolution.credentials.accessToken);
-      }
-      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
-      // uniquement — un hit ne tape pas le compte Acervatim).
-      await this.consumeAcervatimRate();
-      return this.malPublicGet<T>(url);
-    });
+    // Fast-fail typé : repli premium demandé mais client-id serveur absent. Évite d'enfiler un job
+    // voué à échouer et préserve le 503 « not configured » attendu.
+    if (resolution.source === 'fallback' && !this.clientId) {
+      this.logger.error('MAL_CLIENT_ID not configured');
+      throw new ServiceUnavailableException('mal: not configured');
+    }
+
+    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, () =>
+      this.enqueueFetch<T>(url, cacheKey, userId),
+    );
   }
 
   /**
-   * Accès aux données PUBLIQUES MAL via `X-MAL-CLIENT-ID` (sans token OAuth user).
-   * Utilisé par le pivot ISBN : la recherche par ISBN ne doit pas exiger que
-   * l'utilisateur ait connecté son compte MAL.
+   * Enfile un GET MAL et attend le worker. Single-flight sur la clé de cache publique (hashée car
+   * BullMQ interdit `:` et les espaces dans un jobId, or la requête peut en contenir). Échec worker
+   * (MAL indispo) / Redis / timeout → `BadGatewayException` (pas de mise en cache → re-tentable).
    */
-  private async malPublicGet<T>(url: string): Promise<T> {
-    if (!this.clientId) {
-      this.logger.error('MAL_CLIENT_ID not configured — pivot impossible');
-      throw new ServiceUnavailableException('mal: not configured');
+  private async enqueueFetch<T>(
+    url: string,
+    cacheKey: string,
+    userId: string,
+  ): Promise<T> {
+    try {
+      const job = await this.queue.add(
+        MAL_FETCH_JOB,
+        { userId, url },
+        {
+          jobId: createHash('sha1').update(cacheKey).digest('hex'),
+          removeOnComplete: { age: 60, count: 500 },
+          removeOnFail: true,
+        },
+      );
+      return (await job.waitUntilFinished(this.queueEvents, MAL_WAIT_MS)) as T;
+    } catch {
+      throw new BadGatewayException('mal: upstream unavailable');
     }
-    const res = await this.http.request<T>(url, {
-      method: 'GET',
-      headers: { 'X-MAL-CLIENT-ID': this.clientId },
-    });
-    return res.data;
   }
 
   /**
@@ -525,35 +534,6 @@ export class MalAdapter
       return null;
     }
     return b;
-  }
-
-  private async consumeRate(userId: string): Promise<void> {
-    const ok = await this.bucket.consume(
-      `mal:${userId}`,
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException(
-        'mal: rate limit exceeded (60 req/min/user)',
-        429,
-      );
-    }
-  }
-
-  /** Bucket partagé des replis Acervatim (tous premiums confondus). */
-  private async consumeAcervatimRate(): Promise<void> {
-    const ok = await this.bucket.consume(
-      `acervatim:${this.source}`,
-      ACERVATIM_RATE_LIMIT_CAPACITY,
-      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException(
-        'mal: repli Acervatim rate limited (capacité partagée épuisée)',
-        429,
-      );
-    }
   }
 
   /**

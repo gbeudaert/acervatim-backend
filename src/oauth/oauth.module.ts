@@ -6,6 +6,8 @@ import { OauthController } from './oauth.controller';
 import { OauthCredentialsService } from './oauth.service';
 import { DiscogsAdapter } from './providers/discogs.adapter';
 import { MalAdapter } from './providers/mal.adapter';
+import { MalProcessor } from './providers/mal.processor';
+import { MAL_QUEUE } from './providers/mal.types';
 import { TmdbAdapter } from './providers/tmdb.adapter';
 import { TmdbProcessor } from './providers/tmdb.processor';
 import { TMDB_QUEUE } from './providers/tmdb.types';
@@ -15,6 +17,7 @@ import { TokenResolverService } from './token-resolver.service';
   imports: [
     AuthModule, // pour JwtAuthGuard
     BullModule.registerQueue({ name: TMDB_QUEUE }),
+    BullModule.registerQueue({ name: MAL_QUEUE }),
   ],
   controllers: [OauthController],
   providers: [
@@ -22,6 +25,7 @@ import { TokenResolverService } from './token-resolver.service';
     TokenResolverService,
     DiscogsAdapter,
     MalAdapter,
+    MalProcessor,
     TmdbAdapter,
     TmdbProcessor,
     OAuthFlowRegistry,

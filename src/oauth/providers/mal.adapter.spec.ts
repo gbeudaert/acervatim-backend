@@ -1,19 +1,18 @@
 import {
   BadGatewayException,
   BadRequestException,
-  HttpException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import { MalAdapter } from './mal.adapter';
+import { MAL_FETCH_JOB } from './mal.types';
 
 interface MockDeps {
   config: ConfigService;
@@ -24,7 +23,6 @@ interface MockDeps {
     delete: jest.Mock;
     getOrFetch: jest.Mock;
   };
-  bucket: { consume: jest.Mock };
   creds: {
     store: jest.Mock;
     get: jest.Mock;
@@ -34,25 +32,23 @@ interface MockDeps {
   bnf: { resolveByIsbn: jest.Mock };
   tokenResolver: { resolve: jest.Mock };
   googleBooks: { resolveCover: jest.Mock; cachedCover: jest.Mock };
-}
-
-function makeConfig(
-  overrides: Record<string, string | undefined> = {},
-): ConfigService {
-  const env: Record<string, string | undefined> = {
-    MAL_CLIENT_ID: 'cid',
-    MAL_CLIENT_SECRET: 'csec',
-    MAL_CALLBACK_URL: 'http://localhost:3000/v1/oauth/mal/callback',
-    ...overrides,
-  };
-  return { get: jest.fn((k: string) => env[k]) } as unknown as ConfigService;
+  queue: { add: jest.Mock };
+  waitUntilFinished: jest.Mock;
 }
 
 function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   deps: MockDeps;
   svc: MalAdapter;
 } {
-  const config = makeConfig(configOverrides);
+  const env: Record<string, string | undefined> = {
+    MAL_CLIENT_ID: 'cid',
+    MAL_CLIENT_SECRET: 'csec',
+    MAL_CALLBACK_URL: 'http://localhost:3000/v1/oauth/mal/callback',
+    ...configOverrides,
+  };
+  const config = {
+    get: jest.fn((k: string) => env[k]),
+  } as unknown as ConfigService;
   const http = { request: jest.fn() };
   const cache = {
     get: jest.fn(),
@@ -63,7 +59,6 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
         fetcher(),
     ),
   };
-  const bucket = { consume: jest.fn().mockResolvedValue(true) };
   const creds = {
     store: jest.fn(),
     get: jest.fn().mockResolvedValue(null),
@@ -71,8 +66,8 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     listConnected: jest.fn(),
   };
   const bnf = { resolveByIsbn: jest.fn() };
-  // Par défaut : repli premium (X-MAL-CLIENT-ID) — les tests de connexion user ou
-  // de mode dégradé surchargent explicitement `resolve`.
+  // Par défaut : repli premium (X-MAL-CLIENT-ID côté worker) — les tests user ou
+  // dégradé surchargent explicitement `resolve`.
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
@@ -82,34 +77,54 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     resolveCover: jest.fn().mockResolvedValue(null),
     cachedCover: jest.fn().mockResolvedValue(null),
   };
+  const waitUntilFinished = jest.fn();
+  const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
 
   const svc = new MalAdapter(
     config,
     http as unknown as HttpClientService,
     cache as unknown as ApiCacheService,
-    bucket as unknown as TokenBucketService,
     creds as unknown as OauthCredentialsService,
     bnf as unknown as BnfService,
     tokenResolver as unknown as TokenResolverService,
     googleBooks as unknown as GoogleBooksCoverService,
+    queue as never,
   );
-  svc.onModuleInit();
+  // Court-circuite onModuleInit (qui ouvrirait une connexion Redis via QueueEvents) : on pose
+  // les champs à la main depuis la même config.
+  const s = svc as unknown as {
+    clientId?: string;
+    clientSecret?: string;
+    callbackUrl?: string;
+    queueEvents: unknown;
+  };
+  s.clientId = env.MAL_CLIENT_ID;
+  s.clientSecret = env.MAL_CLIENT_SECRET;
+  s.callbackUrl = env.MAL_CALLBACK_URL;
+  s.queueEvents = {};
+
   return {
     deps: {
       config,
       http,
       cache,
-      bucket,
       creds,
       bnf,
       tokenResolver,
       googleBooks,
+      queue,
+      waitUntilFinished,
     },
     svc,
   };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
+
+/** Corps renvoyé par le worker (res.data) : la réponse MAL brute, sans enveloppe HTTP. */
+function malBody(nodes: Record<string, unknown>[], paging: unknown = {}) {
+  return { data: nodes.map((node) => ({ node })), paging };
+}
 
 describe('MalAdapter — config', () => {
   it('throw ServiceUnavailable si client_id/secret absents', async () => {
@@ -244,7 +259,7 @@ describe('MalAdapter.callback (échange code → access_token)', () => {
 });
 
 describe('MalAdapter.search', () => {
-  it('appelle /v2/manga avec Bearer (jeton user résolu) + consume token bucket + map vers UnifiedItem', async () => {
+  it('enfile un job (URL /v2/manga, sans jeton) et mappe la réponse du worker', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({
       source: 'user',
@@ -254,37 +269,33 @@ describe('MalAdapter.search', () => {
         scopes: [],
       },
     });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        data: [
-          {
-            node: {
-              id: 1,
-              title: 'One Piece',
-              main_picture: { large: 'https://img/op.jpg' },
-              start_date: '1997-07-22',
-              authors: [
-                {
-                  node: { first_name: 'Eiichiro', last_name: 'Oda' },
-                  role: 'Story & Art',
-                },
-              ],
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 1,
+          title: 'One Piece',
+          main_picture: { large: 'https://img/op.jpg' },
+          start_date: '1997-07-22',
+          authors: [
+            {
+              node: { first_name: 'Eiichiro', last_name: 'Oda' },
+              role: 'Story & Art',
             },
-          },
-        ],
-        paging: {},
-      },
-    });
+          ],
+        },
+      ]),
+    );
 
     const res = await svc.search('one piece', { userId: USER, limit: 50 });
 
-    expect(deps.bucket.consume).toHaveBeenCalledWith(`mal:${USER}`, 60, 1);
-    const [url, opts] = deps.http.request.mock.calls[0];
-    expect(url).toContain('/v2/manga');
-    expect(url).toContain('q=one%20piece');
-    expect(opts.headers.Authorization).toBe('Bearer tok-user');
+    expect(deps.queue.add).toHaveBeenCalledWith(
+      MAL_FETCH_JOB,
+      { userId: USER, url: expect.stringContaining('/v2/manga') },
+      // jobId = hash de la clé publique (BullMQ interdit ':' et espaces dans un jobId).
+      expect.objectContaining({ jobId: expect.any(String) }),
+    );
+    const jobData = deps.queue.add.mock.calls[0][1] as { url: string };
+    expect(jobData.url).toContain('q=one%20piece');
 
     expect(res.items).toHaveLength(1);
     expect(res.items[0]).toMatchObject({
@@ -307,75 +318,54 @@ describe('MalAdapter.search', () => {
     await expect(
       svc.search('x', { userId: USER, limit: 10 }),
     ).rejects.toBeInstanceOf(SourceTokenRequiredException);
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
-  it('mode dégradé (none) : sert un hit de cache partagé sans appel sortant', async () => {
+  it('mode dégradé (none) : sert un hit de cache partagé sans enqueue', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
-    deps.cache.get.mockResolvedValue({
-      data: [{ node: { id: 7, title: 'Cached Manga' } }],
-      paging: {},
-    });
+    deps.cache.get.mockResolvedValue(
+      malBody([{ id: 7, title: 'Cached Manga' }]),
+    );
 
     const res = await svc.search('x', { userId: USER, limit: 10 });
 
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
     expect(res.items).toHaveLength(1);
     expect(res.items[0].sourceId).toBe('7');
   });
 
-  it('repli premium (fallback) : interroge MAL en X-MAL-CLIENT-ID, sans Bearer', async () => {
+  it('repli premium (fallback) : enfile aussi un job (header injecté au worker)', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { data: [{ node: { id: 9, title: 'Naruto' } }], paging: {} },
-    });
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([{ id: 9, title: 'Naruto' }]),
+    );
 
     const res = await svc.search('naruto', { userId: USER, limit: 10 });
 
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers['X-MAL-CLIENT-ID']).toBe('cid');
-    expect(opts.headers.Authorization).toBeUndefined();
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
     expect(res.items[0].sourceId).toBe('9');
   });
 
-  it('repli premium (fallback) : consomme le bucket partagé acervatim:mal', async () => {
-    const { deps, svc } = makeDeps();
+  it('fast-fail : repli premium sans MAL_CLIENT_ID → ServiceUnavailable, aucun enqueue', async () => {
+    const { deps, svc } = makeDeps({ MAL_CLIENT_ID: undefined });
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { data: [], paging: {} },
-    });
 
-    await svc.search('x', { userId: USER, limit: 10 });
-
-    expect(deps.bucket.consume).toHaveBeenCalledWith('acervatim:mal', 120, 2);
+    await expect(
+      svc.search('x', { userId: USER, limit: 10 }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
-  it('429 si le bucket partagé acervatim:mal est épuisé (repli)', async () => {
+  it('échec du worker (MAL indispo / Redis / timeout) → BadGateway', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
-    // Épuise UNIQUEMENT le bucket partagé Acervatim (le bucket user passe).
-    deps.bucket.consume.mockImplementation((key: string) =>
-      Promise.resolve(key !== 'acervatim:mal'),
-    );
+    deps.waitUntilFinished.mockRejectedValue(new Error('boom'));
 
-    const p = svc.search('x', { userId: USER, limit: 10 });
-    await expect(p).rejects.toBeInstanceOf(HttpException);
-    await p.catch((e) => expect(e.getStatus()).toBe(429));
-    expect(deps.http.request).not.toHaveBeenCalled();
-  });
-
-  it('throw 429 HttpException si bucket plein', async () => {
-    const { deps, svc } = makeDeps();
-    deps.bucket.consume.mockResolvedValue(false);
-    const p = svc.search('x', { userId: USER, limit: 10 });
-    await expect(p).rejects.toBeInstanceOf(HttpException);
-    await p.catch((e) => expect(e.getStatus()).toBe(429));
+    await expect(
+      svc.search('x', { userId: USER, limit: 10 }),
+    ).rejects.toBeInstanceOf(BadGatewayException);
   });
 
   it('calcule nextCursor depuis paging.next + offset', async () => {
@@ -384,14 +374,9 @@ describe('MalAdapter.search', () => {
       source: 'user',
       credentials: { accessToken: 't', expiresAtMs: 0, scopes: [] },
     });
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        data: [],
-        paging: { next: 'https://api.myanimelist.net/v2/manga?offset=50' },
-      },
-    });
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([], { next: 'https://api.myanimelist.net/v2/manga?offset=50' }),
+    );
 
     const res = await svc.search('x', { userId: USER, limit: 50 });
     expect(res.nextCursor).toBe('50'); // 0 + 50
@@ -399,11 +384,7 @@ describe('MalAdapter.search', () => {
 
   it('clé de cache search partagée (provider:query, SANS userId) — repli/dégradé mutualisables, pas de fuite', async () => {
     const { deps, svc } = makeDeps();
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { data: [], paging: {} },
-    });
+    deps.waitUntilFinished.mockResolvedValue(malBody([]));
 
     await svc.search('one piece', { userId: USER, limit: 50 });
 
@@ -431,31 +412,25 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     ongoing: false,
   };
 
-  function malManga(node: Record<string, unknown>) {
-    return {
-      status: 200,
-      headers: {},
-      data: { data: [{ node }], paging: {} },
-    };
-  }
-
-  it('résout via BnF (X-MAL-CLIENT-ID public), retient le match auteur et porte le 454$h dans metadata.scannedTome', async () => {
+  it('résout via BnF (file MAL), retient le match auteur et porte le 454$h dans metadata.scannedTome', async () => {
     const { deps, svc } = makeDeps();
     deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 23390,
-        title: 'Shingeki no Kyojin',
-        media_type: 'manga',
-        status: 'finished',
-        num_volumes: 34,
-        authors: [
-          {
-            node: { first_name: 'Hajime', last_name: 'Isayama' },
-            role: 'Story & Art',
-          },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 23390,
+          title: 'Shingeki no Kyojin',
+          media_type: 'manga',
+          status: 'finished',
+          num_volumes: 34,
+          authors: [
+            {
+              node: { first_name: 'Hajime', last_name: 'Isayama' },
+              role: 'Story & Art',
+            },
+          ],
+        },
+      ]),
     );
 
     const res = await svc.searchByBarcode('9782811623258', {
@@ -463,11 +438,9 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       limit: 50,
     });
 
-    // Recherche MAL en accès public (pas de Bearer user).
-    const [url, opts] = deps.http.request.mock.calls[0];
-    expect(url).toContain('q=Shingeki%20no%20kyojin');
-    expect(opts.headers['X-MAL-CLIENT-ID']).toBe('cid');
-    expect(opts.headers.Authorization).toBeUndefined();
+    // Recherche MAL enfilée (jeton résolu / header posé côté worker).
+    const jobData = deps.queue.add.mock.calls[0][1] as { url: string };
+    expect(jobData.url).toContain('q=Shingeki%20no%20kyojin');
 
     expect(res.items).toHaveLength(1);
     expect(res.items[0].sourceId).toBe('23390');
@@ -484,25 +457,27 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
   });
 
-  it('pivot avec jeton user : interroge MAL en Bearer (pas de X-MAL-CLIENT-ID)', async () => {
+  it('pivot avec jeton user : enfile un job (injection Bearer au worker)', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({
       source: 'user',
       credentials: { accessToken: 'tok-user', expiresAtMs: 0, scopes: [] },
     });
     deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 23390,
-        title: 'Shingeki no Kyojin',
-        media_type: 'manga',
-        authors: [
-          {
-            node: { first_name: 'Hajime', last_name: 'Isayama' },
-            role: 'Story & Art',
-          },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 23390,
+          title: 'Shingeki no Kyojin',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Hajime', last_name: 'Isayama' },
+              role: 'Story & Art',
+            },
+          ],
+        },
+      ]),
     );
 
     const res = await svc.searchByBarcode('9782811623258', {
@@ -510,13 +485,11 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       limit: 50,
     });
 
-    const [, opts] = deps.http.request.mock.calls[0];
-    expect(opts.headers.Authorization).toBe('Bearer tok-user');
-    expect(opts.headers['X-MAL-CLIENT-ID']).toBeUndefined();
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
     expect(res.items[0].sourceId).toBe('23390');
   });
 
-  it('mode dégradé (non-premium sans jeton, pas de cache) : renvoie la notice BnF (bnf_only) + jaquette Google Books, aucun appel MAL', async () => {
+  it('mode dégradé (non-premium sans jeton, pas de cache) : renvoie la notice BnF (bnf_only) + jaquette Google Books, aucun enqueue', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     deps.cache.get.mockResolvedValue(null);
@@ -533,8 +506,7 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
 
     // Régression backend#2 : la notice BnF ne doit plus être jetée. On sert un
     // item bnf_only (série + tome scanné) sans jamais appeler MAL.
-    expect(deps.http.request).not.toHaveBeenCalled();
-    expect(deps.bucket.consume).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
     expect(deps.googleBooks.resolveCover).toHaveBeenCalledWith('9782811623258');
     expect(res.items).toHaveLength(1);
     const item = res.items[0];
@@ -572,7 +544,7 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
 
     expect(res.items).toHaveLength(0);
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
   it('sélectionne par contenance de titre + auteur même si un leurre est au rang 0 (Tokyo toritsu → JJK 0)', async () => {
@@ -590,42 +562,32 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
     // Rang 0 = leurre (bon type, mauvais auteur, titre non contenu) ; rang 1 = JJK 0
     // (titre-requête contenu dans le titre MAL + auteur Akutami).
-    deps.http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        data: [
-          {
-            node: {
-              id: 63,
-              title: 'Tokyo Ghoul:re',
-              media_type: 'manga',
-              authors: [
-                {
-                  node: { first_name: 'Sui', last_name: 'Ishida' },
-                  role: 'Story & Art',
-                },
-              ],
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 63,
+          title: 'Tokyo Ghoul:re',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Sui', last_name: 'Ishida' },
+              role: 'Story & Art',
             },
-          },
-          {
-            node: {
-              id: 115710,
-              title:
-                'Jujutsu Kaisen 0: Tokyo Toritsu Jujutsu Koutou Senmon Gakkou',
-              media_type: 'manga',
-              authors: [
-                {
-                  node: { first_name: 'Gege', last_name: 'Akutami' },
-                  role: 'Story & Art',
-                },
-              ],
+          ],
+        },
+        {
+          id: 115710,
+          title: 'Jujutsu Kaisen 0: Tokyo Toritsu Jujutsu Koutou Senmon Gakkou',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Gege', last_name: 'Akutami' },
+              role: 'Story & Art',
             },
-          },
-        ],
-        paging: {},
-      },
-    });
+          ],
+        },
+      ]),
+    );
 
     const res = await svc.searchByBarcode('9791032706688', {
       userId: USER,
@@ -650,21 +612,26 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       limit: 50,
     });
     expect(res.items).toHaveLength(0);
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 
   it('rejette un candidat sans match auteur ni type (anti faux-positif) → repli bnf_only', async () => {
     const { deps, svc } = makeDeps();
     deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 999,
-        title: 'Autre oeuvre',
-        media_type: 'light_novel',
-        authors: [
-          { node: { first_name: 'Ryo', last_name: 'Kawakami' }, role: 'Story' },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 999,
+          title: 'Autre oeuvre',
+          media_type: 'light_novel',
+          authors: [
+            {
+              node: { first_name: 'Ryo', last_name: 'Kawakami' },
+              role: 'Story',
+            },
+          ],
+        },
+      ]),
     );
     const res = await svc.searchByBarcode('9782811623258', {
       userId: USER,
@@ -692,18 +659,20 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
         authors: [{ surname: 'Takaki', full: 'Tsuyoshi Takaki' }],
       },
     });
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 113399,
-        title: 'Black Torch',
-        media_type: 'manga',
-        authors: [
-          {
-            node: { first_name: 'Tsuyoshi', last_name: 'Takaki' },
-            role: 'Story & Art',
-          },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 113399,
+          title: 'Black Torch',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Tsuyoshi', last_name: 'Takaki' },
+              role: 'Story & Art',
+            },
+          ],
+        },
+      ]),
     );
 
     const res = await svc.searchByBarcode('9791032701881', {
@@ -712,8 +681,8 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
 
     // MAL interrogé avec le titre FR (repli).
-    const [url] = deps.http.request.mock.calls[0];
-    expect(url).toContain('q=Black%20torch');
+    const jobData = deps.queue.add.mock.calls[0][1] as { url: string };
+    expect(jobData.url).toContain('q=Black%20torch');
 
     expect(res.items).toHaveLength(1);
     expect(res.items[0].sourceId).toBe('113399');
@@ -738,22 +707,27 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
     });
     // Premier résultat de bon type mais AUTRE auteur : accepté en pivot normal
     // (type+rang0), refusé en fallback FR (requireAuthor).
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 42,
-        title: 'Black Torch (homonyme)',
-        media_type: 'manga',
-        authors: [
-          { node: { first_name: 'Someone', last_name: 'Else' }, role: 'Story' },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 42,
+          title: 'Black Torch (homonyme)',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Someone', last_name: 'Else' },
+              role: 'Story',
+            },
+          ],
+        },
+      ]),
     );
 
     const res = await svc.searchByBarcode('9791032701881', {
       userId: USER,
       limit: 50,
     });
-    expect(deps.http.request).toHaveBeenCalled(); // MAL bien interrogé…
+    expect(deps.queue.add).toHaveBeenCalled(); // MAL bien interrogé…
     // …l'homonyme est écarté (pas de match auteur), mais on garde la notice BnF.
     expect(res.items).toHaveLength(1);
     expect(res.items[0].source).toBe('bnf');
@@ -778,7 +752,7 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       userId: USER,
       limit: 50,
     });
-    expect(deps.http.request).not.toHaveBeenCalled();
+    expect(deps.queue.add).not.toHaveBeenCalled();
     expect(res.items).toHaveLength(1);
     expect(res.items[0].source).toBe('bnf');
     expect(res.items[0].title).toBe("L'attaque des titans");
@@ -793,19 +767,21 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       ok: true,
       notice: { ...NOTICE, noteFr: 'Résumé en français depuis la BnF.' },
     });
-    deps.http.request.mockResolvedValue(
-      malManga({
-        id: 23390,
-        title: 'Shingeki no Kyojin',
-        media_type: 'manga',
-        synopsis: 'English synopsis from MAL.',
-        authors: [
-          {
-            node: { first_name: 'Hajime', last_name: 'Isayama' },
-            role: 'Story & Art',
-          },
-        ],
-      }),
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 23390,
+          title: 'Shingeki no Kyojin',
+          media_type: 'manga',
+          synopsis: 'English synopsis from MAL.',
+          authors: [
+            {
+              node: { first_name: 'Hajime', last_name: 'Isayama' },
+              role: 'Story & Art',
+            },
+          ],
+        },
+      ]),
     );
 
     const res = await svc.searchByBarcode('9782811623258', {
