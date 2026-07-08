@@ -1,22 +1,14 @@
-import { HttpException, ServiceUnavailableException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import {
+  BadGatewayException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
-import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import { TmdbAdapter } from './tmdb.adapter';
-
-function makeConfig(apiKey: string | null): ConfigService {
-  return {
-    get: jest.fn((k: string) =>
-      k === 'TMDB_API_KEY' ? (apiKey ?? undefined) : undefined,
-    ),
-  } as unknown as ConfigService;
-}
+import { TMDB_FETCH_JOB } from './tmdb.types';
 
 function makeDeps(apiKey: string | null = 'tmdb-key') {
-  const http = { request: jest.fn() };
   const cache = {
     getOrFetch: jest.fn(
       async (_k: string, _ttl: number, fetcher: () => Promise<unknown>) =>
@@ -26,64 +18,68 @@ function makeDeps(apiKey: string | null = 'tmdb-key') {
     set: jest.fn(),
     delete: jest.fn(),
   };
-  const bucket = { consume: jest.fn().mockResolvedValue(true) };
-  // Par défaut : repli premium (clé serveur TMDB_API_KEY) — les tests de clé perso
-  // ou de mode dégradé surchargent explicitement `resolve`.
+  // Par défaut : repli premium (clé serveur). Les tests BYOT / dégradé surchargent `resolve`.
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
+  const waitUntilFinished = jest.fn();
+  const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
+  const config = { get: jest.fn() };
   const svc = new TmdbAdapter(
-    makeConfig(apiKey),
-    http as unknown as HttpClientService,
+    config as never,
     cache as unknown as ApiCacheService,
-    bucket as unknown as TokenBucketService,
     tokenResolver as unknown as TokenResolverService,
+    queue as never,
   );
-  svc.onModuleInit();
-  return { http, cache, bucket, tokenResolver, svc };
+  // Court-circuite onModuleInit (qui ouvrirait une connexion Redis) : on pose les champs à la main.
+  (svc as unknown as { serverApiKey?: string }).serverApiKey =
+    apiKey ?? undefined;
+  (svc as unknown as { queueEvents: unknown }).queueEvents = {};
+  return { cache, tokenResolver, queue, waitUntilFinished, svc };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 
 describe('TmdbAdapter — config', () => {
-  it('throw ServiceUnavailable si TMDB_API_KEY absent', async () => {
-    const { svc } = makeDeps(null);
+  it('throw ServiceUnavailable si repli premium mais TMDB_API_KEY absent', async () => {
+    const { svc, queue } = makeDeps(null);
     await expect(
       svc.search('q', { userId: USER, limit: 10 }),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(queue.add).not.toHaveBeenCalled();
   });
 });
 
 describe('TmdbAdapter.search', () => {
-  it('appelle /search/movie avec api_key + query + page, mappe vers UnifiedItem', async () => {
-    const { http, bucket, svc } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        page: 1,
-        total_pages: 1,
-        results: [
-          {
-            id: 550,
-            title: 'Fight Club',
-            release_date: '1999-10-15',
-            overview: 'A ticking-time-bomb insomniac…',
-            poster_path: '/poster.jpg',
-            vote_average: 8.4,
-          },
-        ],
-      },
+  it('enfile un job (URL sans clé) et mappe la réponse du worker', async () => {
+    const { queue, waitUntilFinished, svc } = makeDeps();
+    waitUntilFinished.mockResolvedValue({
+      page: 1,
+      total_pages: 1,
+      results: [
+        {
+          id: 550,
+          title: 'Fight Club',
+          release_date: '1999-10-15',
+          overview: 'A ticking-time-bomb insomniac…',
+          poster_path: '/poster.jpg',
+          vote_average: 8.4,
+        },
+      ],
     });
 
     const res = await svc.search('fight club', { userId: USER, limit: 20 });
 
-    expect(bucket.consume).toHaveBeenCalledWith('tmdb:global', 200, 20);
-    const url = http.request.mock.calls[0][0];
-    expect(url).toContain('/search/movie');
-    expect(url).toContain('api_key=tmdb-key');
-    expect(url).toContain('query=fight%20club');
-    expect(url).toContain('page=1');
+    expect(queue.add).toHaveBeenCalledWith(
+      TMDB_FETCH_JOB,
+      { userId: USER, url: expect.stringContaining('/search/movie') },
+      // jobId = hash de la clé publique (sans ':' ni espaces, contrainte BullMQ).
+      expect.objectContaining({ jobId: expect.any(String) }),
+    );
+    const jobData = queue.add.mock.calls[0][1] as { url: string };
+    expect(jobData.url).toContain('query=fight%20club');
+    expect(jobData.url).toContain('page=1');
+    expect(jobData.url).not.toContain('api_key'); // clé injectée par le worker
 
     expect(res.items).toHaveLength(1);
     expect(res.items[0]).toMatchObject({
@@ -98,86 +94,50 @@ describe('TmdbAdapter.search', () => {
   });
 
   it('renvoie nextCursor=2 quand total_pages > page', async () => {
-    const { http, svc } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { page: 1, total_pages: 5, results: [] },
+    const { waitUntilFinished, svc } = makeDeps();
+    waitUntilFinished.mockResolvedValue({
+      page: 1,
+      total_pages: 5,
+      results: [],
     });
     const res = await svc.search('q', { userId: USER, limit: 20 });
     expect(res.nextCursor).toBe('2');
   });
 
-  it("bucket key 'tmdb:global' (pas user-scopé car pas d'OAuth user)", async () => {
-    const { bucket, svc, http } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { page: 1, total_pages: 1, results: [] },
-    });
-    await svc.search('x', { userId: USER, limit: 20 });
-    const otherUser = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
-    await svc.search('x', { userId: otherUser, limit: 20 });
-    // Le bucket par-requête est global (une conso par recherche, même clé pour les
-    // deux users) — indépendamment du bucket de repli acervatim:tmdb.
-    const globalCalls = bucket.consume.mock.calls.filter(
-      (c) => c[0] === 'tmdb:global',
-    );
-    expect(globalCalls).toHaveLength(2);
-  });
-
-  it('repli premium (fallback) : consomme le bucket partagé acervatim:tmdb', async () => {
-    const { bucket, http, svc } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { page: 1, total_pages: 1, results: [] },
-    });
-
-    await svc.search('q', { userId: USER, limit: 20 });
-
-    expect(bucket.consume).toHaveBeenCalledWith('acervatim:tmdb', 200, 20);
-  });
-
-  it('throw 429 si bucket plein', async () => {
-    const { bucket, svc } = makeDeps();
-    bucket.consume.mockResolvedValue(false);
-    const p = svc.search('x', { userId: USER, limit: 20 });
-    await expect(p).rejects.toBeInstanceOf(HttpException);
-    await p.catch((e) => expect(e.getStatus()).toBe(429));
-  });
-
-  it('clé perso user (BYOT) : interroge TMDB avec la clé de l’utilisateur', async () => {
-    const { http, tokenResolver, svc } = makeDeps();
+  it('clé perso user (BYOT) : enfile aussi un job (l’injection de clé se fait dans le worker)', async () => {
+    const { queue, waitUntilFinished, tokenResolver, svc } = makeDeps();
     tokenResolver.resolve.mockResolvedValue({
       source: 'user',
       credentials: { accessToken: 'user-tmdb-key', expiresAtMs: 0, scopes: [] },
     });
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { page: 1, total_pages: 1, results: [] },
+    waitUntilFinished.mockResolvedValue({
+      page: 1,
+      total_pages: 1,
+      results: [],
     });
 
     await svc.search('q', { userId: USER, limit: 20 });
 
-    const url = http.request.mock.calls[0][0];
-    expect(url).toContain('api_key=user-tmdb-key');
+    expect(queue.add).toHaveBeenCalledWith(
+      TMDB_FETCH_JOB,
+      { userId: USER, url: expect.not.stringContaining('api_key') },
+      expect.any(Object),
+    );
   });
 
-  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun appel sortant', async () => {
-    const { http, tokenResolver, cache, svc } = makeDeps();
+  it('mode dégradé (none) sans cache : SourceTokenRequired 403, aucun enqueue', async () => {
+    const { queue, tokenResolver, cache, svc } = makeDeps();
     tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     cache.get.mockResolvedValue(null);
 
     await expect(
       svc.search('q', { userId: USER, limit: 20 }),
     ).rejects.toBeInstanceOf(SourceTokenRequiredException);
-    expect(http.request).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
   });
 
-  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans appel', async () => {
-    const { http, tokenResolver, cache, svc } = makeDeps();
+  it('mode dégradé (none) avec hit de cache partagé : sert le cache sans enqueue', async () => {
+    const { queue, tokenResolver, cache, svc } = makeDeps();
     tokenResolver.resolve.mockResolvedValue({ source: 'none' });
     cache.get.mockResolvedValue({
       page: 1,
@@ -187,44 +147,47 @@ describe('TmdbAdapter.search', () => {
 
     const res = await svc.search('q', { userId: USER, limit: 20 });
 
-    expect(http.request).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
     expect(res.items[0].sourceId).toBe('12');
   });
 
   it("cache key EXCLUT l'apiKey (rotation ne nuke pas le cache)", async () => {
-    const { cache, http, svc } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: { page: 1, total_pages: 1, results: [] },
+    const { cache, waitUntilFinished, svc } = makeDeps();
+    waitUntilFinished.mockResolvedValue({
+      page: 1,
+      total_pages: 1,
+      results: [],
     });
     await svc.search('fight club', { userId: USER, limit: 20 });
     const cacheKey = cache.getOrFetch.mock.calls[0][0] as string;
-    expect(cacheKey).not.toContain('tmdb-key');
     expect(cacheKey).toBe('tmdb:search:fight club:1');
+  });
+
+  it('échec du worker (TMDB indispo) → BadGateway', async () => {
+    const { waitUntilFinished, svc } = makeDeps();
+    waitUntilFinished.mockRejectedValue(new Error('boom'));
+    await expect(
+      svc.search('q', { userId: USER, limit: 20 }),
+    ).rejects.toBeInstanceOf(BadGatewayException);
   });
 });
 
 describe('TmdbAdapter.fetchDetails', () => {
   it('extrait les directors depuis credits.crew et mappe runtime/genres', async () => {
-    const { http, svc } = makeDeps();
-    http.request.mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {
-        id: 550,
-        title: 'Fight Club',
-        release_date: '1999-10-15',
-        runtime: 139,
-        genres: [{ id: 18, name: 'Drama' }],
-        poster_path: '/p.jpg',
-        credits: {
-          crew: [
-            { name: 'David Fincher', job: 'Director' },
-            { name: 'Other Crew', job: 'Editor' },
-          ],
-          cast: [{ name: 'Brad Pitt' }, { name: 'Edward Norton' }],
-        },
+    const { queue, waitUntilFinished, svc } = makeDeps();
+    waitUntilFinished.mockResolvedValue({
+      id: 550,
+      title: 'Fight Club',
+      release_date: '1999-10-15',
+      runtime: 139,
+      genres: [{ id: 18, name: 'Drama' }],
+      poster_path: '/p.jpg',
+      credits: {
+        crew: [
+          { name: 'David Fincher', job: 'Director' },
+          { name: 'Other Crew', job: 'Editor' },
+        ],
+        cast: [{ name: 'Brad Pitt' }, { name: 'Edward Norton' }],
       },
     });
 
@@ -236,8 +199,9 @@ describe('TmdbAdapter.fetchDetails', () => {
       genres: ['Drama'],
       cast: ['Brad Pitt', 'Edward Norton'],
     });
-    const url = http.request.mock.calls[0][0];
-    expect(url).toContain('/movie/550');
-    expect(url).toContain('append_to_response=credits');
+    const jobData = queue.add.mock.calls[0][1] as { url: string };
+    expect(jobData.url).toContain('/movie/550');
+    expect(jobData.url).toContain('append_to_response=credits');
+    expect(jobData.url).not.toContain('api_key');
   });
 });

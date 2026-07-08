@@ -1,14 +1,16 @@
+import { InjectQueue } from '@nestjs/bullmq';
 import {
-  HttpException,
+  BadGatewayException,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Queue, QueueEvents } from 'bullmq';
+import { createHash } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
-import { HttpClientService } from '../../common/http/http-client.service';
-import { TokenBucketService } from '../../common/rate-limit/token-bucket.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import {
@@ -17,6 +19,7 @@ import {
   SourceAdapter,
   UnifiedItem,
 } from './types';
+import { TMDB_FETCH_JOB, TMDB_QUEUE, TmdbFetchJobData } from './tmdb.types';
 
 const TMDB_API_BASE = 'https://api.themoviedb.org/3';
 const TMDB_IMG_BASE = 'https://image.tmdb.org/t/p/w500';
@@ -24,16 +27,8 @@ const TMDB_IMG_BASE = 'https://image.tmdb.org/t/p/w500';
 const SEARCH_CACHE_TTL_SECONDS = 3600;
 const DETAILS_CACHE_TTL_SECONDS = 86_400;
 
-// TMDB autorise ~50 req/s par IP. On garde un bucket global modeste
-// (clé partagée car pas d'OAuth user — c'est l'IP du backend qui est limitée).
-const RATE_LIMIT_CAPACITY = 200;
-const RATE_LIMIT_REFILL_PER_SEC = 20;
-
-// Bucket PARTAGÉ entre tous les premiums servis en repli (TMDB_API_KEY Acervatim) :
-// plafonne le débit sortant total sur la clé serveur, distinct du bucket global
-// (qui couvre aussi les clés perso). À calibrer sur la limite du compte Acervatim.
-const ACERVATIM_RATE_LIMIT_CAPACITY = 200;
-const ACERVATIM_RATE_LIMIT_REFILL_PER_SEC = 20;
+// Plafond d'attente d'un appel TMDB via la file (best-effort → BadGateway au-delà).
+const TMDB_WAIT_MS = 15_000;
 
 interface TmdbSearchResponse {
   page?: number;
@@ -63,39 +58,54 @@ interface TmdbMovieDetails extends TmdbMovieResult {
 }
 
 @Injectable()
-export class TmdbAdapter implements SourceAdapter, OnModuleInit {
+export class TmdbAdapter
+  implements SourceAdapter, OnModuleInit, OnModuleDestroy
+{
   readonly source = 'tmdb' as const;
   readonly mediaType = 'movie' as const;
 
   private readonly logger = new Logger(TmdbAdapter.name);
-  private apiKey?: string;
+  private serverApiKey?: string;
+  private queueEvents!: QueueEvents;
 
   constructor(
     private readonly config: ConfigService,
-    private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
-    private readonly bucket: TokenBucketService,
     private readonly tokenResolver: TokenResolverService,
+    @InjectQueue(TMDB_QUEUE)
+    private readonly queue: Queue<TmdbFetchJobData, unknown>,
   ) {}
 
   onModuleInit() {
-    this.apiKey = this.config.get<string>('TMDB_API_KEY');
+    // La clé serveur reste connue de l'adapter uniquement pour le fast-fail typé (repli premium
+    // sans clé configurée). L'appel réel et l'injection de clé se font dans TmdbProcessor.
+    this.serverApiKey = this.config.get<string>('TMDB_API_KEY');
+    this.queueEvents = new QueueEvents(TMDB_QUEUE, {
+      connection: {
+        host: this.config.get<string>('REDIS_HOST', 'localhost'),
+        port: this.config.get<number>('REDIS_PORT', 6379),
+      },
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.queueEvents?.close();
   }
 
   async search(
     query: string,
     ctx: AdapterContext,
   ): Promise<AdapterSearchResult> {
-    await this.consumeRate();
     const page = parsePage(ctx.cursor);
     // TMDB ignore `limit` côté API (20/page imposé). On respecte donc 20 et on documente.
     // Le cacheKey EXCLUT l'apiKey — sinon une rotation invaliderait tout le cache. Et il est
     // partagé entre users (données TMDB publiques : clé user ou serveur, même réponse).
     const cacheKey = `tmdb:search:${query}:${page}`;
+    // URL SANS clé (injectée par le worker).
+    const url = `${TMDB_API_BASE}/search/movie?query=${encodeURIComponent(query)}&page=${page}`;
 
     const raw = await this.tmdbResolvedGet<TmdbSearchResponse>(
-      (apiKey) =>
-        `${TMDB_API_BASE}/search/movie?api_key=${apiKey}&query=${encodeURIComponent(query)}&page=${page}`,
+      url,
       cacheKey,
       SEARCH_CACHE_TTL_SECONDS,
       ctx.userId,
@@ -113,12 +123,11 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
   }
 
   async fetchDetails(id: string, ctx: AdapterContext): Promise<UnifiedItem> {
-    await this.consumeRate();
     const cacheKey = `tmdb:movie:${id}`;
+    const url = `${TMDB_API_BASE}/movie/${encodeURIComponent(id)}?append_to_response=credits`;
 
     const raw = await this.tmdbResolvedGet<TmdbMovieDetails>(
-      (apiKey) =>
-        `${TMDB_API_BASE}/movie/${encodeURIComponent(id)}?api_key=${apiKey}&append_to_response=credits`,
+      url,
       cacheKey,
       DETAILS_CACHE_TTL_SECONDS,
       ctx.userId,
@@ -128,16 +137,15 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
   }
 
   /**
-   * GET TMDB avec résolution de la clé API (cf. `TokenResolverService`) et mode dégradé.
-   *  - clé perso user présente → clé API personnelle (BYOT, saisie via
-   *    `PUT /v1/sources/tmdb/token`, stockée chiffrée dans `oauth_credentials`) ;
-   *  - premium sans clé perso → repli `TMDB_API_KEY` serveur (Acervatim) ;
-   *  - sinon (dégradé Q-c) → cache-only, aucun appel sortant ; à défaut de hit,
-   *    `SourceTokenRequiredException` (403 actionnable : saisir sa clé ou premium).
-   * La clé n'apparaît jamais dans le cacheKey (partagé, insensible à la rotation).
+   * GET TMDB via la file `tmdb` (throttle sortant global + single-flight sur la clé de cache), avec
+   * résolution de la clé API **dans le worker** (cf. `TmdbProcessor`) et mode dégradé côté producteur.
+   *  - clé perso user présente → clé perso (worker) ;
+   *  - premium sans clé perso → repli `TMDB_API_KEY` serveur (worker) ;
+   *  - sinon (dégradé) → cache-only, aucun enqueue ; à défaut de hit, `SourceTokenRequiredException`.
+   * La clé n'apparaît ni dans le cacheKey ni dans le payload du job (jamais en clair dans Redis).
    */
   private async tmdbResolvedGet<T>(
-    buildUrl: (apiKey: string) => string,
+    url: string,
     cacheKey: string,
     ttlSeconds: number,
     userId: string,
@@ -150,19 +158,34 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
       throw new SourceTokenRequiredException('tmdb');
     }
 
-    const apiKey =
-      resolution.source === 'user'
-        ? resolution.credentials.accessToken
-        : this.requireApiKey();
+    // Fast-fail typé : repli premium demandé mais clé serveur absente. Évite d'enfiler un job
+    // voué à échouer et préserve le 503 « not configured » attendu.
+    if (resolution.source === 'fallback' && !this.serverApiKey) {
+      this.logger.error('TMDB_API_KEY not configured');
+      throw new ServiceUnavailableException('tmdb: not configured');
+    }
 
     return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
-      // Repli premium : consomme le bucket partagé Acervatim (sur cache-miss
-      // uniquement — un hit ne tape pas la clé serveur Acervatim).
-      if (resolution.source === 'fallback') {
-        await this.consumeAcervatimRate();
+      try {
+        const job = await this.queue.add(
+          TMDB_FETCH_JOB,
+          { userId, url },
+          {
+            // Single-flight sur la clé publique. Hashée car BullMQ interdit certains caractères
+            // (espaces, ':') dans un jobId, et la requête peut en contenir.
+            jobId: createHash('sha1').update(cacheKey).digest('hex'),
+            removeOnComplete: { age: 60, count: 500 },
+            removeOnFail: true,
+          },
+        );
+        return (await job.waitUntilFinished(
+          this.queueEvents,
+          TMDB_WAIT_MS,
+        )) as T;
+      } catch {
+        // Échec worker (TMDB indispo) / Redis / timeout → 502 (pas de mise en cache).
+        throw new BadGatewayException('tmdb: upstream unavailable');
       }
-      const res = await this.http.request<T>(buildUrl(apiKey));
-      return res.data;
     });
   }
 
@@ -204,40 +227,6 @@ export class TmdbAdapter implements SourceAdapter, OnModuleInit {
         cast: r.credits?.cast?.slice(0, 10).map((c) => c.name),
       },
     };
-  }
-
-  private async consumeRate(): Promise<void> {
-    const ok = await this.bucket.consume(
-      'tmdb:global',
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException('tmdb: rate limit exceeded', 429);
-    }
-  }
-
-  /** Bucket partagé des replis Acervatim (clé serveur, tous premiums confondus). */
-  private async consumeAcervatimRate(): Promise<void> {
-    const ok = await this.bucket.consume(
-      `acervatim:${this.source}`,
-      ACERVATIM_RATE_LIMIT_CAPACITY,
-      ACERVATIM_RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!ok) {
-      throw new HttpException(
-        'tmdb: repli Acervatim rate limited (capacité partagée épuisée)',
-        429,
-      );
-    }
-  }
-
-  private requireApiKey(): string {
-    if (!this.apiKey) {
-      this.logger.error('TMDB_API_KEY not configured');
-      throw new ServiceUnavailableException('tmdb: not configured');
-    }
-    return this.apiKey;
   }
 }
 

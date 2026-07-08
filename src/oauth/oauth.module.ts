@@ -1,3 +1,4 @@
+import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { OAUTH_FLOW_PROVIDERS, OAuthFlowRegistry } from './oauth-flow.registry';
@@ -6,10 +7,15 @@ import { OauthCredentialsService } from './oauth.service';
 import { DiscogsAdapter } from './providers/discogs.adapter';
 import { MalAdapter } from './providers/mal.adapter';
 import { TmdbAdapter } from './providers/tmdb.adapter';
+import { TmdbProcessor } from './providers/tmdb.processor';
+import { TMDB_QUEUE } from './providers/tmdb.types';
 import { TokenResolverService } from './token-resolver.service';
 
 @Module({
-  imports: [AuthModule], // pour JwtAuthGuard
+  imports: [
+    AuthModule, // pour JwtAuthGuard
+    BullModule.registerQueue({ name: TMDB_QUEUE }),
+  ],
   controllers: [OauthController],
   providers: [
     OauthCredentialsService,
@@ -17,6 +23,7 @@ import { TokenResolverService } from './token-resolver.service';
     DiscogsAdapter,
     MalAdapter,
     TmdbAdapter,
+    TmdbProcessor,
     OAuthFlowRegistry,
     {
       provide: OAUTH_FLOW_PROVIDERS,
