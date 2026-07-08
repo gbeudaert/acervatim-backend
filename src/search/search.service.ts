@@ -103,8 +103,11 @@ export class SearchService {
   async editionMapping(
     titleFr: string,
     edition?: string,
+    onProgress?: (done: number, total: number) => void,
   ): Promise<EditionMappingResponse> {
     const mapping = await this.bnf.enumerateEdition(titleFr, edition ?? null);
+    const total = mapping.tomes.length;
+    let done = 0;
     const tomes = await mapWithConcurrency(
       mapping.tomes,
       COVER_RESOLUTION_CONCURRENCY,
@@ -116,6 +119,10 @@ export class SearchService {
               edition: mapping.edition,
             })
           : { coverUrl: null, description: null };
+        // Avancement : incrément après chaque tome résolu (JS mono-thread → `done++`
+        // entre deux `await` est sûr malgré la concurrence bornée). Sert au job d'import.
+        done++;
+        onProgress?.(done, total);
         return {
           ...tome,
           coverUrl: resolved.coverUrl,
