@@ -5,6 +5,7 @@ import { Test } from '@nestjs/testing';
 import { Queue } from 'bullmq';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { TokenResolverService } from '../token-resolver.service';
 import { TmdbAdapter } from './tmdb.adapter';
 import { TmdbProcessor } from './tmdb.processor';
@@ -71,6 +72,7 @@ describe('Tmdb queue (e2e, Redis réel)', () => {
         { provide: ApiCacheService, useValue: new InMemoryCache() },
         { provide: HttpClientService, useValue: http },
         { provide: TokenResolverService, useValue: tokenResolver },
+        { provide: RedisHealthService, useValue: { isAvailable: () => true } },
       ],
     }).compile();
 

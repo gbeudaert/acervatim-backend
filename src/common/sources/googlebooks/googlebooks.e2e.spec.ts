@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { Queue } from 'bullmq';
 import { ApiCacheService } from '../../cache/api-cache.service';
+import { RedisHealthService } from '../../redis/redis-health.service';
 import { GoogleBooksCoverService } from './googlebooks.service';
 import { GoogleBooksProcessor } from './googlebooks.processor';
 import { GoogleBooksResolver } from './googlebooks.resolver';
@@ -61,6 +62,7 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
         GoogleBooksProcessor,
         { provide: GoogleBooksResolver, useValue: { fetchCover: jest.fn() } },
         { provide: ApiCacheService, useValue: cache },
+        { provide: RedisHealthService, useValue: { isAvailable: () => true } },
       ],
     }).compile();
 

@@ -10,6 +10,8 @@ function makeService() {
     }),
   };
   const config = { get: jest.fn((_k: string, d: unknown) => d) };
+  // Par défaut : Redis disponible — le test de circuit-breaker force `false`.
+  const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
   const queue = {
     add: jest.fn().mockResolvedValue({ waitUntilFinished }),
@@ -18,11 +20,12 @@ function makeService() {
     queue as never,
     config as never,
     cache as never,
+    redisHealth as never,
   );
   // Court-circuite onModuleInit() (qui ouvrirait une vraie connexion Redis) : la valeur exacte
   // de queueEvents est indifférente ici, waitUntilFinished est mocké sur le job.
   (svc as unknown as { queueEvents: unknown }).queueEvents = {};
-  return { svc, cache, config, queue, waitUntilFinished, store };
+  return { svc, cache, config, redisHealth, queue, waitUntilFinished, store };
 }
 
 describe('GoogleBooksCoverService (producteur)', () => {
@@ -94,6 +97,16 @@ describe('GoogleBooksCoverService (producteur)', () => {
         coverUrl: null,
         description: null,
       });
+    });
+
+    it('circuit-breaker : Redis indisponible → null immédiat, aucun enqueue', async () => {
+      const { svc, queue, redisHealth } = makeService();
+      redisHealth.isAvailable.mockReturnValue(false);
+      expect(await svc.resolveCoverAndDescription('9782505011943')).toEqual({
+        coverUrl: null,
+        description: null,
+      });
+      expect(queue.add).not.toHaveBeenCalled();
     });
   });
 

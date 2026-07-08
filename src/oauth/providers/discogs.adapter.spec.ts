@@ -24,6 +24,7 @@ interface MockDeps {
     listConnected: jest.Mock;
   };
   tokenResolver: { resolve: jest.Mock };
+  redisHealth: { isAvailable: jest.Mock };
   queue: { add: jest.Mock };
   waitUntilFinished: jest.Mock;
 }
@@ -62,6 +63,8 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
+  // Par défaut : Redis disponible — le test de circuit-breaker force `false`.
+  const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
   const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
 
@@ -71,6 +74,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     cache as unknown as ApiCacheService,
     creds as unknown as OauthCredentialsService,
     tokenResolver as unknown as TokenResolverService,
+    redisHealth as never,
     queue as never,
   );
   // Court-circuite onModuleInit (qui ouvrirait une connexion Redis via QueueEvents) : on pose les
@@ -95,6 +99,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
       cache,
       creds,
       tokenResolver,
+      redisHealth,
       queue,
       waitUntilFinished,
     },
@@ -341,6 +346,16 @@ describe('DiscogsAdapter.search', () => {
       DISCOGS_ACERVATIM_TOKEN: undefined,
     });
     deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+
+    await expect(
+      svc.search('x', { userId: USER, limit: 10 }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(deps.queue.add).not.toHaveBeenCalled();
+  });
+
+  it('circuit-breaker : Redis indisponible → 503 immédiat, aucun enqueue', async () => {
+    const { deps, svc } = makeDeps();
+    deps.redisHealth.isAvailable.mockReturnValue(false);
 
     await expect(
       svc.search('x', { userId: USER, limit: 10 }),

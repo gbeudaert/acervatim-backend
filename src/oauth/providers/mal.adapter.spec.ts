@@ -32,6 +32,7 @@ interface MockDeps {
   bnf: { resolveByIsbn: jest.Mock };
   tokenResolver: { resolve: jest.Mock };
   googleBooks: { resolveCover: jest.Mock; cachedCover: jest.Mock };
+  redisHealth: { isAvailable: jest.Mock };
   queue: { add: jest.Mock };
   waitUntilFinished: jest.Mock;
 }
@@ -77,6 +78,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     resolveCover: jest.fn().mockResolvedValue(null),
     cachedCover: jest.fn().mockResolvedValue(null),
   };
+  const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
   const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
 
@@ -88,6 +90,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     bnf as unknown as BnfService,
     tokenResolver as unknown as TokenResolverService,
     googleBooks as unknown as GoogleBooksCoverService,
+    redisHealth as never,
     queue as never,
   );
   // Court-circuite onModuleInit (qui ouvrirait une connexion Redis via QueueEvents) : on pose
@@ -112,6 +115,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
       bnf,
       tokenResolver,
       googleBooks,
+      redisHealth,
       queue,
       waitUntilFinished,
     },

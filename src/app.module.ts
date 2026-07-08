@@ -21,6 +21,7 @@ import { HttpModule } from './common/http/http.module';
 import { BnfModule } from './common/sources/bnf/bnf.module';
 import { GoogleBooksModule } from './common/sources/googlebooks/googlebooks.module';
 import { QuotaModule } from './common/quota/quota.module';
+import { RedisHealthModule } from './common/redis/redis-health.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
 import { ItemsModule } from './items/items.module';
@@ -67,6 +68,7 @@ import { UsersModule } from './users/users.module';
     PrismaModule,
     HttpModule,
     ApiCacheModule,
+    RedisHealthModule,
     BnfModule,
     GoogleBooksModule,
     QuotaModule,

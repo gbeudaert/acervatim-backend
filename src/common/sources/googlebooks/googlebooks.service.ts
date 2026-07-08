@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Queue, QueueEvents } from 'bullmq';
 import { ApiCacheService } from '../../cache/api-cache.service';
+import { RedisHealthService } from '../../redis/redis-health.service';
 import {
   CachedCover,
   CoverHint,
@@ -45,6 +46,7 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
     private readonly queue: Queue<CoverJobData, CoverResult>,
     private readonly config: ConfigService,
     private readonly cache: ApiCacheService,
+    private readonly redisHealth: RedisHealthService,
   ) {}
 
   onModuleInit(): void {
@@ -95,6 +97,12 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
     const cached = await this.cache.get<CachedCover>(key);
     if (cached) {
       return { coverUrl: cached.url, description: cached.description ?? null };
+    }
+
+    // Circuit-breaker : Redis down → best-effort `null` tout de suite. Sans ça, l'énumération d'une
+    // édition (jusqu'à ~30 tomes) attendrait 15 s par tome avant de dégrader (cf. RedisHealthService).
+    if (!this.redisHealth.isAvailable()) {
+      return EMPTY;
     }
 
     try {

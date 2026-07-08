@@ -7,6 +7,7 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { TokenResolverService } from '../token-resolver.service';
 import { MalAdapter } from './mal.adapter';
@@ -75,6 +76,7 @@ describe('Mal queue (e2e, Redis réel)', () => {
         { provide: ApiCacheService, useValue: new InMemoryCache() },
         { provide: HttpClientService, useValue: http },
         { provide: TokenResolverService, useValue: tokenResolver },
+        { provide: RedisHealthService, useValue: { isAvailable: () => true } },
         // Dépendances de MalAdapter non exercées par `search()` (pivot ISBN / OAuth) : stubs.
         { provide: OauthCredentialsService, useValue: {} },
         { provide: BnfService, useValue: {} },

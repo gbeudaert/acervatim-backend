@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { Queue, QueueEvents } from 'bullmq';
 import { createHash } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
 import {
@@ -72,6 +73,7 @@ export class TmdbAdapter
     private readonly config: ConfigService,
     private readonly cache: ApiCacheService,
     private readonly tokenResolver: TokenResolverService,
+    private readonly redisHealth: RedisHealthService,
     @InjectQueue(TMDB_QUEUE)
     private readonly queue: Queue<TmdbFetchJobData, unknown>,
   ) {}
@@ -166,6 +168,13 @@ export class TmdbAdapter
     }
 
     return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, async () => {
+      // Circuit-breaker : Redis down → 503 immédiat plutôt que d'attendre ~15 s
+      // (`waitUntilFinished`) sur le chemin interactif (cf. RedisHealthService).
+      if (!this.redisHealth.isAvailable()) {
+        throw new ServiceUnavailableException(
+          'tmdb: file indisponible (Redis)',
+        );
+      }
       try {
         const job = await this.queue.add(
           TMDB_FETCH_JOB,

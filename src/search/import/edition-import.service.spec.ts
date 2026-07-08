@@ -1,3 +1,4 @@
+import { ServiceUnavailableException } from '@nestjs/common';
 import { EditionImportService } from './edition-import.service';
 import { EDITION_IMPORT_JOB, editionImportJobId } from './edition-import.types';
 
@@ -6,8 +7,9 @@ function make() {
     getJob: jest.fn(),
     add: jest.fn().mockResolvedValue(undefined),
   };
-  const svc = new EditionImportService(queue as never);
-  return { svc, queue };
+  const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
+  const svc = new EditionImportService(queue as never, redisHealth as never);
+  return { svc, queue, redisHealth };
 }
 
 const TITLE = "L'attaque des titans";
@@ -71,6 +73,17 @@ describe('EditionImportService', () => {
       expect(remove).toHaveBeenCalled();
       expect(queue.add).toHaveBeenCalled();
       expect(res.state).toBe('queued');
+    });
+
+    it('circuit-breaker : Redis indisponible → 503, aucun accès à la file', async () => {
+      const { svc, queue, redisHealth } = make();
+      redisHealth.isAvailable.mockReturnValue(false);
+
+      await expect(svc.enqueue(TITLE, EDITION)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(queue.getJob).not.toHaveBeenCalled();
+      expect(queue.add).not.toHaveBeenCalled();
     });
   });
 

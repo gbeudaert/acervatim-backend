@@ -22,6 +22,7 @@ function makeDeps(apiKey: string | null = 'tmdb-key') {
   const tokenResolver = {
     resolve: jest.fn().mockResolvedValue({ source: 'fallback' }),
   };
+  const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
   const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
   const config = { get: jest.fn() };
@@ -29,13 +30,14 @@ function makeDeps(apiKey: string | null = 'tmdb-key') {
     config as never,
     cache as unknown as ApiCacheService,
     tokenResolver as unknown as TokenResolverService,
+    redisHealth as never,
     queue as never,
   );
   // Court-circuite onModuleInit (qui ouvrirait une connexion Redis) : on pose les champs à la main.
   (svc as unknown as { serverApiKey?: string }).serverApiKey =
     apiKey ?? undefined;
   (svc as unknown as { queueEvents: unknown }).queueEvents = {};
-  return { cache, tokenResolver, queue, waitUntilFinished, svc };
+  return { cache, tokenResolver, redisHealth, queue, waitUntilFinished, svc };
 }
 
 const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -169,6 +171,15 @@ describe('TmdbAdapter.search', () => {
     await expect(
       svc.search('q', { userId: USER, limit: 20 }),
     ).rejects.toBeInstanceOf(BadGatewayException);
+  });
+
+  it('circuit-breaker : Redis indisponible → 503 immédiat, aucun enqueue', async () => {
+    const { queue, redisHealth, svc } = makeDeps();
+    redisHealth.isAvailable.mockReturnValue(false);
+    await expect(
+      svc.search('q', { userId: USER, limit: 20 }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(queue.add).not.toHaveBeenCalled();
   });
 });
 

@@ -16,6 +16,7 @@ import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { BnfAuthor, BnfNotice } from '../../common/sources/bnf/bnf.types';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
@@ -127,6 +128,7 @@ export class MalAdapter
     private readonly bnf: BnfService,
     private readonly tokenResolver: TokenResolverService,
     private readonly googleBooks: GoogleBooksCoverService,
+    private readonly redisHealth: RedisHealthService,
     @InjectQueue(MAL_QUEUE)
     private readonly queue: Queue<MalFetchJobData, unknown>,
   ) {}
@@ -453,6 +455,11 @@ export class MalAdapter
     cacheKey: string,
     userId: string,
   ): Promise<T> {
+    // Circuit-breaker : Redis down → 503 immédiat plutôt que d'attendre ~15 s
+    // (`waitUntilFinished`) sur le chemin interactif (cf. RedisHealthService).
+    if (!this.redisHealth.isAvailable()) {
+      throw new ServiceUnavailableException('mal: file indisponible (Redis)');
+    }
     try {
       const job = await this.queue.add(
         MAL_FETCH_JOB,

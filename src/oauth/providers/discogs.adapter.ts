@@ -13,6 +13,7 @@ import { Queue, QueueEvents } from 'bullmq';
 import { createHash } from 'crypto';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
@@ -118,6 +119,7 @@ export class DiscogsAdapter
     private readonly cache: ApiCacheService,
     private readonly creds: OauthCredentialsService,
     private readonly tokenResolver: TokenResolverService,
+    private readonly redisHealth: RedisHealthService,
     @InjectQueue(DISCOGS_QUEUE)
     private readonly queue: Queue<DiscogsFetchJobData, unknown>,
   ) {}
@@ -355,6 +357,13 @@ export class DiscogsAdapter
     cacheKey: string,
     userId: string,
   ): Promise<T> {
+    // Circuit-breaker : Redis down → 503 immédiat plutôt que d'attendre le timeout de
+    // `waitUntilFinished` (~15 s) sur le chemin interactif (cf. RedisHealthService).
+    if (!this.redisHealth.isAvailable()) {
+      throw new ServiceUnavailableException(
+        'discogs: file indisponible (Redis)',
+      );
+    }
     try {
       const job = await this.queue.add(
         DISCOGS_FETCH_JOB,

@@ -5,6 +5,7 @@ import { Test } from '@nestjs/testing';
 import { Queue } from 'bullmq';
 import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { TokenResolverService } from '../token-resolver.service';
 import { DiscogsAdapter } from './discogs.adapter';
@@ -80,6 +81,8 @@ describe('Discogs queue (e2e, Redis réel)', () => {
         { provide: ApiCacheService, useValue: new InMemoryCache() },
         { provide: HttpClientService, useValue: http },
         { provide: TokenResolverService, useValue: tokenResolver },
+        // Redis est réellement up dans cet e2e → le circuit-breaker laisse passer.
+        { provide: RedisHealthService, useValue: { isAvailable: () => true } },
         // Dépendance de DiscogsAdapter non exercée par search() (flux OAuth) : stub.
         { provide: OauthCredentialsService, useValue: {} },
       ],

@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { Queue } from 'bullmq';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { SearchService } from '../search.service';
 import { EditionImportService } from './edition-import.service';
 import { EditionImportProcessor } from './edition-import.processor';
@@ -61,6 +62,7 @@ describe('EditionImport (e2e, Redis réel)', () => {
         EditionImportService,
         EditionImportProcessor,
         { provide: SearchService, useValue: { editionMapping: jest.fn() } },
+        { provide: RedisHealthService, useValue: { isAvailable: () => true } },
       ],
     }).compile();
 

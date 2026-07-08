@@ -1,6 +1,7 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable } from '@nestjs/common';
+import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { Queue } from 'bullmq';
+import { RedisHealthService } from '../../common/redis/redis-health.service';
 import {
   ApiJobState,
   EDITION_IMPORT_JOB,
@@ -23,6 +24,7 @@ export class EditionImportService {
   constructor(
     @InjectQueue(EDITION_IMPORT_QUEUE)
     private readonly queue: Queue<EditionImportJobData, EditionImportResult>,
+    private readonly redisHealth: RedisHealthService,
   ) {}
 
   /**
@@ -34,6 +36,13 @@ export class EditionImportService {
     title: string,
     edition?: string,
   ): Promise<{ jobId: string; state: ApiJobState }> {
+    // Circuit-breaker : Redis down → 503 immédiat (l'app retombe sur son import local). Évite
+    // d'attendre l'erreur de connexion BullMQ (cf. RedisHealthService).
+    if (!this.redisHealth.isAvailable()) {
+      throw new ServiceUnavailableException(
+        'import: file indisponible (Redis)',
+      );
+    }
     const jobId = editionImportJobId(title, edition ?? null);
 
     const existing = await this.queue.getJob(jobId);
@@ -62,6 +71,11 @@ export class EditionImportService {
 
   /** Statut d'un job pour le polling ; `null` si l'id est inconnu (job jamais créé ou purgé). */
   async status(jobId: string): Promise<EditionImportStatus | null> {
+    if (!this.redisHealth.isAvailable()) {
+      throw new ServiceUnavailableException(
+        'import: file indisponible (Redis)',
+      );
+    }
     const job = await this.queue.getJob(jobId);
     if (!job) return null;
     const state = await job.getState();
