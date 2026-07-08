@@ -28,28 +28,23 @@ const COLOSSALE_XML = `<srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov
   </srw:recordData></srw:record></srw:records>
 </srw:searchRetrieveResponse>`;
 
-function makeService(xml: string | (() => Promise<unknown>)) {
-  const http = {
-    request: jest
-      .fn()
-      .mockResolvedValue({ status: 200, headers: {}, data: xml }),
-  };
+function makeService(xml: string) {
   const cache = {
     // getOrFetch exécute simplement le fetcher (pas de cache en test).
     getOrFetch: jest.fn(
       (_k: string, _ttl: number, fetcher: () => Promise<unknown>) => fetcher(),
     ),
   };
-  const bucket = { consume: jest.fn().mockResolvedValue(true) };
+  // La file renvoie le XML via un job dont waitUntilFinished résout la valeur du worker.
+  const queue = {
+    add: jest.fn().mockResolvedValue({ waitUntilFinished: async () => xml }),
+  };
   const config = { get: jest.fn().mockReturnValue(undefined) };
-  const svc = new BnfService(
-    config as never,
-    http as never,
-    cache as never,
-    bucket as never,
-  );
-  svc.onModuleInit();
-  return { svc, http, bucket };
+  const svc = new BnfService(config as never, cache as never, queue as never);
+  // Court-circuite onModuleInit() (qui ouvrirait une vraie connexion Redis) : baseUrl garde son
+  // défaut, la valeur de queueEvents est indifférente (waitUntilFinished est mocké sur le job).
+  (svc as unknown as { queueEvents: unknown }).queueEvents = {};
+  return { svc, queue };
 }
 
 describe('BnfService', () => {
@@ -80,11 +75,11 @@ describe('BnfService', () => {
     expect(res).toEqual({ ok: false, reason: 'bnf_not_found' });
   });
 
-  it('renvoie bnf_rate_limited quand le bucket refuse', async () => {
-    const { svc, bucket } = makeService(COLOSSALE_XML);
-    bucket.consume.mockResolvedValueOnce(false);
+  it('renvoie bnf_unavailable quand le fetch via la file échoue (Redis down / worker)', async () => {
+    const { svc, queue } = makeService(COLOSSALE_XML);
+    queue.add.mockRejectedValueOnce(new Error('redis down'));
     const res = await svc.resolveByIsbn('9782811623258');
-    expect(res).toEqual({ ok: false, reason: 'bnf_rate_limited' });
+    expect(res).toEqual({ ok: false, reason: 'bnf_unavailable' });
   });
 
   it('détecte une série en cours sur date ouverte (210$d "2015-")', async () => {

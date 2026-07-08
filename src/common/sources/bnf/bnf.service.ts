@@ -1,10 +1,21 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { ApiCacheService } from '../../cache/api-cache.service';
-import { HttpClientService } from '../../http/http-client.service';
-import { TokenBucketService } from '../../rate-limit/token-bucket.service';
+import { InjectQueue } from '@nestjs/bullmq';
 import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Queue, QueueEvents } from 'bullmq';
+import { createHash } from 'crypto';
+import { ApiCacheService } from '../../cache/api-cache.service';
+import {
+  BNF_FETCH_JOB,
+  BNF_PRIORITY_BACKGROUND,
+  BNF_PRIORITY_INTERACTIVE,
+  BNF_QUEUE,
   BnfAuthor,
+  BnfFetchJobData,
   BnfNotice,
   BnfResolution,
   EditionMapping,
@@ -27,10 +38,9 @@ const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des
 const EDITION_PAGE_SIZE = 100; // par requête SRU.
 const EDITION_MAX_RECORDS = 400; // plafond cumulé sur toutes les pages (garde-fou BnF).
 
-// Throttle global poli (BnF ne publie pas de quota strict, mais c'est un service public).
-const RATE_LIMIT_BUCKET = 'bnf:global';
-const RATE_LIMIT_CAPACITY = 20;
-const RATE_LIMIT_REFILL_PER_SEC = 5;
+// Plafond d'attente d'un fetch SRU (via la file `bnf`) avant d'abandonner (best-effort). Le SRU
+// peut être lent ; on laisse de la marge, l'appelant gère l'échec (bnf_unavailable).
+const BNF_WAIT_MS = 20_000;
 
 /**
  * Client BnF SRU + extraction UNIMARC → `BnfNotice`.
@@ -40,20 +50,52 @@ const RATE_LIMIT_REFILL_PER_SEC = 5;
  * séries détectées « en cours » (données de comptage partielles).
  */
 @Injectable()
-export class BnfService implements OnModuleInit {
+export class BnfService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(BnfService.name);
   private baseUrl = DEFAULT_BASE_URL;
+  private queueEvents!: QueueEvents;
 
   constructor(
     private readonly config: ConfigService,
-    private readonly http: HttpClientService,
     private readonly cache: ApiCacheService,
-    private readonly bucket: TokenBucketService,
+    @InjectQueue(BNF_QUEUE)
+    private readonly queue: Queue<BnfFetchJobData, string>,
   ) {}
 
   onModuleInit() {
     this.baseUrl =
       this.config.get<string>('BNF_SRU_BASE_URL') ?? DEFAULT_BASE_URL;
+    this.queueEvents = new QueueEvents(BNF_QUEUE, {
+      connection: {
+        host: this.config.get<string>('REDIS_HOST', 'localhost'),
+        port: this.config.get<number>('REDIS_PORT', 6379),
+      },
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.queueEvents?.close();
+  }
+
+  /**
+   * Fetch d'une URL SRU **via la file `bnf`** (throttle sortant global + single-flight par URL).
+   * `priority` : {@link BNF_PRIORITY_INTERACTIVE} pour un scan, {@link BNF_PRIORITY_BACKGROUND} pour
+   * l'énumération. Jette si le worker échoue / Redis indisponible / timeout — l'appelant traduit en
+   * `bnf_unavailable` (best-effort).
+   */
+  private async fetchSru(url: string, priority: number): Promise<string> {
+    const jobId = `bnf:sru:${createHash('sha1').update(url).digest('hex')}`;
+    const job = await this.queue.add(
+      BNF_FETCH_JOB,
+      { url },
+      {
+        jobId,
+        priority,
+        removeOnComplete: { age: 60, count: 500 },
+        removeOnFail: true,
+      },
+    );
+    return job.waitUntilFinished(this.queueEvents, BNF_WAIT_MS);
   }
 
   /**
@@ -62,16 +104,6 @@ export class BnfService implements OnModuleInit {
    */
   async resolveByIsbn(isbn: string): Promise<BnfResolution> {
     const normIsbn = isbn.replace(/[^0-9Xx]/g, '');
-
-    const allowed = await this.bucket.consume(
-      RATE_LIMIT_BUCKET,
-      RATE_LIMIT_CAPACITY,
-      RATE_LIMIT_REFILL_PER_SEC,
-    );
-    if (!allowed) {
-      this.logger.warn(`bnf: rate limited isbn=${normIsbn}`);
-      return { ok: false, reason: 'bnf_rate_limited' };
-    }
 
     // `bib.fuzzyISBN` accepte ISBN-10/13 et EAN indifféremment (cf. brief).
     const params = new URLSearchParams({
@@ -89,10 +121,7 @@ export class BnfService implements OnModuleInit {
       xml = await this.cache.getOrFetch<string>(
         cacheKey,
         NOTICE_CACHE_TTL_SECONDS,
-        async () => {
-          const res = await this.http.request<string>(url, { method: 'GET' });
-          return typeof res.data === 'string' ? res.data : String(res.data);
-        },
+        () => this.fetchSru(url, BNF_PRIORITY_INTERACTIVE),
       );
     } catch {
       this.logger.warn(`bnf: SRU fetch failed isbn=${normIsbn}`);
@@ -246,19 +275,6 @@ export class BnfService implements OnModuleInit {
     let startRecord = 1; // SRU est indexé à partir de 1.
 
     while (startRecord <= EDITION_MAX_RECORDS) {
-      const allowed = await this.bucket.consume(
-        RATE_LIMIT_BUCKET,
-        RATE_LIMIT_CAPACITY,
-        RATE_LIMIT_REFILL_PER_SEC,
-      );
-      if (!allowed) {
-        this.logger.warn(
-          `bnf: edition rate limited title="${titleFr}" startRecord=${startRecord}`,
-        );
-        complete = false;
-        break;
-      }
-
       const params = new URLSearchParams({
         version: '1.2',
         operation: 'searchRetrieve',
@@ -275,10 +291,7 @@ export class BnfService implements OnModuleInit {
         xml = await this.cache.getOrFetch<string>(
           cacheKey,
           EDITION_CACHE_TTL_SECONDS,
-          async () => {
-            const res = await this.http.request<string>(url, { method: 'GET' });
-            return typeof res.data === 'string' ? res.data : String(res.data);
-          },
+          () => this.fetchSru(url, BNF_PRIORITY_BACKGROUND),
         );
       } catch {
         this.logger.warn(

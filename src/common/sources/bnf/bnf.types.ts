@@ -1,3 +1,22 @@
+// ---------- File BullMQ des fetch SRU (throttle sortant, remplace le bucket bnf:global) ----------
+
+/** File BullMQ des requêtes SRU BnF. `concurrency: 2` : un lookup interactif trouve toujours un slot
+ * libre même pendant une énumération de fond (la priorité ne préempte pas un job en cours). */
+export const BNF_QUEUE = 'bnf';
+
+/** Nom du job (fetch d'une URL SRU → XML). */
+export const BNF_FETCH_JOB = 'sru';
+
+/** Priorité BullMQ (plus petit = plus prioritaire). Le lookup par ISBN (scan) passe devant
+ * l'énumération d'édition (tâche de fond). */
+export const BNF_PRIORITY_INTERACTIVE = 1;
+export const BNF_PRIORITY_BACKGROUND = 10;
+
+/** Payload d'un job `bnf:sru` : l'URL SRU complète à récupérer. */
+export interface BnfFetchJobData {
+  url: string;
+}
+
 /** Auteur tel que catalogué en notice BnF (700/701 structuré, ou 200$f libre). */
 export interface BnfAuthor {
   /** 700$a — nom de famille. Signal fort pour le rapprochement MAL. */
