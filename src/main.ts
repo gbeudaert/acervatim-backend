@@ -1,11 +1,12 @@
-import { RequestMethod } from '@nestjs/common';
+import { Logger, RequestMethod } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { json } from 'express';
-import { writeFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import helmet from 'helmet';
+import { join } from 'path';
 import { patchNestJsSwagger, ZodValidationPipe } from 'nestjs-zod';
 import { AppModule } from './app.module';
 import { ProblemDetailsExceptionFilter } from './common/filters/problem-details.filter';
@@ -64,6 +65,15 @@ async function bootstrap() {
   const port = config.get<number>('PORT', 3000);
 
   await app.listen(port);
+
+  // Version loguée au démarrage pour corréler un log prod à la révision déployée (lue depuis
+  // package.json au runtime — vaut en dev comme en prod, où __dirname pointe sur dist/).
+  const pkg = JSON.parse(
+    readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
+  ) as { name: string; version: string };
+  new Logger('Bootstrap').log(
+    `${pkg.name} v${pkg.version} démarré — port=${port} env=${process.env.NODE_ENV ?? 'development'}`,
+  );
 }
 
 bootstrap();
