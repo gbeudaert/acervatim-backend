@@ -111,9 +111,12 @@ export class GoogleBooksResolver {
       );
     }
 
+    // maxAttempts: 1 — le retry est porté par le backoff exponentiel job-level (attempts:5, 15→120 s)
+    // de GoogleBooksCoverService, calibré pour les vagues 503 pluri-minutes de Google. Retenter ici
+    // en ~2 s ne traverse pas la vague et ne fait qu'ajouter du volume à un endpoint déjà throttlé.
     const res = await this.http.request<GoogleBooksVolumesResponse>(
       `${BASE_URL}?${params.toString()}`,
-      { method: 'GET' },
+      { method: 'GET', maxAttempts: 1 },
     );
     return res.data?.items ?? [];
   }

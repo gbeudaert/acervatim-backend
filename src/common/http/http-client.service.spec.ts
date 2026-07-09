@@ -76,6 +76,16 @@ describe('HttpClientService', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it('maxAttempts:1 → 503 échoue sans retry (le retry est porté ailleurs, ex. gbooks)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(503, { err: 'down' }));
+    const svc = makeService();
+
+    await expect(
+      svc.request('https://api/x', { maxAttempts: 1 }),
+    ).rejects.toBeInstanceOf(BadGatewayException);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('400 → throw immédiat, pas de retry', async () => {
     fetchMock.mockResolvedValue(jsonResponse(400, { err: 'bad' }));
     const svc = makeService();

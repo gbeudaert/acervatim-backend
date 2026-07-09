@@ -112,11 +112,22 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
         {
           // Single-flight : un job par ISBN. Complétion gardée quelques secondes pour que
           // `waitUntilFinished` lise l'état même si l'événement a été manqué (le cache long TTL
-          // court-circuite tout ré-enqueue dans cette fenêtre). En revanche, un échec est retiré
-          // IMMÉDIATEMENT (`removeOnFail: true`) : un échec Google transitoire doit rester
-          // re-tentable au prochain scan, or garder le job échoué sous ce jobId le bloquerait.
+          // court-circuite tout ré-enqueue dans cette fenêtre).
           jobId: key,
           removeOnComplete: { age: 60, count: 500 },
+          // Retry job-level à backoff exponentiel LONG : les 503 Google arrivent en vagues que le
+          // retry HTTP (~2 s) ne peut pas traverser. On laisse BullMQ retenter le job APRÈS la vague,
+          // en arrière-plan — il met en cache dès qu'une tentative réussit. `waitUntilFinished` (15 s)
+          // rend `null` sur la 1ʳᵉ vague, mais le poll suivant de `edition-mapping` sert le cache
+          // réchauffé (intention « cache warming »).
+          // Horizon relevé à 5 tentatives (15/30/60/120 s, soit ~3,75 min cumulés) après le prod
+          // 0.6.1 où une vague 503 a duré ~6 min et débordait l'ancien horizon (3 tentatives, ~45 s) :
+          // toutes les fenêtres tombaient dans la vague et le job échouait définitivement (jaquettes
+          // jamais réchauffées de la session). Pendant ces retries (état `delayed`) le single-flight
+          // tient : un doublon concurrent dédup sur le même jobId. `removeOnFail` ne s'applique
+          // qu'après épuisement → l'échec définitif reste re-tentable au prochain scan (jobId libéré).
+          attempts: 5,
+          backoff: { type: 'exponential', delay: 15_000 },
           removeOnFail: true,
         },
       );

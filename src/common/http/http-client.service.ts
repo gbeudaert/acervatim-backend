@@ -17,6 +17,14 @@ export interface HttpRequest {
   body?: string;
   /** Override du timeout par défaut (10s). */
   timeoutMs?: number;
+  /**
+   * Nombre max de tentatives HTTP (défaut {@link MAX_ATTEMPTS}=3). Mettre à `1` pour désactiver le
+   * retry transport quand le retry est déjà porté ailleurs à un meilleur étage — cas Google Books,
+   * dont les 503 arrivent en vagues pluri-minutes gérées par le backoff exponentiel job-level
+   * (cf. `GoogleBooksCoverService`) : retenter en ~2 s ne fait qu'ajouter du volume à un endpoint
+   * déjà throttlé. Clampé à ≥1.
+   */
+  maxAttempts?: number;
 }
 
 export interface HttpResponse<T = unknown> {
@@ -65,8 +73,9 @@ export class HttpClientService implements OnModuleInit {
     opts: HttpRequest = {},
   ): Promise<HttpResponse<T>> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const maxAttempts = Math.max(1, opts.maxAttempts ?? MAX_ATTEMPTS);
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         return await this.doFetch<T>(url, opts, timeoutMs);
       } catch (err) {
@@ -75,16 +84,16 @@ export class HttpClientService implements OnModuleInit {
           throw err;
         }
         const retryable = err as HttpRetryableError;
-        const isLast = attempt === MAX_ATTEMPTS;
+        const isLast = attempt === maxAttempts;
         if (isLast) {
           this.logger.warn(
-            `http: upstream unavailable after ${MAX_ATTEMPTS} attempts ${redactedTarget(url)} status=${retryable.status ?? 'network'}`,
+            `http: upstream unavailable after ${maxAttempts} attempt(s) ${redactedTarget(url)} status=${retryable.status ?? 'network'}`,
           );
           throw new BadGatewayException('upstream unavailable');
         }
         const delay = retryable.retryAfterMs ?? backoff(attempt);
         this.logger.log(
-          `http: retry ${attempt + 1}/${MAX_ATTEMPTS} ${redactedTarget(url)} status=${retryable.status ?? 'network'} delay=${delay}ms`,
+          `http: retry ${attempt + 1}/${maxAttempts} ${redactedTarget(url)} status=${retryable.status ?? 'network'} delay=${delay}ms`,
         );
         await sleep(delay);
       }
