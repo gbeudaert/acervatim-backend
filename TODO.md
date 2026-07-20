@@ -21,3 +21,15 @@ P3 circuit-breaker Redis, P3 métriques de files (`GET /admin/queues` + log pér
 - [ ] **App — WorkManager** (repo `acervatim-app`) : reprise en arrière-plan du polling d'import
       de série (reporté de P1, aujourd'hui polling ViewModel).
 - [ ] **Validation app bout-en-bout** de l'import série async contre un backend avec Redis.
+
+## Jaquettes — source alternative pour les trous Google Books
+
+- [ ] **Source de jaquette de repli quand Google Books n'a pas l'image.** Certains tomes n'ont
+      **aucune** jaquette chez Google Books (notice sans `imageLinks`), indépendamment du `country`
+      (FR **et** US renvoient les mêmes notices non illustrées) — vérifié 2026-07-10 sur **Black Torch
+      T1-5** (standard) et **SNK Éd. colossale T3/T4** ; les seules notices illustrées sont des
+      éditions étrangères (bare-number) ou hors-séries, rejetées à juste titre. Ce n'est donc PAS un
+      503 (corrigé : repli `intitle:` + retry) ni un matching trop strict — c'est un trou de données.
+      Le log `gbooks: intitle no-match …` (ajouté) permet de repérer ces cas en prod. Pistes de repli :
+      notice illustrée BnF/Electre, ISBN éditeur, ou provider tiers (Nautiljon/AniList…). Décision
+      produit à trancher.

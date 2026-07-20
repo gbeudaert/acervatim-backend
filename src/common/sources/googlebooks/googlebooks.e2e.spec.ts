@@ -123,21 +123,35 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
     }
   });
 
-  it('best-effort : un échec du worker → null, rien en cache, re-tentable', async () => {
-    resolver.fetchCover.mockRejectedValueOnce(new Error('google down'));
+  it('best-effort : un échec dur du worker → null + cache négatif court (coupe le ré-enqueue)', async () => {
+    resolver.fetchCover.mockRejectedValue(new Error('google down'));
     const isbn = '9780000000003';
 
     const first = await svc.resolveCoverAndDescription(isbn);
-    expect(first).toEqual({ coverUrl: null, description: null });
-    expect(cache.store.has(coverCacheKey(isbn))).toBe(false);
-
-    // Rien mis en cache → un 2e passage re-tente et réussit.
-    resolver.fetchCover.mockResolvedValueOnce({
-      coverUrl: 'https://img/retry.jpg',
+    // Échec dur → `unresolved` (transitoire, à re-tenter), pas `absent`.
+    expect(first).toEqual({
+      coverUrl: null,
       description: null,
+      status: 'unresolved',
     });
+    // #1 (fix prod 0.6.2) : l'échec dur pose un cache négatif court (`unresolved`) pour couper le
+    // ré-enqueue par de nouveaux scans pendant la vague 429/503 (re-tentable après expiration du TTL,
+    // non testée ici : le cache en mémoire ignore le TTL).
+    expect(cache.store.get(coverCacheKey(isbn))).toEqual<CachedCover>({
+      url: null,
+      description: null,
+      status: 'unresolved',
+    });
+
+    // 2e passage immédiat : servi du cache négatif, aucun nouvel appel réseau ni ré-enqueue.
+    resolver.fetchCover.mockClear();
     const second = await svc.resolveCoverAndDescription(isbn);
-    expect(second.coverUrl).toBe('https://img/retry.jpg');
+    expect(second).toEqual({
+      coverUrl: null,
+      description: null,
+      status: 'unresolved',
+    });
+    expect(resolver.fetchCover).not.toHaveBeenCalled();
   });
 
   it('hit de cache → aucun job enfilé', async () => {
@@ -149,7 +163,12 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
 
     const res = await svc.resolveCoverAndDescription(isbn);
 
-    expect(res).toEqual({ coverUrl: 'https://cached.jpg', description: 'x' });
+    // Entrée sans `status` (pré-0.6.4) → ré-inféré `found` (url présente).
+    expect(res).toEqual({
+      coverUrl: 'https://cached.jpg',
+      description: 'x',
+      status: 'found',
+    });
     expect(resolver.fetchCover).not.toHaveBeenCalled();
   });
 });

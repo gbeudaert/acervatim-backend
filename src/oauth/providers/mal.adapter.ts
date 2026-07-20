@@ -16,6 +16,13 @@ import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { BnfAuthor, BnfNotice } from '../../common/sources/bnf/bnf.types';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import {
+  matchesAuthor,
+  PIVOT_TITLE_STRONG,
+  titleSimilarity,
+} from '../../common/sources/manga-matching';
+import { MangaDexCoverService } from '../../common/sources/mangadex/mangadex.service';
+import { MangaDexIdentity } from '../../common/sources/mangadex/mangadex.types';
 import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
@@ -57,10 +64,6 @@ const MANGA_MEDIA_TYPES = new Set([
 ]);
 
 const PIVOT_SEARCH_LIMIT = 10;
-
-// Seuil de similarité de titre (contenance/Dice) au-delà duquel un candidat manga
-// est retenu SANS match auteur (cf. §4 du brief, calibré ~0.85).
-const PIVOT_TITLE_STRONG = 0.85;
 
 interface PendingState {
   userId: string;
@@ -128,6 +131,7 @@ export class MalAdapter
     private readonly bnf: BnfService,
     private readonly tokenResolver: TokenResolverService,
     private readonly googleBooks: GoogleBooksCoverService,
+    private readonly mangaDex: MangaDexCoverService,
     private readonly redisHealth: RedisHealthService,
     @InjectQueue(MAL_QUEUE)
     private readonly queue: Queue<MalFetchJobData, unknown>,
@@ -256,12 +260,14 @@ export class MalAdapter
   }
 
   /**
-   * Recherche manga par ISBN (EAN-13). Pivot ISBN → BnF (titre original romaji)
-   * → MAL (recherche fuzzy + consolidation auteur/type).
+   * Recherche manga par ISBN (EAN-13). Pivot ISBN → BnF (titre original romaji) → **MangaDex**
+   * (identité + méta + synopsis FR + jaquettes + `links.mal`) → **MAL en repli** si MangaDex
+   * n'identifie pas. Chemin nominal : on porte le `mal_id` fourni par MangaDex, on N'APPELLE PAS MAL
+   * (cf. plan §3). MAL redevient joignable par id direct via `links.mal` (sync bibliothèque).
    *
-   * Logging volontairement explicite sur le process de pivot : ce qu'on a obtenu
-   * de la BnF, ce qu'on a interrogé côté MAL, et ce qu'on a retenu (+ confiance).
-   * Cf. docs/interne/CONTEXT_isbn_to_mal.md.
+   * Logging volontairement explicite sur le process de pivot : ce qu'on a obtenu de la BnF, la voie
+   * d'identification (mangadex / repli mal / bnf_only) et ce qu'on a retenu (+ confiance).
+   * Cf. docs/interne/CONTEXT_isbn_to_mal.md et docs/travail/plan-mangadex-source-principale.md.
    */
   async searchByBarcode(
     barcode: string,
@@ -279,22 +285,53 @@ export class MalAdapter
     }
     const notice = resolution.notice;
 
-    // Choix de la requête MAL et de sa validation :
-    //  - titre original (454$t romaji) présent → pont fiable, validation souple
-    //    (auteur OU type+rang0), resolutionPath 'bnf+mal'.
-    //  - sinon repli sur le titre FR (identique à l'original pour les titres en
-    //    graphie latine : Black torch, One Piece…). Le titre FR étant plus
-    //    générique (homonymes), on EXIGE le match auteur, resolutionPath 'bnf+mal-fr'.
+    // Choix de la requête d'identification :
+    //  - titre original (454$t romaji) présent → pont le plus fiable, resolutionPath '…+mangadex' ;
+    //  - sinon repli sur le titre FR (identique à l'original pour les graphies latines : Black torch,
+    //    One Piece…), resolutionPath '…+mangadex-fr'.
     const useOriginal = !!notice.originalTitle;
     const query = notice.originalTitle ?? notice.titleFr ?? null;
     if (!query) {
-      // Ni titre original ni titre FR exploitable → pivot MAL impossible (cf. log BnF).
+      // Ni titre original ni titre FR exploitable → identification impossible (cf. log BnF).
       // On renvoie tout de même la notice BnF (bnf_only) au lieu de rien (backend#2).
       this.logger.warn(
-        `pivot: bnf_only isbn=${isbn} (ni titre original ni titre FR) -> pas d'enrichissement MAL`,
+        `pivot: bnf_only isbn=${isbn} (ni titre original ni titre FR) -> pas d'enrichissement`,
       );
       return this.bnfOnlyResult(notice, isbn);
     }
+
+    // Chemin nominal : MangaDex identifie (identité + méta + synopsis FR + jaquettes + links.mal).
+    // Best-effort : `null` (MangaDex indispo ou non identifié) → repli MAL. On ne rappelle PAS MAL
+    // quand MangaDex a réussi : le mal_id est simplement porté en metadata.
+    const identity = await this.mangaDex.identifySeries(query, notice.authors);
+    if (identity) {
+      this.logger.log(
+        `pivot: retained via mangadex isbn=${isbn} mangaId=${identity.mangaId} mal_id=${identity.malId ?? '-'} title="${identity.title}" matchedBy=${identity.matchedBy} confidence=${identity.confidence.toFixed(2)} synopsisFr=${identity.descriptionFr ? 'y' : 'n'}`,
+      );
+      return {
+        items: [this.buildMangaDexItem(identity, notice, isbn, useOriginal)],
+        nextCursor: null,
+      };
+    }
+    this.logger.log(`pivot: mangadex no match isbn=${isbn} -> repli MAL`);
+
+    return this.malPivotFallback(notice, isbn, query, useOriginal, ctx);
+  }
+
+  /**
+   * **Repli MAL** (pivot flou historique) : MangaDex n'a pas identifié le manga. On interroge MAL par
+   * recherche floue et on consolide par auteur/type, exactement comme avant l'inversion du pivot.
+   *  - titre original (454$t) → validation souple (auteur OU type+rang0), `resolutionPath: 'bnf+mal'` ;
+   *  - repli titre FR → on EXIGE le match auteur (anti-homonyme), `resolutionPath: 'bnf+mal-fr'`.
+   * Échec du repli (aucun candidat, mode dégradé sans jeton…) → notice BnF seule (`bnf_only`).
+   */
+  private async malPivotFallback(
+    notice: BnfNotice,
+    isbn: string,
+    query: string,
+    useOriginal: boolean,
+    ctx: AdapterContext,
+  ): Promise<AdapterSearchResult> {
     const requireAuthor = !useOriginal;
 
     this.logger.log(
@@ -502,7 +539,10 @@ export class MalAdapter
       const typeOk = node.media_type
         ? MANGA_MEDIA_TYPES.has(node.media_type)
         : false;
-      const authorMatched = matchesAuthor(bnfAuthors, node.authors);
+      const authorMatched = matchesAuthor(
+        bnfAuthors,
+        malAuthorNames(node.authors),
+      );
       const titleScore = titleSimilarity(query, node.title);
 
       // Combinaison linéaire (max = 1.0) : titre 0.45, auteur 0.40, type 0.15.
@@ -586,6 +626,59 @@ export class MalAdapter
       rawData: notice,
     };
     return { items: [item], nextCursor: null };
+  }
+
+  /**
+   * Mappe une identité MangaDex en item `source='mangadex'` (chemin nominal du scan). Le `mal_id`
+   * (`links.mal`) est porté dans `metadata.pivot` pour retrouver MAL trivialement plus tard (sync).
+   *  - `description` (public FR) = synopsis `.fr` → note BnF 330$a → synopsis `.en` ;
+   *  - `coverUrl` = jaquette principale MangaDex ;
+   *  - `num_volumes` dérivé de `lastVolume` ; `rating`/`status`/`genres` en metadata.
+   * Le tome scanné voyage dans `metadata.scannedTome`, comme les autres chemins.
+   */
+  private buildMangaDexItem(
+    identity: MangaDexIdentity,
+    notice: BnfNotice,
+    isbn: string,
+    useOriginal: boolean,
+  ): UnifiedItem {
+    const description =
+      identity.descriptionFr ??
+      notice.noteFr ??
+      identity.descriptionEn ??
+      undefined;
+    const numVolumes = toVolumeCount(identity.lastVolume);
+    return {
+      source: 'mangadex',
+      sourceId: identity.mangaId,
+      mediaType: 'manga',
+      title: identity.title,
+      creators: identity.authors.length
+        ? identity.authors
+        : bnfCreators(notice.authors),
+      releaseDate: identity.year
+        ? String(identity.year)
+        : (notice.publicationDate ?? undefined),
+      coverUrl: identity.coverUrl ?? undefined,
+      description,
+      metadata: {
+        pivot: {
+          isbn,
+          confidence: identity.confidence,
+          authorMatched: identity.matchedBy === 'title+author',
+          resolutionPath: useOriginal ? 'bnf+mangadex' : 'bnf+mangadex-fr',
+          malId: identity.malId,
+          anilistId: identity.anilistId,
+          mangaId: identity.mangaId,
+        },
+        rating: identity.rating,
+        num_volumes: numVolumes,
+        status: identity.status,
+        genres: identity.genres,
+        scannedTome: buildScannedTomeMeta(notice, isbn),
+      },
+      rawData: identity,
+    };
   }
 
   private mapNode(node: MalMangaNode): UnifiedItem {
@@ -675,94 +768,21 @@ function volumeRangeLabel(range: string | null): string | null {
   return /^\d+$/.test(range) ? `Tome ${range}` : `Tomes ${range}`;
 }
 
-/** Normalise un nom : minuscules, sans accents/diacritiques. */
-function normName(s: string): string {
-  return s
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .trim();
-}
-
-/** Tokens d'un nom (mots ≥ 2 lettres), pour comparer sans tenir compte de l'ordre. */
-function nameTokens(s: string | undefined): string[] {
-  if (!s) return [];
-  return normName(s)
-    .split(/[\s,]+/)
-    .filter((w) => w.length >= 2);
-}
-
-/**
- * Match auteur BnF ↔ MAL : vrai si au moins un token de nom (nom/prénom) est
- * commun. Insensible à la casse, aux accents et à l'ordre nom/prénom — c'est le
- * validateur robuste du pivot (le titre romaji peut matcher par chance, l'auteur
- * confirme). Ex. BnF 700$a "Isayama" ↔ MAL last_name "Isayama".
- */
-function matchesAuthor(
-  bnfAuthors: BnfAuthor[],
-  malAuthors: MalMangaNode['authors'],
-): boolean {
-  if (!bnfAuthors?.length || !malAuthors?.length) return false;
-
-  const malTokens = new Set(
-    malAuthors.flatMap((a) => [
-      ...nameTokens(a.node?.first_name),
-      ...nameTokens(a.node?.last_name),
-    ]),
-  );
-  if (malTokens.size === 0) return false;
-
-  const bnfTokens = bnfAuthors.flatMap((a) => [
-    ...nameTokens(a.surname),
-    ...nameTokens(a.given),
-    ...nameTokens(a.full),
+/** Noms d'auteurs MAL → chaînes libres (prénom, nom) pour {@link matchesAuthor}. */
+function malAuthorNames(
+  authors: MalMangaNode['authors'],
+): (string | undefined)[] {
+  return (authors ?? []).flatMap((a) => [
+    a.node?.first_name,
+    a.node?.last_name,
   ]);
-
-  return bnfTokens.some((t) => malTokens.has(t));
 }
 
-/**
- * Similarité titre requête↔candidat ∈ [0,1]. Contenance (une chaîne incluse dans
- * l'autre, ex "tokyo toritsu" ⊂ "jujutsu kaisen 0: tokyo toritsu…") → 1.0 ; sinon
- * coefficient de Dice sur bigrammes de caractères (fuzzy, tolère les variantes de
- * romanisation BnF↔MAL type "jyouou"/"joou"). Normalisation : minuscules, sans
- * diacritiques, espaces compactés.
- */
-function titleSimilarity(query: string, candidate: string | undefined): number {
-  const q = normTitle(query);
-  const c = normTitle(candidate ?? '');
-  if (!q || !c) return 0;
-  if (c.includes(q) || q.includes(c)) return 1;
-  return diceCoefficient(q, c);
-}
-
-function normTitle(s: string): string {
-  return normName(s).replace(/\s+/g, ' ').trim();
-}
-
-/** Coefficient de Dice sur bigrammes de caractères ∈ [0,1]. */
-function diceCoefficient(a: string, b: string): number {
-  const baseA = a.replace(/\s+/g, '');
-  const baseB = b.replace(/\s+/g, '');
-  if (baseA.length < 2 || baseB.length < 2) return baseA === baseB ? 1 : 0;
-  const bigrams = new Map<string, number>();
-  for (let i = 0; i < baseA.length - 1; i++) {
-    const bg = baseA.slice(i, i + 2);
-    bigrams.set(bg, (bigrams.get(bg) ?? 0) + 1);
-  }
-  let overlap = 0;
-  let totalB = 0;
-  for (let i = 0; i < baseB.length - 1; i++) {
-    totalB++;
-    const bg = baseB.slice(i, i + 2);
-    const count = bigrams.get(bg) ?? 0;
-    if (count > 0) {
-      bigrams.set(bg, count - 1);
-      overlap++;
-    }
-  }
-  const totalA = baseA.length - 1;
-  return (2 * overlap) / (totalA + totalB);
+/** `lastVolume` MangaDex (brut) → nombre de tomes, `undefined` si non numérique. */
+function toVolumeCount(lastVolume: string | null): number | undefined {
+  if (!lastVolume) return undefined;
+  const n = Number(lastVolume);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function parseOffset(cursor: string | undefined): number {

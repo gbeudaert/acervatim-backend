@@ -48,6 +48,16 @@ export const HIT_TTL_SECONDS = 90 * 24 * 3600;
 export const MISS_TTL_SECONDS = 7 * 24 * 3600;
 
 /**
+ * TTL du cache **négatif d'échec dur** (réseau / 4xx / 5xx après retries) : bien plus court qu'un
+ * MISS 2xx (absence confirmée par Google), car un échec est transitoire — une vague 429/503 dure
+ * quelques minutes. Il borne juste le ré-enqueue par de nouveaux scans pendant la vague (la file
+ * `gbooks` est throttlée, cf. incident prod 0.6.2 : les mêmes ISBN se ré-enfilaient à chaque scan et
+ * saturaient la file), puis expire vite pour laisser une jaquette réellement disponible réapparaître.
+ * Couvre l'horizon de retry BullMQ (~3,75 min) + un peu de marge.
+ */
+export const FAIL_TTL_SECONDS = 10 * 60;
+
+/**
  * Signaux BnF permettant le **repli par titre** quand l'ISBN scanné (édition papier Ki-oon) n'a
  * pas de jaquette chez Google Books : ces notices papier n'existent souvent qu'en fiche
  * catalographique sans image, alors que le même tome porte une jaquette sous une autre notice
@@ -66,19 +76,39 @@ export interface CoverHint {
   edition?: string | null;
 }
 
+/**
+ * Issue d'une résolution de jaquette — tri-état exposé jusqu'à l'app pour lever l'ambiguïté du `null` :
+ *  - `found`      : jaquette résolue (`coverUrl` non-null).
+ *  - `absent`     : Google Books n'a PAS de jaquette pour ce tome (2xx sans notice illustrée qui
+ *                   matche tome+édition, ou ISBN invalide/absent) → **définitif**, l'app peut afficher
+ *                   « pas de couverture » sans re-tenter.
+ *  - `unresolved` : non déterminé (503/réseau après retries, Redis indisponible, ou pas encore résolu
+ *                   côté cache) → **transitoire**, à re-tenter (le worker réchauffe en arrière-plan).
+ */
+export type CoverStatus = 'found' | 'absent' | 'unresolved';
+
 /** Jaquette + résumé d'un tome, résolus en un seul appel Google Books. */
 export interface CoverResult {
   coverUrl: string | null;
   description: string | null;
+  status: CoverStatus;
 }
 
 /**
  * Enveloppe de cache : distingue « ISBN jamais résolu » (absent du cache) de
  * « résolu, pas de jaquette » (`{ url: null }`), pour ne pas re-taper Google Books à chaque fois.
+ * `status` porte le tri-état ({@link CoverStatus}) ; absent des entrées écrites avant la 0.6.4, il est
+ * alors ré-inféré à la lecture (`url` présent → `found`, sinon → `absent`).
  */
 export interface CachedCover {
   url: string | null;
   description?: string | null;
+  status?: CoverStatus;
+}
+
+/** Ré-infère le {@link CoverStatus} d'une entrée de cache (compat entrées pré-0.6.4 sans `status`). */
+export function cachedStatus(hit: CachedCover): CoverStatus {
+  return hit.status ?? (hit.url ? 'found' : 'absent');
 }
 
 /** Payload d'un job `gbooks:cover` : ISBN **déjà normalisé** + hint BnF optionnel. */

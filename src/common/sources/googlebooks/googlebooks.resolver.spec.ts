@@ -101,7 +101,12 @@ describe('GoogleBooksResolver.fetchCover', () => {
       const { resolver, http } = makeResolver();
       http.request.mockResolvedValue(volumesResponse());
       const res = await resolver.fetchCover('9782505011943');
-      expect(res).toEqual({ coverUrl: null, description: null });
+      // 2xx sans jaquette → absence confirmée (définitif), pas un échec transitoire.
+      expect(res).toEqual({
+        coverUrl: null,
+        description: null,
+        status: 'absent',
+      });
     });
 
     it('propage l’échec réseau (pour empêcher toute mise en cache côté worker)', async () => {
@@ -112,10 +117,22 @@ describe('GoogleBooksResolver.fetchCover', () => {
       );
     });
 
+    it('échec isbn: SANS hint → propage (aucun repli possible)', async () => {
+      const { resolver, http } = makeResolver();
+      http.request.mockRejectedValue(new Error('503 upstream'));
+      await expect(resolver.fetchCover('9791032701881')).rejects.toThrow(
+        '503 upstream',
+      );
+    });
+
     it('renvoie null pour un ISBN trop court, sans réseau', async () => {
       const { resolver, http } = makeResolver();
       const res = await resolver.fetchCover('123');
-      expect(res).toEqual({ coverUrl: null, description: null });
+      expect(res).toEqual({
+        coverUrl: null,
+        description: null,
+        status: 'absent',
+      });
       expect(http.request).not.toHaveBeenCalled();
     });
 
@@ -138,6 +155,7 @@ describe('GoogleBooksResolver.fetchCover', () => {
       expect(await resolver.fetchCover('9782505011943')).toEqual({
         coverUrl: 'https://img/c.jpg',
         description: 'Résumé du tome',
+        status: 'found',
       });
     });
   });
@@ -232,6 +250,37 @@ describe('GoogleBooksResolver.fetchCover', () => {
         hint('Black torch', 1),
       );
       expect(res.coverUrl).toBeNull();
+    });
+
+    it('503 sur isbn: AVEC hint → le repli intitle: prend le relais et résout la jaquette (Ki-oon)', async () => {
+      const { resolver, http } = makeResolver();
+      // isbn: échoue (503 intermittent), intitle: répond : le repli ne doit pas être court-circuité.
+      http.request.mockImplementation(async (url: string) => {
+        if (url.includes('q=isbn')) throw new Error('503 upstream');
+        return titleVolumesResponse([
+          { title: 'Black Torch T02', withImage: true },
+        ]);
+      });
+
+      const res = await resolver.fetchCover(
+        '9791032702468',
+        hint('Black torch', 2),
+      );
+
+      expect(res.coverUrl).toBe('https://img/Black Torch T02.jpg');
+      // Le repli intitle: a bien un budget de retry (>1 tentative), pas la requête isbn:.
+      const titleCall = http.request.mock.calls.find(
+        (c) => !String(c[0]).includes('q=isbn'),
+      );
+      expect(titleCall).toBeDefined();
+    });
+
+    it('503 sur isbn: ET sur le repli intitle: → propage (échec transitoire, non caché)', async () => {
+      const { resolver, http } = makeResolver();
+      http.request.mockRejectedValue(new Error('503 upstream'));
+      await expect(
+        resolver.fetchCover('9791032702468', hint('Black torch', 2)),
+      ).rejects.toThrow('503 upstream');
     });
 
     it('appaire le tome via seriesInfo.bookDisplayNumber quand le titre ne porte pas de « T<n> »', async () => {

@@ -6,7 +6,7 @@ import {
 } from './edition-import.types';
 
 function make() {
-  const search = { editionMapping: jest.fn() };
+  const search = { warmEditionMapping: jest.fn() };
   const proc = new EditionImportProcessor(search as never);
   return { proc, search };
 }
@@ -26,7 +26,7 @@ describe('EditionImportProcessor.process', () => {
   it('énumère, relaie la progression et renvoie le nb de tomes', async () => {
     const { proc, search } = make();
     // Simule 3 tomes résolus en appelant le callback de progression.
-    search.editionMapping.mockImplementation(
+    search.warmEditionMapping.mockImplementation(
       async (
         _title: string,
         _edition: string | undefined,
@@ -39,15 +39,16 @@ describe('EditionImportProcessor.process', () => {
       },
     );
 
-    const j = job({ title: 'Black torch', edition: null });
+    const j = job({ title: 'Black torch', edition: null, malId: null });
     const res = await proc.process(j);
 
     expect(res).toEqual<EditionImportResult>({ tomeCount: 3 });
-    // edition null → transmis en undefined à editionMapping.
-    expect(search.editionMapping).toHaveBeenCalledWith(
+    // edition null + malId null → transmis en undefined à warmEditionMapping.
+    expect(search.warmEditionMapping).toHaveBeenCalledWith(
       'Black torch',
       undefined,
       expect.any(Function),
+      undefined,
     );
     // Phase d'énumération annoncée, puis progression des jaquettes.
     expect(j.updateProgress).toHaveBeenCalledWith({
@@ -64,14 +65,15 @@ describe('EditionImportProcessor.process', () => {
 
   it('transmet l’édition quand elle est fournie', async () => {
     const { proc, search } = make();
-    search.editionMapping.mockResolvedValue({ tomes: [] });
+    search.warmEditionMapping.mockResolvedValue({ tomes: [] });
 
-    await proc.process(job({ title: 'X', edition: 'Éd. colossale' }));
+    await proc.process(job({ title: 'X', edition: 'Éd. colossale', malId: null }));
 
-    expect(search.editionMapping).toHaveBeenCalledWith(
+    expect(search.warmEditionMapping).toHaveBeenCalledWith(
       'X',
       'Éd. colossale',
       expect.any(Function),
+      undefined,
     );
   });
 });

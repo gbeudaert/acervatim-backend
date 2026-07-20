@@ -6,6 +6,7 @@ import {
   CachedCover,
   CoverJobData,
   CoverResult,
+  FAIL_TTL_SECONDS,
   GBOOKS_QUEUE,
   HIT_TTL_SECONDS,
   MISS_TTL_SECONDS,
@@ -24,9 +25,12 @@ import {
  * amplifie l'engorgement. `concurrency: 1` sérialise donc les appels entre tomes ; `max: 4` laisse
  * une marge confortable vs. le seuil observé (l'ancien 10 req/s le déclenchait encore).
  *
- * Cache **uniquement sur 2xx** : si `fetchCover` renvoie (HTTP 2xx), on met en cache — y compris une
- * absence d'image (`url: null`, absence légitime, TTL court). Si `fetchCover` **jette** (réseau /
- * 4xx / 5xx après retries), le job échoue et **rien n'est mis en cache** → re-tenté au prochain scan.
+ * Cache sur 2xx : si `fetchCover` renvoie (HTTP 2xx), on met en cache — jaquette (`HIT_TTL`) ou
+ * absence d'image légitime (`url: null`, `MISS_TTL`). Si `fetchCover` **jette** (réseau / 4xx / 5xx
+ * après retries), on pose un **cache négatif court** (`FAIL_TTL`) puis on **re-jette** : le job
+ * échoue toujours (le backoff BullMQ retente en arrière-plan et écrase l'entrée dès qu'une tentative
+ * réussit), mais pendant ce temps un nouveau scan du même ISBN court-circuite sur le cache au lieu de
+ * ré-enfiler dans la file throttlée (incident prod 0.6.2 : mêmes ISBN ré-enfilés à chaque scan).
  */
 @Processor(GBOOKS_QUEUE, {
   concurrency: 1,
@@ -42,12 +46,27 @@ export class GoogleBooksProcessor extends WorkerHost {
 
   async process(job: Job<CoverJobData, CoverResult>): Promise<CoverResult> {
     const { isbn, hint } = job.data;
-    const res = await this.resolver.fetchCover(isbn, hint);
+    const key = coverCacheKey(isbn);
 
+    let res: CoverResult;
+    try {
+      res = await this.resolver.fetchCover(isbn, hint);
+    } catch (err) {
+      // Échec dur (réseau / 4xx / 5xx après retries) → `unresolved` : cache négatif court pour couper
+      // le ré-enqueue par de nouveaux scans pendant la vague, puis on re-jette (retry BullMQ en fond).
+      await this.cache.set<CachedCover>(
+        key,
+        { url: null, description: null, status: 'unresolved' },
+        FAIL_TTL_SECONDS,
+      );
+      throw err;
+    }
+
+    // 2xx : `found` (jaquette, TTL long) ou `absent` (Google confirme l'absence, TTL court).
     await this.cache.set<CachedCover>(
-      coverCacheKey(isbn),
-      { url: res.coverUrl, description: res.description },
-      res.coverUrl ? HIT_TTL_SECONDS : MISS_TTL_SECONDS,
+      key,
+      { url: res.coverUrl, description: res.description, status: res.status },
+      res.status === 'found' ? HIT_TTL_SECONDS : MISS_TTL_SECONDS,
     );
 
     return res;

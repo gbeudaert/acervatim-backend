@@ -2,6 +2,7 @@ import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CoverStatus } from '../common/sources/googlebooks/googlebooks.types';
 import { CursorPage } from '../common/pagination/paginate';
 import { UnifiedItem } from '../oauth/providers/types';
 import { CoverQueryDto } from './dto/cover.query';
@@ -39,12 +40,13 @@ export class SearchController {
   async editionMapping(
     @Query() query: EditionMappingQueryDto,
   ): Promise<EditionMappingResponse> {
-    return this.search.editionMapping(query.title, query.edition);
+    return this.search.editionMapping(query.title, query.edition, query.malId);
   }
 
   /**
    * Résout la jaquette d'un tome par ISBN via Google Books (et la met en cache serveur, ce qui
-   * alimente `edition-mapping`). Renvoie `{ coverUrl: null }` si aucune jaquette n'est trouvée.
+   * alimente `edition-mapping`). Renvoie `coverStatus` (cf. {@link CoverStatus}) pour distinguer
+   * `found` / `absent` (pas de jaquette, définitif) / `unresolved` (transitoire, à re-tenter).
    *
    * Passer `title`+`volume` (et `edition` si spéciale) arme le repli `intitle:` quand la notice ISBN
    * n'a pas d'image — indispensable pour les ISBN papier FR sans jaquette (cf. `resolveCover`).
@@ -52,7 +54,7 @@ export class SearchController {
   @Get('cover')
   async cover(
     @Query() query: CoverQueryDto,
-  ): Promise<{ coverUrl: string | null }> {
+  ): Promise<{ coverUrl: string | null; coverStatus: CoverStatus }> {
     const hint =
       query.title != null && query.volume != null
         ? {
@@ -61,6 +63,6 @@ export class SearchController {
             edition: query.edition ?? null,
           }
         : undefined;
-    return { coverUrl: await this.search.resolveCover(query.isbn, hint) };
+    return this.search.resolveCoverDetailed(query.isbn, hint);
   }
 }

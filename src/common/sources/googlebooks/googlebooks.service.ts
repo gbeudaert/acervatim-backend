@@ -16,13 +16,25 @@ import {
   CoverResult,
   GBOOKS_COVER_JOB,
   GBOOKS_QUEUE,
+  cachedStatus,
   coverCacheKey,
   normalizeIsbn,
 } from './googlebooks.types';
 
 export type { CoverHint, CoverResult } from './googlebooks.types';
 
-const EMPTY: CoverResult = { coverUrl: null, description: null };
+// Deux « vides » distincts (cf. CoverStatus) : `ABSENT` = pas de jaquette, définitif (ISBN invalide) ;
+// `UNRESOLVED` = non déterminé/transitoire (Redis down, timeout d'attente, pas encore résolu).
+const ABSENT: CoverResult = {
+  coverUrl: null,
+  description: null,
+  status: 'absent',
+};
+const UNRESOLVED: CoverResult = {
+  coverUrl: null,
+  description: null,
+  status: 'unresolved',
+};
 
 // Plafond d'attente d'une résolution (best-effort) : au-delà on rend `null` sans casser l'appelant.
 // Couvre le cas Redis lent/indisponible et une file engorgée.
@@ -76,6 +88,25 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
     return hit?.url ?? null;
   }
 
+  /**
+   * Lecture **cache-only** de la jaquette **et** du résumé (jamais de réseau ni de file). Renvoie
+   * `EMPTY` si l'ISBN n'est pas encore résolu. Sert à `SearchService.editionMapping` (endpoint HTTP)
+   * pour répondre en < 1 s même à froid : le réchauffage réel passe par le worker d'import qui, lui,
+   * appelle {@link resolveCoverAndDescription}. Évite le timeout client (incident 0.5.3 / 0.6.2).
+   */
+  async cachedCoverAndDescription(isbn: string): Promise<CoverResult> {
+    const norm = normalizeIsbn(isbn);
+    if (!norm) return ABSENT;
+    const hit = await this.cache.get<CachedCover>(coverCacheKey(norm));
+    // Absent du cache = pas encore résolu (le worker d'import le réchauffe) → `unresolved`, PAS `absent`.
+    if (!hit) return UNRESOLVED;
+    return {
+      coverUrl: hit.url,
+      description: hit.description ?? null,
+      status: cachedStatus(hit),
+    };
+  }
+
   /** {@link resolveCoverAndDescription} en ne renvoyant que l'URL de jaquette. */
   async resolveCover(isbn: string, hint?: CoverHint): Promise<string | null> {
     return (await this.resolveCoverAndDescription(isbn, hint)).coverUrl;
@@ -91,18 +122,23 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
     hint?: CoverHint,
   ): Promise<CoverResult> {
     const norm = normalizeIsbn(isbn);
-    if (!norm) return EMPTY;
+    if (!norm) return ABSENT;
 
     const key = coverCacheKey(norm);
     const cached = await this.cache.get<CachedCover>(key);
     if (cached) {
-      return { coverUrl: cached.url, description: cached.description ?? null };
+      return {
+        coverUrl: cached.url,
+        description: cached.description ?? null,
+        status: cachedStatus(cached),
+      };
     }
 
-    // Circuit-breaker : Redis down → best-effort `null` tout de suite. Sans ça, l'énumération d'une
-    // édition (jusqu'à ~30 tomes) attendrait 15 s par tome avant de dégrader (cf. RedisHealthService).
+    // Circuit-breaker : Redis down → best-effort tout de suite, statut `unresolved` (transitoire :
+    // l'appelant pourra re-tenter). Sans ça, l'énumération d'une édition (jusqu'à ~30 tomes)
+    // attendrait 15 s par tome avant de dégrader (cf. RedisHealthService).
     if (!this.redisHealth.isAvailable()) {
-      return EMPTY;
+      return UNRESOLVED;
     }
 
     try {
@@ -133,10 +169,11 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
       );
       return await job.waitUntilFinished(this.queueEvents, WAIT_TIMEOUT_MS);
     } catch {
-      // Redis indisponible, worker en échec (réseau/quota Google) ou timeout d'attente :
-      // best-effort → null, jamais d'exception (ne casse pas l'énumération d'édition).
+      // Redis indisponible, worker en échec (réseau/quota Google) ou timeout d'attente : best-effort
+      // → `unresolved` (transitoire), jamais d'exception (ne casse pas l'énumération d'édition). Le
+      // worker retente en arrière-plan ; le prochain passage servira le cache réchauffé.
       this.logger.warn(`gbooks: resolve failed isbn=${norm}`);
-      return EMPTY;
+      return UNRESOLVED;
     }
   }
 }

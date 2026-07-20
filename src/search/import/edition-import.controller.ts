@@ -33,7 +33,7 @@ export class EditionImportController {
   async create(
     @Body() body: CreateImportJobDto,
   ): Promise<{ jobId: string; state: ApiJobState }> {
-    return this.editionImport.enqueue(body.title, body.edition);
+    return this.editionImport.enqueue(body.title, body.edition, body.malId);
   }
 
   /** Statut + avancement d'un job. `404` si l'id est inconnu. */

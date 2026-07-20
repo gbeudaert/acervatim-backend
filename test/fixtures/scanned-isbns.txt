@@ -1,0 +1,49 @@
+# Jeu de test d'ISBN manga pour le pivot BnF → MyAnimeList.
+# Deux sources :
+#   - scans de production (logs/prod_0.5.3.log → prod_0.6.3.log, « pivot: start isbn= »),
+#     classés par résultat déjà observé ;
+#   - ISBN relevés sur des photos de 4e de couverture (à résoudre).
+# Dédupliqués. Une ISBN par ligne ; pour n'obtenir que les codes : grep -v '^#' | grep .
+#
+# Usage typique :
+#   ./scripts/dev.ps1 study-covers $(grep -v '^#' test/fixtures/scanned-isbns.txt | grep .)
+
+# --- Résolus BnF → MAL (pivot: retained) ---------------------------------
+9791032706343  # "Je vais te tuer" -> Jujutsu Kaisen (mal_id=113138, conf=1.00)
+9791032706688  # "L'école d'exorcisme de Tokyo" -> Jujutsu Kaisen 0 (mal_id=115710, conf=1.00)
+9791032701881  # "Black torch" -> Black Torch (mal_id=103786, conf=1.00)
+9782302089198  # "Dans le sens du vent" -> Hokuhokusei ni Kumo to Ike (mal_id=97179, conf=1.00)
+9791032705469  # "Heart gear" -> Heart Gear (mal_id=119321, conf=1.00)
+9782820347817  # "Hell's paradise" (Éd. prestige) -> Jigokuraku (mal_id=112318, conf=1.00)
+9782820340795  # "Hell's paradise" (vol 12) -> Jigokuraku (mal_id=112318, conf=1.00)
+9782811635923  # "L'attaque des titans" (Éd. colossale) -> Shingeki no Kyojin (mal_id=23390, conf=0.55, titre non similaire)
+
+# --- BnF trouvé mais aucun candidat MAL -> repli bnf_only ----------------
+9791032706312  # "À chacun son festival" (Horikoshi) — pas de titre original (454$t absent)
+9782723442084  # "Piccolo" (Toriyama) — pas de titre original, aucun candidat n'a matché l'auteur
+9782723441490  # "Recoom et Guldo" (Toriyama) — idem
+9782723440448  # "Monsieur Freezer" (Toriyama) — idem
+
+# --- BnF introuvable (bnf_not_found -> no candidate) ---------------------
+9791032724996  # ISBN valide mais absent du catalogue BnF
+
+# --- Codes-barres scannés NON reconnus comme ISBN (mis-scans / EAN) ------
+1701037706376  # préfixe invalide (ni 978/979) — bnf_not_found
+3791632706343  # mis-scan de 9791032706343 — bnf_not_found
+4580818635923  # EAN produit japonais (préfixe 458) — bnf_not_found
+
+# --- ISBN relevés sur photos de 4e de couverture (à résoudre) ------------
+# Source : C:\Users\guill\Downloads\Photos-1-001(3) — résultat pivot non encore observé.
+9782351426937  # Blood Lad (Kurokawa)
+9782811601096  # Highschool of the Dead (Pika)
+9782756037035  # Delcourt/Tonkam (couv. torii, titre non identifié)
+9782723433358  # One Piece (Glénat)
+9782723478380  # Chi's Sweet Home (Glénat)
+9782811635862  # Your Name / Kimi no Na wa (Pika, vol 1/3)
+9782818936238  # The Rising of the Shield Hero / Tate no Yûsha (Doki-Doki) — ISBN pris sur la page de crédits, pas le code-barres
+9782820340320  # Blue Exorcist / Ao no Exorcist (Kazé) — « tome offert, ne peut être vendu »
+9782888904588  # Usagi Yojimbo (Paquet)
+9782355926341  # Bloody Cross (Ki-oon)
+9782820342577  # The Promised Neverland (Kazé) — tome offert 2+1
+9782811606640  # Kingdom Hearts (Pika)
+9782820340597  # The Promised Neverland : Never Be Alone (Kazé) — tome offert

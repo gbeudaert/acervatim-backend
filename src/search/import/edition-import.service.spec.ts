@@ -27,7 +27,7 @@ describe('EditionImportService', () => {
       expect(res).toEqual({ jobId: expectedId, state: 'queued' });
       expect(queue.add).toHaveBeenCalledWith(
         EDITION_IMPORT_JOB,
-        { title: TITLE, edition: EDITION },
+        { title: TITLE, edition: EDITION, malId: null },
         expect.objectContaining({ jobId: expectedId }),
       );
     });

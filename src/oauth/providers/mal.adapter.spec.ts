@@ -8,6 +8,8 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import { MangaDexCoverService } from '../../common/sources/mangadex/mangadex.service';
+import { MangaDexIdentity } from '../../common/sources/mangadex/mangadex.types';
 import { OauthCredentialsService } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
 import { TokenResolverService } from '../token-resolver.service';
@@ -32,6 +34,7 @@ interface MockDeps {
   bnf: { resolveByIsbn: jest.Mock };
   tokenResolver: { resolve: jest.Mock };
   googleBooks: { resolveCover: jest.Mock; cachedCover: jest.Mock };
+  mangaDex: { identifySeries: jest.Mock };
   redisHealth: { isAvailable: jest.Mock };
   queue: { add: jest.Mock };
   waitUntilFinished: jest.Mock;
@@ -78,6 +81,11 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     resolveCover: jest.fn().mockResolvedValue(null),
     cachedCover: jest.fn().mockResolvedValue(null),
   };
+  // Par défaut : MangaDex n'identifie PAS (null) → le pivot replie sur MAL, ce qui préserve les
+  // scénarios MAL historiques. Les tests du chemin nominal surchargent `identifySeries`.
+  const mangaDex = {
+    identifySeries: jest.fn().mockResolvedValue(null),
+  };
   const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
   const queue = { add: jest.fn().mockResolvedValue({ waitUntilFinished }) };
@@ -90,6 +98,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
     bnf as unknown as BnfService,
     tokenResolver as unknown as TokenResolverService,
     googleBooks as unknown as GoogleBooksCoverService,
+    mangaDex as unknown as MangaDexCoverService,
     redisHealth as never,
     queue as never,
   );
@@ -115,6 +124,7 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
       bnf,
       tokenResolver,
       googleBooks,
+      mangaDex,
       redisHealth,
       queue,
       waitUntilFinished,
@@ -793,5 +803,179 @@ describe('MalAdapter.searchByBarcode (pivot ISBN → BnF → MAL)', () => {
       limit: 50,
     });
     expect(res.items[0].description).toBe('Résumé en français depuis la BnF.');
+  });
+});
+
+describe('MalAdapter.searchByBarcode (chemin nominal MangaDex, MAL en repli)', () => {
+  const NOTICE = {
+    isbn: '9782811623258',
+    ark: 'http://catalogue.bnf.fr/ark:/12148/cb44459249t',
+    titleFr: "L'attaque des titans",
+    volume: '1',
+    edition: null,
+    publisherFr: 'Pika édition',
+    seriesTitle: "L'attaque des titans",
+    originalTitle: 'Shingeki no kyojin',
+    originalTitleSource: '454$t' as const,
+    sourceVolumeRange: null,
+    noteFr: null,
+    authors: [{ surname: 'Isayama', given: 'Hajime', full: 'Hajime Isayama' }],
+    publicationDate: 'DL 2015',
+    ongoing: false,
+  };
+
+  function makeIdentity(
+    over: Partial<MangaDexIdentity> = {},
+  ): MangaDexIdentity {
+    return {
+      mangaId: 'md-uuid-1',
+      title: "L'Attaque des Titans",
+      titleFr: "L'Attaque des Titans",
+      titleRomaji: 'Shingeki no Kyojin',
+      descriptionFr: 'Synopsis en français depuis MangaDex.',
+      descriptionEn: 'English synopsis from MangaDex.',
+      malId: '23390',
+      anilistId: '53390',
+      status: 'completed',
+      year: 2009,
+      lastVolume: '34',
+      contentRating: 'safe',
+      genres: ['Action', 'Drama'],
+      authors: ['Hajime Isayama'],
+      coverUrl:
+        'https://uploads.mangadex.org/covers/md-uuid-1/cover.jpg.512.jpg',
+      rating: 8.4,
+      volumes: {},
+      confidence: 0.95,
+      matchedBy: 'title+author',
+      ...over,
+    };
+  }
+
+  it('identifie via MangaDex (chemin nominal) : item source=mangadex, mal_id en metadata, AUCUN appel MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
+    deps.mangaDex.identifySeries.mockResolvedValue(makeIdentity());
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+
+    // MangaDex interrogé avec le titre romaji (454$t) + auteurs BnF (désambiguïsation).
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledWith(
+      'Shingeki no kyojin',
+      NOTICE.authors,
+    );
+    // Chemin nominal : MAL n'est PAS appelé (le mal_id est porté, pas re-résolu).
+    expect(deps.queue.add).not.toHaveBeenCalled();
+
+    expect(res.items).toHaveLength(1);
+    const item = res.items[0];
+    expect(item.source).toBe('mangadex');
+    expect(item.sourceId).toBe('md-uuid-1');
+    expect(item.coverUrl).toBe(
+      'https://uploads.mangadex.org/covers/md-uuid-1/cover.jpg.512.jpg',
+    );
+    // Synopsis FR MangaDex prioritaire (décisif public FR).
+    expect(item.description).toBe('Synopsis en français depuis MangaDex.');
+    const meta = item.metadata as Record<string, any>;
+    expect(meta.pivot).toMatchObject({
+      resolutionPath: 'bnf+mangadex',
+      malId: '23390',
+      anilistId: '53390',
+      mangaId: 'md-uuid-1',
+      authorMatched: true,
+    });
+    expect(meta.num_volumes).toBe(34);
+    expect(meta.status).toBe('completed');
+    expect(meta.genres).toEqual(['Action', 'Drama']);
+    expect(meta.scannedTome).toMatchObject({
+      isbn: '9782811623258',
+      seriesTitleFr: "L'attaque des titans",
+      volume: '1',
+    });
+  });
+
+  it('resolutionPath bnf+mangadex-fr quand la requête vient du titre FR (pas de 454$t)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: {
+        ...NOTICE,
+        titleFr: 'Black torch',
+        originalTitle: null,
+        originalTitleSource: null,
+      },
+    });
+    deps.mangaDex.identifySeries.mockResolvedValue(
+      makeIdentity({ matchedBy: 'title', malId: '113399' }),
+    );
+
+    const res = await svc.searchByBarcode('9791032701881', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledWith(
+      'Black torch',
+      expect.any(Array),
+    );
+    expect(deps.queue.add).not.toHaveBeenCalled();
+    const meta = res.items[0].metadata as Record<string, any>;
+    expect(meta.pivot).toMatchObject({
+      resolutionPath: 'bnf+mangadex-fr',
+      malId: '113399',
+      authorMatched: false,
+    });
+  });
+
+  it('description : repli note BnF (330$a) puis synopsis EN quand pas de synopsis FR MangaDex', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: true,
+      notice: { ...NOTICE, noteFr: 'Note BnF FR.' },
+    });
+    deps.mangaDex.identifySeries.mockResolvedValue(
+      makeIdentity({ descriptionFr: null }),
+    );
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+    // Pas de synopsis FR MangaDex → note BnF FR prioritaire sur le synopsis EN.
+    expect(res.items[0].description).toBe('Note BnF FR.');
+  });
+
+  it('MangaDex n’identifie pas (null) → repli MAL (item source=mal)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({ ok: true, notice: NOTICE });
+    deps.mangaDex.identifySeries.mockResolvedValue(null);
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([
+        {
+          id: 23390,
+          title: 'Shingeki no Kyojin',
+          media_type: 'manga',
+          authors: [
+            {
+              node: { first_name: 'Hajime', last_name: 'Isayama' },
+              role: 'Story & Art',
+            },
+          ],
+        },
+      ]),
+    );
+
+    const res = await svc.searchByBarcode('9782811623258', {
+      userId: USER,
+      limit: 50,
+    });
+
+    // Repli MAL : la file MAL est bien sollicitée.
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
+    expect(res.items[0].source).toBe('mal');
+    expect((res.items[0].metadata as any).pivot.resolutionPath).toBe('bnf+mal');
   });
 });

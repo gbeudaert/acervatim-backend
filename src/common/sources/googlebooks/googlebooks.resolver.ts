@@ -13,14 +13,26 @@ import {
 const BASE_URL = 'https://www.googleapis.com/books/v1/volumes';
 
 /**
+ * Tentatives HTTP du **repli `intitle:`** (requête décisive pour les ISBN papier FR). Google renvoie
+ * des 503 INTERMITTENTS à taux élevé sur `/volumes` (mesuré ~50-60 %, l'appel suivant est souvent
+ * 200) : un retry court (backoff HttpClientService 250/750/2250 ms) les absorbe, là où `maxAttempts:1`
+ * les laissait tuer la résolution. La requête `isbn:`, elle, reste à 1 tentative (son échec retombe
+ * désormais sur ce repli) ; les vagues 503 *soutenues* restent gérées par le backoff long job-level.
+ */
+const FALLBACK_QUERY_ATTEMPTS = 3;
+
+/**
  * Résolution **réseau** d'une jaquette Google Books par ISBN — sans cache ni throttle : ces
  * responsabilités sont portées, respectivement, par {@link GoogleBooksCoverService} (cache +
  * enqueue) et le limiter BullMQ du {@link GoogleBooksProcessor}. Ce resolver ne fait QUE l'appel
  * HTTP et le choix du bon volume.
  *
- * **Ne rattrape pas les erreurs** : un échec HTTP (réseau / 4xx / 5xx après retries) est propagé.
- * C'est voulu — le worker distingue ainsi un 2xx (mis en cache, même sans image = absence
- * légitime) d'un échec transitoire (jamais mis en cache, re-tenté au prochain scan).
+ * **Gestion d'erreur** : l'échec de la requête `isbn:` (best-effort) NE propage PAS tant qu'un repli
+ * `intitle:` est possible (hint BnF présent) — les ISBN papier FR (Ki-oon…) n'ont de toute façon pas
+ * de jaquette sur `isbn:`, et Google y renvoie des 503 intermittents ; laisser ce 503 avorter la
+ * résolution privait ces séries de jaquette pendant des jours (Black Torch, SNK colossale). Un échec
+ * du repli — ou de `isbn:` quand aucun repli n'est possible — est propagé : le worker distingue ainsi
+ * un 2xx (mis en cache, même sans image = absence légitime) d'un échec transitoire (non caché, re-tenté).
  */
 @Injectable()
 export class GoogleBooksResolver {
@@ -43,10 +55,23 @@ export class GoogleBooksResolver {
     hint?: CoverHint | null,
   ): Promise<CoverResult> {
     const norm = normalizeIsbn(isbn);
-    if (!norm) return { coverUrl: null, description: null };
+    // ISBN invalide/trop court : aucune jaquette possible → absence définitive (pas un échec réseau).
+    if (!norm) return { coverUrl: null, description: null, status: 'absent' };
 
-    let chosen = await this.fetchVolumeByIsbn(norm);
-    if (!coverOf(chosen) && hint?.title && hint.volume != null) {
+    const canFallback = hint?.title != null && hint.volume != null;
+
+    // La requête `isbn:` est un raccourci best-effort. Son échec (503 intermittent, réseau) ne doit
+    // PAS court-circuiter le repli `intitle:` tant que celui-ci est possible — sinon les ISBN papier
+    // FR, qui ne résolvent QUE par titre, ne récupèrent jamais de jaquette. Sans repli possible, on
+    // propage (503 transitoire → non caché, re-tenté).
+    let chosen: GoogleBooksVolume | undefined = undefined;
+    try {
+      chosen = await this.fetchVolumeByIsbn(norm);
+    } catch (err) {
+      if (!canFallback) throw err;
+    }
+
+    if (!coverOf(chosen) && hint?.title != null && hint.volume != null) {
       chosen =
         (await this.fetchVolumeByTitle(
           hint.title,
@@ -55,7 +80,15 @@ export class GoogleBooksResolver {
         )) ?? chosen;
     }
 
-    return { coverUrl: coverOf(chosen), description: descriptionOf(chosen) };
+    // Ici la requête a abouti (2xx) : une URL → `found`, sinon Google n'a pas la jaquette → `absent`
+    // (définitif). Un échec réseau/503 n'arrive JAMAIS ici — il a été propagé plus haut (→ le worker
+    // le classera `unresolved`).
+    const coverUrl = coverOf(chosen);
+    return {
+      coverUrl,
+      description: descriptionOf(chosen),
+      status: coverUrl ? 'found' : 'absent',
+    };
   }
 
   /** `q=isbn:<isbn>` — volume de la notice correspondant exactement à l'ISBN, ou undefined. */
@@ -82,6 +115,7 @@ export class GoogleBooksResolver {
     const items = await this.queryVolumes(
       `intitle:${seriesTitle} ${token}`,
       40,
+      FALLBACK_QUERY_ATTEMPTS,
     );
     const wantSeries = normalizeTitle(seriesTitle);
     const wantEdition = editionKeyword(edition);
@@ -91,13 +125,23 @@ export class GoogleBooksResolver {
       if (editionOf(item, wantSeries) !== (wantEdition ?? '')) continue;
       return item;
     }
+    // Repli exécuté mais aucune notice illustrée ne satisfait tome+édition : Google n'a pas la
+    // jaquette (trou de données), à distinguer d'un 503. On le trace pour l'analyse en prod.
+    this.logger.log(
+      `gbooks: intitle no-match title="${seriesTitle}" vol=${volume} edition="${edition ?? '-'}" items=${items.length}`,
+    );
     return undefined;
   }
 
-  /** Appel Google Books commun (clé API + country=FR), renvoie les volumes de la réponse. */
+  /**
+   * Appel Google Books commun (clé API + country=FR), renvoie les volumes de la réponse.
+   * `maxAttempts` : 1 par défaut (requête `isbn:`, dont l'échec retombe désormais sur le repli) ;
+   * {@link FALLBACK_QUERY_ATTEMPTS} pour le repli `intitle:` afin d'absorber les 503 intermittents.
+   */
   private async queryVolumes(
     q: string,
     maxResults?: number,
+    maxAttempts = 1,
   ): Promise<GoogleBooksVolume[]> {
     const params = new URLSearchParams({ q, country: 'FR' });
     if (maxResults) params.set('maxResults', String(maxResults));
@@ -111,14 +155,29 @@ export class GoogleBooksResolver {
       );
     }
 
-    // maxAttempts: 1 — le retry est porté par le backoff exponentiel job-level (attempts:5, 15→120 s)
-    // de GoogleBooksCoverService, calibré pour les vagues 503 pluri-minutes de Google. Retenter ici
-    // en ~2 s ne traverse pas la vague et ne fait qu'ajouter du volume à un endpoint déjà throttlé.
-    const res = await this.http.request<GoogleBooksVolumesResponse>(
-      `${BASE_URL}?${params.toString()}`,
-      { method: 'GET', maxAttempts: 1 },
-    );
-    return res.data?.items ?? [];
+    // Deux étages de retry complémentaires : ici en ~0,25-2 s pour les 503 INTERMITTENTS (repli
+    // `intitle:`, maxAttempts>1) ; et le backoff exponentiel job-level (attempts:5, 15→120 s) de
+    // GoogleBooksCoverService pour les vagues 503 *soutenues* pluri-minutes. La requête `isbn:`
+    // reste à 1 tentative (son échec retombe sur le repli), pour ne pas gonfler un endpoint throttlé.
+    // Trace requête + code retour : le HttpClientService masque la query dans ses WARN
+    // (`redactedTarget`) — ce log rend visible CE qui a été demandé (isbn:/intitle: + valeurs) et son
+    // issue (2xx+nb d'items, ou échec/503), pour distinguer 503 d'un trou de données côté Google.
+    try {
+      const res = await this.http.request<GoogleBooksVolumesResponse>(
+        `${BASE_URL}?${params.toString()}`,
+        { method: 'GET', maxAttempts },
+      );
+      const items = res.data?.items ?? [];
+      this.logger.log(
+        `gbooks: query q="${q}" -> ${res.status} items=${items.length}`,
+      );
+      return items;
+    } catch (err) {
+      this.logger.warn(
+        `gbooks: query q="${q}" -> échec ${err instanceof Error ? err.message : 'erreur'}`,
+      );
+      throw err;
+    }
   }
 }
 

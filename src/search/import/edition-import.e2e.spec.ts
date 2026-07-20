@@ -40,7 +40,7 @@ async function waitForDone(
 describe('EditionImport (e2e, Redis réel)', () => {
   let app: INestApplication;
   let svc: EditionImportService;
-  let search: { editionMapping: jest.Mock };
+  let search: { warmEditionMapping: jest.Mock };
   let queue: Queue;
 
   beforeAll(async () => {
@@ -61,7 +61,7 @@ describe('EditionImport (e2e, Redis réel)', () => {
       providers: [
         EditionImportService,
         EditionImportProcessor,
-        { provide: SearchService, useValue: { editionMapping: jest.fn() } },
+        { provide: SearchService, useValue: { warmEditionMapping: jest.fn() } },
         { provide: RedisHealthService, useValue: { isAvailable: () => true } },
       ],
     }).compile();
@@ -81,11 +81,11 @@ describe('EditionImport (e2e, Redis réel)', () => {
   });
 
   beforeEach(() => {
-    search.editionMapping.mockReset();
+    search.warmEditionMapping.mockReset();
   });
 
   it('enqueue → worker → progression → done', async () => {
-    search.editionMapping.mockImplementation(
+    search.warmEditionMapping.mockImplementation(
       async (
         _t: string,
         _e: string | undefined,
@@ -103,14 +103,14 @@ describe('EditionImport (e2e, Redis réel)', () => {
     const final = await waitForDone(svc, created.jobId);
     expect(final.state).toBe('done');
     expect(final.progress).toEqual({ phase: 'covers', done: 2, total: 2 });
-    expect(search.editionMapping).toHaveBeenCalledTimes(1);
+    expect(search.warmEditionMapping).toHaveBeenCalledTimes(1);
   });
 
   it('dédup : deux demandes identiques → un seul job exécuté', async () => {
     // Le worker reste bloqué le temps qu'on enfile la 2e demande.
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    search.editionMapping.mockImplementation(
+    search.warmEditionMapping.mockImplementation(
       async (
         _t: string,
         _e: string | undefined,
@@ -128,6 +128,6 @@ describe('EditionImport (e2e, Redis réel)', () => {
 
     release();
     await waitForDone(svc, a.jobId);
-    expect(search.editionMapping).toHaveBeenCalledTimes(1);
+    expect(search.warmEditionMapping).toHaveBeenCalledTimes(1);
   });
 });

@@ -11,6 +11,9 @@ export const EditionMappingQuerySchema = z
     title: z.string().min(1).max(256),
     // Mention d'édition 205 (ex "Éd. colossale"). Absent = édition standard.
     edition: z.string().max(128).optional(),
+    // id MyAnimeList de la série (résolu par le pivot ISBN→MAL). Fiabilise le join MangaDex pour les
+    // jaquettes par tome. Optionnel : sans lui, MangaDex retombe sur un match par titre.
+    malId: z.string().max(32).optional(),
   })
   .strict();
 

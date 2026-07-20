@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { BnfService } from '../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../common/sources/googlebooks/googlebooks.service';
+import { MangaDexCoverService } from '../common/sources/mangadex/mangadex.service';
 import {
   AdapterSearchResult,
   SourceAdapter,
@@ -14,10 +15,17 @@ const bnf = bnfMock as unknown as BnfService;
 
 const gbooksMock = {
   cachedCover: jest.fn(),
+  cachedCoverAndDescription: jest.fn(),
   resolveCover: jest.fn(),
   resolveCoverAndDescription: jest.fn(),
 };
 const gbooks = gbooksMock as unknown as GoogleBooksCoverService;
+
+const mangadexMock = {
+  cachedSeriesCovers: jest.fn(),
+  resolveSeriesCovers: jest.fn(),
+};
+const mangadex = mangadexMock as unknown as MangaDexCoverService;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -25,11 +33,28 @@ beforeEach(() => {
   gbooksMock.resolveCoverAndDescription.mockResolvedValue({
     coverUrl: null,
     description: null,
+    status: 'absent',
+  });
+  gbooksMock.cachedCoverAndDescription.mockResolvedValue({
+    coverUrl: null,
+    description: null,
+    status: 'unresolved',
+  });
+  // Par défaut MangaDex ne trouve rien → la résolution retombe sur Google Books (comportement testé).
+  mangadexMock.cachedSeriesCovers.mockResolvedValue({
+    mangaId: null,
+    volumes: {},
+    status: 'unresolved',
+  });
+  mangadexMock.resolveSeriesCovers.mockResolvedValue({
+    mangaId: null,
+    volumes: {},
+    status: 'absent',
   });
 });
 
 function makeService(adapters: SourceAdapter[]): SearchService {
-  return new SearchService(adapters, bnf, gbooks);
+  return new SearchService(adapters, bnf, gbooks, mangadex);
 }
 
 function makeAdapter(
@@ -148,7 +173,7 @@ describe('SearchService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('editionMapping délègue à la BnF et résout jaquette + résumé de chaque tome (isbn + hint)', async () => {
+  it('warmEditionMapping délègue à la BnF et résout jaquette + résumé de chaque tome (isbn + hint)', async () => {
     const mapping = {
       titleFr: "L'attaque des titans",
       edition: 'Éd. colossale',
@@ -176,12 +201,16 @@ describe('SearchService', () => {
     gbooksMock.resolveCoverAndDescription.mockImplementation(
       async (isbn: string) =>
         isbn === '111'
-          ? { coverUrl: 'https://img/1.jpg', description: 'Résumé GB ignoré' }
-          : { coverUrl: null, description: null },
+          ? {
+              coverUrl: 'https://img/1.jpg',
+              description: 'Résumé GB ignoré',
+              status: 'found',
+            }
+          : { coverUrl: null, description: null, status: 'absent' },
     );
     const svc = makeService([]);
 
-    const res = await svc.editionMapping(
+    const res = await svc.warmEditionMapping(
       "L'attaque des titans",
       'Éd. colossale',
     );
@@ -207,6 +236,9 @@ describe('SearchService', () => {
         // 330$a BnF prioritaire : le résumé Google Books est ignoré quand la BnF en a un.
         description: 'Résumé BnF du tome 1',
         coverUrl: 'https://img/1.jpg',
+        coverStatus: 'found',
+        // MangaDex ne matche pas (mock vide) → jaquette servie par Google Books.
+        coverSource: 'google_books',
       },
       {
         editionVolume: 2,
@@ -215,11 +247,14 @@ describe('SearchService', () => {
         sourceVolumeRange: null,
         description: null,
         coverUrl: null,
+        // Tome sans ISBN → absence définitive (rien à interroger).
+        coverStatus: 'absent',
+        coverSource: null,
       },
     ]);
   });
 
-  it('editionMapping: repli sur le résumé Google Books quand la BnF (330$a) est absente', async () => {
+  it('warmEditionMapping: repli sur le résumé Google Books quand la BnF (330$a) est absente', async () => {
     bnfMock.enumerateEdition.mockResolvedValue({
       titleFr: 'X',
       edition: null,
@@ -242,7 +277,7 @@ describe('SearchService', () => {
     });
     const svc = makeService([]);
 
-    const res = await svc.editionMapping('X');
+    const res = await svc.warmEditionMapping('X');
 
     expect(res.tomes[0].description).toBe('Résumé Google Books');
   });
@@ -252,6 +287,40 @@ describe('SearchService', () => {
     const svc = makeService([]);
     await svc.editionMapping('Naruto');
     expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null);
+  });
+
+  it('editionMapping (endpoint HTTP) est cache-only : lit le cache, ne touche jamais au réseau', async () => {
+    bnfMock.enumerateEdition.mockResolvedValue({
+      titleFr: 'X',
+      edition: null,
+      tomeCount: 1,
+      tomes: [
+        {
+          editionVolume: 1,
+          isbn: '111',
+          titleFr: 'T.1',
+          sourceVolumeRange: null,
+          description: null,
+        },
+      ],
+      recordsScanned: 1,
+      ongoing: false,
+    });
+    gbooksMock.cachedCoverAndDescription.mockResolvedValue({
+      coverUrl: 'https://img/cache.jpg',
+      description: 'Résumé caché',
+      status: 'found',
+    });
+    const svc = makeService([]);
+
+    const res = await svc.editionMapping('X');
+
+    // Sert la jaquette du cache et n'enfile JAMAIS de résolution réseau (anti-timeout client).
+    expect(gbooksMock.cachedCoverAndDescription).toHaveBeenCalledWith('111');
+    expect(gbooksMock.resolveCoverAndDescription).not.toHaveBeenCalled();
+    expect(res.tomes[0].coverUrl).toBe('https://img/cache.jpg');
+    expect(res.tomes[0].description).toBe('Résumé caché');
+    expect(res.tomes[0].coverStatus).toBe('found');
   });
 
   it('resolveCover délègue à GoogleBooksCoverService (sans hint)', async () => {

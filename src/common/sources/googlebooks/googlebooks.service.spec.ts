@@ -40,6 +40,8 @@ describe('GoogleBooksCoverService (producteur)', () => {
       expect(await svc.resolveCoverAndDescription('9782505011943')).toEqual({
         coverUrl: 'https://c.jpg',
         description: 'cached',
+        // Entrée de cache sans `status` (pré-0.6.4) → ré-inféré `found` (url présente).
+        status: 'found',
       });
       expect(queue.add).not.toHaveBeenCalled();
     });
@@ -49,6 +51,7 @@ describe('GoogleBooksCoverService (producteur)', () => {
       waitUntilFinished.mockResolvedValue({
         coverUrl: 'https://img/c.jpg',
         description: 'Résumé',
+        status: 'found',
       });
 
       const res = await svc.resolveCoverAndDescription('978-2-505-01194-3', {
@@ -60,6 +63,7 @@ describe('GoogleBooksCoverService (producteur)', () => {
       expect(res).toEqual({
         coverUrl: 'https://img/c.jpg',
         description: 'Résumé',
+        status: 'found',
       });
       expect(queue.add).toHaveBeenCalledWith(
         GBOOKS_COVER_JOB,
@@ -71,40 +75,44 @@ describe('GoogleBooksCoverService (producteur)', () => {
       );
     });
 
-    it('ISBN trop court → EMPTY sans cache ni enqueue', async () => {
+    it('ISBN trop court → absent sans cache ni enqueue', async () => {
       const { svc, cache, queue } = makeService();
       expect(await svc.resolveCoverAndDescription('123')).toEqual({
         coverUrl: null,
         description: null,
+        status: 'absent',
       });
       expect(cache.get).not.toHaveBeenCalled();
       expect(queue.add).not.toHaveBeenCalled();
     });
 
-    it('best-effort : un échec d’attente (Redis down / worker en échec) → null, pas d’exception', async () => {
+    it('best-effort : un échec d’attente (Redis down / worker en échec) → unresolved, pas d’exception', async () => {
       const { svc, waitUntilFinished } = makeService();
       waitUntilFinished.mockRejectedValue(new Error('redis down'));
       expect(await svc.resolveCoverAndDescription('9782505011943')).toEqual({
         coverUrl: null,
         description: null,
+        status: 'unresolved',
       });
     });
 
-    it('best-effort : un échec d’enqueue → null, pas d’exception', async () => {
+    it('best-effort : un échec d’enqueue → unresolved, pas d’exception', async () => {
       const { svc, queue } = makeService();
       queue.add.mockRejectedValue(new Error('redis down'));
       expect(await svc.resolveCoverAndDescription('9782505011943')).toEqual({
         coverUrl: null,
         description: null,
+        status: 'unresolved',
       });
     });
 
-    it('circuit-breaker : Redis indisponible → null immédiat, aucun enqueue', async () => {
+    it('circuit-breaker : Redis indisponible → unresolved immédiat, aucun enqueue', async () => {
       const { svc, queue, redisHealth } = makeService();
       redisHealth.isAvailable.mockReturnValue(false);
       expect(await svc.resolveCoverAndDescription('9782505011943')).toEqual({
         coverUrl: null,
         description: null,
+        status: 'unresolved',
       });
       expect(queue.add).not.toHaveBeenCalled();
     });
@@ -132,6 +140,32 @@ describe('GoogleBooksCoverService (producteur)', () => {
     it('renvoie null sur miss de cache', async () => {
       const { svc } = makeService();
       expect(await svc.cachedCover('9782505011943')).toBeNull();
+    });
+  });
+
+  describe('cachedCoverAndDescription', () => {
+    it('lit jaquette + résumé du cache sans jamais enfiler de job', async () => {
+      const { svc, queue, store } = makeService();
+      store.set('gbooks:cover:9782505011943', {
+        url: 'https://c.jpg',
+        description: 'cached',
+      });
+      expect(await svc.cachedCoverAndDescription('978-2-505-01194-3')).toEqual({
+        coverUrl: 'https://c.jpg',
+        description: 'cached',
+        status: 'found',
+      });
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+
+    it('miss de cache → unresolved (pas encore résolu, jamais de réseau)', async () => {
+      const { svc, queue } = makeService();
+      expect(await svc.cachedCoverAndDescription('9782505011943')).toEqual({
+        coverUrl: null,
+        description: null,
+        status: 'unresolved',
+      });
+      expect(queue.add).not.toHaveBeenCalled();
     });
   });
 });

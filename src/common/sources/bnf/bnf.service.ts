@@ -36,7 +36,13 @@ const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des
 // Une notice par tome, mais le titre matche aussi le bruit (standard + collector +
 // spin-offs + guides + rééditions) : un titre populaire dépasse largement 100 notices.
 const EDITION_PAGE_SIZE = 100; // par requête SRU.
-const EDITION_MAX_RECORDS = 400; // plafond cumulé sur toutes les pages (garde-fou BnF).
+// Plafond cumulé sur toutes les pages (garde-fou BnF contre un titre pathologique).
+// La pagination s'arrête de toute façon dès `all.length >= total` : une petite série
+// ne paie pas ce plafond, seules les grosses en profitent. 400 tronquait des séries
+// courantes — Dragon Ball remonte 536 notices (toutes éditions + spin-offs + guides),
+// dont des tomes standard au-delà de la 400ᵉ étaient silencieusement perdus. 1000 =
+// 10 pages max, priorité background, cachées 7 jours.
+const EDITION_MAX_RECORDS = 1000;
 
 // Plafond d'attente d'un fetch SRU (via la file `bnf`) avant d'abandonner (best-effort). Le SRU
 // peut être lent ; on laisse de la marge, l'appelant gère l'échec (bnf_unavailable).

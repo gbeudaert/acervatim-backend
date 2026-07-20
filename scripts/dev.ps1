@@ -56,6 +56,9 @@ Scripts :
   test-discogs-consumer    Verifie le repli Discogs (consumer-only vs personal token : rate-limit + images) (T8)
   study-covers <isbns...>  Etudie l'appariement des jaquettes (BnF + Google Books) pour un/des ISBN
                            ex: ./scripts/dev.ps1 study-covers 9791032706343 9782811635923 [--raw]
+  scan-resolve [args...]   Resout un lot d'ISBN comme des scans (pivot + tomes + jaquettes/resumes),
+                           tous en parallele (N users premium simules) -> JSON found/not-found
+                           ex: ./scripts/dev.ps1 scan-resolve [test/fixtures/scanned-isbns.txt] [--out r.json]
 
 Passe-plats (exécutés dans app) :
   npm <args...>      ex: ./scripts/dev.ps1 npm install zod
@@ -123,6 +126,7 @@ switch ($Command) {
     'test-mal-bearer' { Invoke-Compose exec app npx ts-node --transpile-only scripts/test-mal-bearer.ts @Rest }
     'test-discogs-consumer' { Invoke-Compose exec app npx ts-node --transpile-only scripts/test-discogs-consumer.ts @Rest }
     'study-covers'   { Invoke-Compose exec app npx ts-node --transpile-only scripts/study-covers.ts @Rest }
+    'scan-resolve'   { Invoke-Compose exec app npx ts-node --transpile-only scripts/scan-resolve.ts @Rest }
     'npm'            { Invoke-Compose exec app npm @Rest }
     'npx'            { Invoke-Compose exec app npx @Rest }
     'exec'           { Invoke-Compose exec app @Rest }
