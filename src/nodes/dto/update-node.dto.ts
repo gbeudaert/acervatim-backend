@@ -1,5 +1,6 @@
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
+import { nodeUserDataShape } from './node-user-data.schema';
 
 const UNIFIED_DATA_MAX_BYTES = 32_000;
 
@@ -17,9 +18,9 @@ export const UpdateNodeSchema = z
       UNIFIED_DATA_MAX_BYTES,
       'unifiedData',
     ).optional(),
-    // userData : note + commentaire.
-    note: z.number().int().min(0).max(10).nullable().optional(),
-    comment: z.string().max(4000).nullable().optional(),
+    // userData du nœud, à plat dans le corps du PATCH (cf. node-user-data.schema.ts).
+    note: nodeUserDataShape.note.optional(),
+    comment: nodeUserDataShape.comment.optional(),
     // isWishlist=false sur un nœud vide → purge (204).
     isWishlist: z.boolean().optional(),
   })

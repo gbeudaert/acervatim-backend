@@ -435,6 +435,168 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
     }
   });
 
+  // S1bis — le serveur doit être un miroir intégral : ce qui entre ressort à l'identique.
+  it('round-trip vinyl : un item avec TOUS les champs se relit sans perte', async () => {
+    const sub = `e2e-roundtrip-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'miroir');
+      const unifiedData = {
+        title: 'Kind of Blue',
+        creators: ['Miles Davis', 'John Coltrane'],
+        genre: ['Jazz', 'Modal'],
+        label: 'Columbia',
+        format: 'LP',
+        recordingSpeed: 'RPM_33',
+        country: 'US',
+        releaseDate: '1959-08-17',
+        coverUrl: 'https://example.test/kob.jpg',
+      };
+      const userData = {
+        rating: 5,
+        purchasePrice: 34.9,
+        lastPlayedAt: '2026-08-01T20:30:00.000Z',
+        note: 'Pressage original, pochette usée',
+        status: 'OWNED',
+      };
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          unifiedData,
+          userData,
+          sources: [
+            { provider: 'barcode', externalId: '0888072024557' },
+            { provider: 'discogs', externalId: '1234567' },
+          ],
+        })
+        .expect(201);
+      const itemId = created.body.id as string;
+
+      const reread = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      // `type` est ajouté par le profil ; tout le reste doit revenir tel quel.
+      expect(reread.body.unifiedData).toEqual({
+        type: 'vinyl',
+        ...unifiedData,
+      });
+      expect(reread.body.userData).toEqual(userData);
+      // Le code-barres vit dans sources[], sa seule source de vérité (S1bis).
+      expect(reread.body.sources).toEqual([
+        { provider: 'barcode', externalId: '0888072024557', fetchedAt: null },
+        { provider: 'discogs', externalId: '1234567', fetchedAt: null },
+      ]);
+
+      // Un PATCH d'un seul champ curé ne doit rien emporter d'autre.
+      await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ unifiedData: { ...unifiedData, label: 'Columbia (reissue)' } })
+        .expect(200);
+      const after = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(after.body.unifiedData).toEqual({
+        type: 'vinyl',
+        ...unifiedData,
+        label: 'Columbia (reissue)',
+      });
+      expect(after.body.userData).toEqual(userData);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('releaseDate : un push qui ne connaît que l’année ne dégrade pas une date précise', async () => {
+    const sub = `e2e-releasedate-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'dates');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          unifiedData: { title: 'Kind of Blue', releaseDate: '1959-08-17' },
+        })
+        .expect(201);
+      const itemId = created.body.id as string;
+
+      // L'app repousse "%04d-01-01" : la date précise est conservée.
+      const patched = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          unifiedData: { title: 'Kind of Blue', releaseDate: '1959-01-01' },
+        })
+        .expect(200);
+      expect(patched.body.unifiedData.releaseDate).toBe('1959-08-17');
+
+      // Changer d'année reste un vrai changement : il passe.
+      const moved = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          unifiedData: { title: 'Kind of Blue', releaseDate: '1960-01-01' },
+        })
+        .expect(200);
+      expect(moved.body.unifiedData.releaseDate).toBe('1960-01-01');
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('round-trip nœud série : note/comment se relisent, bornes du schéma appliquées', async () => {
+    const sub = `e2e-node-roundtrip-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'manga', 'séries');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/nodes`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ level: 'serie', source: { provider: 'mal', externalId: '31' } })
+        .expect(201);
+      const nodeId = created.body.id as string;
+
+      await request(app.getHttpServer())
+        .patch(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ note: 9, comment: 'À relire' })
+        .expect(200);
+      const reread = await request(app.getHttpServer())
+        .get(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(reread.body.userData).toEqual({ note: 9, comment: 'À relire' });
+      // Les champs curés de la série survivent au PATCH userData.
+      expect(reread.body).toMatchObject({ title: 'Serie 31', totalCount: 108 });
+
+      // Un PATCH du seul commentaire ne doit pas effacer la note (merge partiel).
+      await request(app.getHttpServer())
+        .patch(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ comment: 'Relu' })
+        .expect(200);
+      const merged = await request(app.getHttpServer())
+        .get(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(merged.body.userData).toEqual({ note: 9, comment: 'Relu' });
+
+      // Bornes du schéma (note 0..10) : 400 Problem Details au-delà.
+      const bad = await request(app.getHttpServer())
+        .patch(`/v1/nodes/${nodeId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ note: 11 });
+      expect(bad.status).toBe(400);
+      expect(bad.body.type).toContain('/probs/validation-error');
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
   it('userData.status : PATCH → relecture, merge partiel préservé, valeur inconnue rejetée', async () => {
     const sub = `e2e-status-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);

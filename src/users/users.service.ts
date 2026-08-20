@@ -13,6 +13,7 @@ export interface UserExport {
   data: {
     user: { id: string; createdAt: Date; updatedAt: Date };
     collections: unknown[];
+    collectionNodes: unknown[];
     items: unknown[];
     oauthCredentials: unknown[];
     subscription: unknown | null;
@@ -54,6 +55,7 @@ export class UsersService {
     const [
       user,
       collections,
+      collectionNodes,
       items,
       oauthCredentials,
       subscription,
@@ -66,6 +68,10 @@ export class UsersService {
         select: { id: true, createdAt: true, updatedAt: true },
       }),
       this.prisma.collection.findMany({ where: { userId } }),
+      // Les nœuds (séries) portent leur propre unifiedData/userData/sources : sans eux
+      // l'export amputerait la collection de tout le niveau série (note, commentaire,
+      // isWishlist, synopsis curé).
+      this.prisma.collectionNode.findMany({ where: { userId } }),
       this.prisma.item.findMany({ where: { userId } }),
       this.prisma.oauthCredential.findMany({ where: { userId } }),
       this.prisma.subscription.findUnique({ where: { userId } }),
@@ -87,6 +93,7 @@ export class UsersService {
       data: {
         user,
         collections,
+        collectionNodes,
         items,
         oauthCredentials,
         subscription,

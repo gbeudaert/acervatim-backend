@@ -67,6 +67,17 @@ export interface CollectionTypeProfile {
   toListProjection(row: ItemProjectionRow): LightItem;
   /** Niveaux de hiérarchie ; `[]` = type plat. */
   hierarchy: HierarchyLevel[];
+  /**
+   * Dernier mot sur le `unifiedData` d'un PATCH, au vu de celui déjà stocké.
+   *
+   * `unifiedData` est **remplacé en bloc** : un client qui modélise un champ moins finement que le
+   * serveur le dégrade à chaque push. Ce point d'extension laisse un profil refuser une telle
+   * régression, champ par champ. Absent = remplacement pur (comportement par défaut).
+   */
+  reconcileOnUpdate?(
+    incoming: Record<string, unknown>,
+    stored: Record<string, unknown>,
+  ): Record<string, unknown>;
 }
 
 /** `true` si le type matérialise des nœuds (série, set…). */

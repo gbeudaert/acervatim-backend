@@ -359,10 +359,18 @@ export class ItemsService {
     }
     const data: Prisma.ItemUpdateInput = {};
     if (dto.unifiedData !== undefined) {
-      // `unifiedData` est remplacé en bloc (re-validé par le profil du type).
-      data.unifiedData = this.validateUnified(
-        item.collection.type.code,
-        dto.unifiedData,
+      // `unifiedData` est remplacé en bloc (re-validé par le profil du type), sauf ce que le
+      // profil décide de préserver face à l'existant (cf. `reconcileOnUpdate`).
+      const typeCode = item.collection.type.code;
+      const validated = this.validateUnified(typeCode, dto.unifiedData);
+      const profile = getProfile(typeCode);
+      data.unifiedData = (
+        profile.reconcileOnUpdate
+          ? profile.reconcileOnUpdate(
+              validated,
+              (item.unifiedData ?? {}) as JsonRecord,
+            )
+          : validated
       ) as Prisma.InputJsonValue;
     }
     if (dto.userData !== undefined) {

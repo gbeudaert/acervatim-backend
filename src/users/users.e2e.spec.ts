@@ -97,6 +97,8 @@ describe('Users (e2e) — /v1/me, /v1/me/export, /v1/me delete', () => {
       expect(payload.schemaVersion).toBe(1);
       expect(payload.data.user.id).toBe(userId);
       expect(Array.isArray(payload.data.collections)).toBe(true);
+      // Les nœuds (séries) font partie du miroir : sans eux l'export RGPD est amputé (S1bis).
+      expect(Array.isArray(payload.data.collectionNodes)).toBe(true);
       expect(Array.isArray(payload.data.items)).toBe(true);
       expect(Array.isArray(payload.data.oauthCredentials)).toBe(true);
       expect(Array.isArray(payload.data.invitationRedemptions)).toBe(true);
@@ -136,6 +138,81 @@ describe('Users (e2e) — /v1/me, /v1/me/export, /v1/me delete', () => {
       await prisma.user
         .deleteMany({ where: { id: userId } })
         .catch(() => undefined);
+    }
+  });
+
+  // S1bis — l'export RGPD est le test le plus large du « miroir complet » : tout ce que le
+  // serveur détient doit en sortir, y compris le niveau série.
+  it('GET /v1/me/export : collections, nœuds ET items, avec leurs trois blocs JSON', async () => {
+    const sub = `e2e-export-miroir-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await request(app.getHttpServer())
+        .post('/v1/collections')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ typeCode: 'manga', name: 'Mes séries' })
+        .expect(201);
+      const collectionId = coll.body.id as string;
+
+      // Nœud + item écrits directement : ce test porte sur l'export, pas sur l'enrichissement
+      // (créer un nœud par l'API déclencherait un snapshot réseau, stubbé ailleurs).
+      const node = await prisma.collectionNode.create({
+        data: {
+          collectionId,
+          userId,
+          level: 'serie',
+          unifiedData: { title: 'Vinland Saga', totalCount: 27 },
+          userData: { note: 9, comment: 'chef-d’œuvre' },
+          sources: [
+            {
+              provider: 'mal',
+              externalId: '17',
+              rawData: null,
+              fetchedAt: null,
+            },
+          ],
+          isWishlist: false,
+        },
+      });
+      await prisma.item.create({
+        data: {
+          collectionId,
+          userId,
+          nodeId: node.id,
+          volume: 1,
+          unifiedData: { type: 'manga', title: 'Vinland Saga — T.1' },
+          userData: { status: 'WISHLIST', rating: 5 },
+          sources: [],
+        },
+      });
+
+      const exp = await request(app.getHttpServer())
+        .get('/v1/me/export')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      const { data } = JSON.parse(exp.text);
+
+      expect(data.collections).toHaveLength(1);
+      expect(data.collectionNodes).toHaveLength(1);
+      expect(data.collectionNodes[0]).toMatchObject({
+        id: node.id,
+        level: 'serie',
+        isWishlist: false,
+        unifiedData: { title: 'Vinland Saga', totalCount: 27 },
+        userData: { note: 9, comment: 'chef-d’œuvre' },
+      });
+      expect(data.collectionNodes[0].sources).toHaveLength(1);
+      expect(data.items).toHaveLength(1);
+      expect(data.items[0]).toMatchObject({
+        volume: 1,
+        unifiedData: { type: 'manga', title: 'Vinland Saga — T.1' },
+        userData: { status: 'WISHLIST', rating: 5 },
+      });
+    } finally {
+      await prisma.user
+        .deleteMany({ where: { id: userId } })
+        .catch(() => undefined);
+      await prisma.auditLog.deleteMany({ where: { userId } });
     }
   });
 
