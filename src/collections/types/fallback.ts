@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveItemStatus } from '../../items/dto/item-user-data.schema';
 import { CollectionTypeProfile, ItemProjectionRow, LightItem } from './common';
 
 // Profil permissif pour les types non encore modélisés (movie/book/game) :
@@ -11,7 +12,13 @@ export function makeFallbackProfile(code: string): CollectionTypeProfile {
     itemSchema: PassthroughSchema,
     hierarchy: [],
     toListProjection(row: ItemProjectionRow): LightItem {
-      return { id: row.id, ...row.unifiedData };
+      // `status` après le spread : le statut de possession prime sur un éventuel
+      // `status` homonyme laissé passer par le schéma permissif.
+      return {
+        id: row.id,
+        ...row.unifiedData,
+        status: resolveItemStatus(row.userData),
+      };
     },
   };
 }

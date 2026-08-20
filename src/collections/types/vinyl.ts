@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveItemStatus } from '../../items/dto/item-user-data.schema';
 import {
   CollectionTypeProfile,
   ItemProjectionRow,
@@ -47,6 +48,7 @@ export const vinylProfile: CollectionTypeProfile = {
       creators: u.creators ?? [],
       genre: u.genre ?? [],
       releaseDate: u.releaseDate ?? null,
+      status: resolveItemStatus(row.userData),
     };
   },
 };

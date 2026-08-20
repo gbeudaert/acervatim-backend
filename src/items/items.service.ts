@@ -288,6 +288,7 @@ export class ItemsService {
             nodeId: true,
             volume: true,
             unifiedData: true,
+            userData: true,
             node: { select: { unifiedData: true } },
           },
         }),
@@ -308,6 +309,7 @@ export class ItemsService {
     nodeId: string | null;
     volume: number | null;
     unifiedData: Prisma.JsonValue;
+    userData: Prisma.JsonValue;
     node: { unifiedData: Prisma.JsonValue } | null;
   }): ItemProjectionRow {
     return {
@@ -315,6 +317,7 @@ export class ItemsService {
       nodeId: row.nodeId,
       volume: row.volume,
       unifiedData: (row.unifiedData ?? {}) as JsonRecord,
+      userData: (row.userData ?? {}) as JsonRecord,
       node: row.node
         ? { unifiedData: (row.node.unifiedData ?? {}) as JsonRecord }
         : null,

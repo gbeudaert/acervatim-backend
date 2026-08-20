@@ -172,6 +172,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
         creators: ['Larkin'],
         genre: [],
         releaseDate: null,
+        status: 'OWNED', // défaut serveur : userData.status absent
       });
 
       // PATCH unifiedData (curation)
@@ -429,6 +430,62 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
         .expect(200);
       expect(filtered.body.data).toHaveLength(1);
       expect(filtered.body.data[0].id).toBe(withMal.body.id);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('userData.status : PATCH → relecture, merge partiel préservé, valeur inconnue rejetée', async () => {
+    const sub = `e2e-status-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'statuts');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ unifiedData: { title: 'Wanted' } })
+        .expect(201);
+      const itemId = created.body.id as string;
+      // Item créé sans status : relu sans erreur, projeté OWNED.
+      expect(created.body.userData.status).toBeUndefined();
+
+      // PATCH status → relecture
+      await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userData: { status: 'WISHLIST' } })
+        .expect(200);
+      const detail = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(detail.body.userData.status).toBe('WISHLIST');
+
+      // La liste expose le statut (S4 filtrera dessus sans re-fetch)
+      const list = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(list.body.data[0].status).toBe('WISHLIST');
+
+      // PATCH d'un autre champ : le status ne doit pas être effacé (merge partiel)
+      const patched = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userData: { rating: 4 } })
+        .expect(200);
+      expect(patched.body.userData).toMatchObject({
+        status: 'WISHLIST',
+        rating: 4,
+      });
+
+      // Valeur hors enum → 400 Problem Details
+      const bad = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userData: { status: 'FOO' } });
+      expect(bad.status).toBe(400);
+      expect(bad.body.type).toContain('/probs/validation-error');
     } finally {
       await cleanupUser(prisma, userId);
     }

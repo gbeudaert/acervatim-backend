@@ -45,6 +45,8 @@ export interface ItemProjectionRow {
   nodeId: string | null;
   volume: number | null;
   unifiedData: Record<string, unknown>;
+  /** Données perso — la projection n'en expose que le `status` (cf. resolveItemStatus). */
+  userData: Record<string, unknown>;
   node: { unifiedData: Record<string, unknown> } | null;
 }
 

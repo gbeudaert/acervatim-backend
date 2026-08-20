@@ -271,6 +271,7 @@ describe('ItemsService.list', () => {
         nodeId: null,
         volume: null,
         unifiedData: { type: 'vinyl', title: 'A', creators: ['x'] },
+        userData: { status: 'WISHLIST' },
         node: null,
       },
     ]);
@@ -285,7 +286,27 @@ describe('ItemsService.list', () => {
       creators: ['x'],
       genre: [],
       releaseDate: null,
+      status: 'WISHLIST',
     });
+  });
+
+  it('projette status=OWNED pour un item sans userData.status (avant S1)', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.item.findMany.mockResolvedValue([
+      {
+        id: ITEM_ID,
+        nodeId: null,
+        volume: null,
+        unifiedData: { type: 'vinyl', title: 'A' },
+        userData: {},
+        node: null,
+      },
+    ]);
+
+    const { svc } = makeService(prisma);
+    const page = await svc.list(USER_A, COLL_ID, { limit: 50 } as never);
+    expect(page.data[0]).toMatchObject({ status: 'OWNED' });
   });
 
   it('throw NotFound si la collection n’appartient pas au user', async () => {

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveItemStatus } from '../../items/dto/item-user-data.schema';
 import { UnifiedItem } from '../../oauth/providers/types';
 import {
   CollectionTypeProfile,
@@ -107,6 +108,9 @@ export const mangaProfile: CollectionTypeProfile = {
       coverUrl: u.coverUrl ?? null,
       nodeId: row.nodeId,
       serie,
+      // Statut du TOME (possédé/désiré) — sans rapport avec le `status` de la
+      // série (ongoing/finished), qui n'est pas projeté ici.
+      status: resolveItemStatus(row.userData),
     };
   },
 };
