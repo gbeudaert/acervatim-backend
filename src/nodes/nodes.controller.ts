@@ -15,6 +15,9 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CollectionPremiumGuard } from '../premium/collection-premium.guard';
+import { CollectionRef } from '../premium/collection-ref.decorator';
+import { PremiumGuard } from '../premium/premium.guard';
 import { AttachNodeSourceDto } from './dto/attach-source.dto';
 import { CreateNodeDto } from './dto/create-node.dto';
 import { ListNodesQueryDto } from './dto/list-nodes.query';
@@ -29,6 +32,7 @@ export class NodesController {
   constructor(private readonly nodes: NodesService) {}
 
   @Post('collections/:collectionId/nodes')
+  @UseGuards(PremiumGuard)
   async create(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -38,6 +42,8 @@ export class NodesController {
   }
 
   @Get('collections/:collectionId/nodes')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('collection', 'collectionId')
   async list(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -47,6 +53,8 @@ export class NodesController {
   }
 
   @Get('nodes/:id')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('node', 'id')
   async findOne(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -55,6 +63,8 @@ export class NodesController {
   }
 
   @Get('nodes/:id/sources')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('node', 'id')
   async sources(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -63,6 +73,7 @@ export class NodesController {
   }
 
   @Patch('nodes/:id')
+  @UseGuards(PremiumGuard)
   async update(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -79,6 +90,7 @@ export class NodesController {
   }
 
   @Post('nodes/:id/sources')
+  @UseGuards(PremiumGuard)
   async attachSource(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,

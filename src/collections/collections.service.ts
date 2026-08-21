@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { Collection, Prisma } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
-import { QuotaService } from '../common/quota/quota.service';
+import { LimitsService } from '../common/limits/limits.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { HierarchySummaryEntry, summarizeHierarchy } from './types/hierarchy';
 import { getProfile } from './types/registry';
@@ -40,7 +40,7 @@ function escapeLike(term: string): string {
 export class CollectionsService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly quota: QuotaService,
+    private readonly limits: LimitsService,
   ) {}
 
   private toResponse(
@@ -124,7 +124,7 @@ export class CollectionsService {
     userId: string,
     dto: CreateCollectionDto,
   ): Promise<CollectionResponse> {
-    // typeCode → typeId hors-tx : lookup pur en lecture, indépendant du quota.
+    // typeCode → typeId hors-tx : lookup pur en lecture, indépendant du plafond.
     const type = await this.prisma.collectionType.findUnique({
       where: { code: dto.typeCode },
       select: { id: true },
@@ -132,10 +132,10 @@ export class CollectionsService {
     if (!type) {
       throw new BadRequestException(`Unknown collection type: ${dto.typeCode}`);
     }
-    // Quota check + create dans la même tx : réduit la fenêtre TOCTOU
+    // Plafond technique + create dans la même tx : réduit la fenêtre TOCTOU
     // sous concurrence (sans SELECT FOR UPDATE le risque reste, cf. review SEC-004).
     return this.prisma.$transaction(async (tx) => {
-      await this.quota.assertCanCreateCollection(userId, tx);
+      await this.limits.assertCanCreateCollection(userId, tx);
       const collection = await tx.collection.create({
         data: {
           userId,

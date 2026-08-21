@@ -11,7 +11,6 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { QuotaService } from '../common/quota/quota.service';
 import { PremiumService } from '../premium/premium.service';
 import { UsersService } from './users.service';
 
@@ -22,7 +21,6 @@ import { UsersService } from './users.service';
 export class UsersController {
   constructor(
     private readonly users: UsersService,
-    private readonly quota: QuotaService,
     private readonly premium: PremiumService,
   ) {}
 
@@ -33,11 +31,6 @@ export class UsersController {
       this.premium.getStatus(userId),
     ]);
     return { ...me, premium };
-  }
-
-  @Get('quota')
-  async getQuota(@CurrentUserId() userId: string) {
-    return this.quota.getQuotaSummary(userId);
   }
 
   @Get('export')

@@ -21,7 +21,7 @@ import { HttpModule } from './common/http/http.module';
 import { BnfModule } from './common/sources/bnf/bnf.module';
 import { GoogleBooksModule } from './common/sources/googlebooks/googlebooks.module';
 import { MangaDexModule } from './common/sources/mangadex/mangadex.module';
-import { QuotaModule } from './common/quota/quota.module';
+import { LimitsModule } from './common/limits/limits.module';
 import { RedisHealthModule } from './common/redis/redis-health.module';
 import { validateEnv } from './config/env.validation';
 import { InvitationsModule } from './invitations/invitations.module';
@@ -74,7 +74,7 @@ import { UsersModule } from './users/users.module';
     BnfModule,
     GoogleBooksModule,
     MangaDexModule,
-    QuotaModule,
+    LimitsModule,
     AuditLogModule,
     AuthModule,
     PremiumModule,

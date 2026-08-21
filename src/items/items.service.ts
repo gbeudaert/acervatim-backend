@@ -15,7 +15,7 @@ import {
 } from '../collections/types/common';
 import { getProfile } from '../collections/types/registry';
 import { CursorPage, paginate } from '../common/pagination/paginate';
-import { QuotaService } from '../common/quota/quota.service';
+import { LimitsService } from '../common/limits/limits.service';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { UnifiedItem } from '../oauth/providers/types';
 import { PrismaService } from '../prisma/prisma.service';
@@ -47,7 +47,7 @@ export interface CuratedItem {
 export class ItemsService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly quota: QuotaService,
+    private readonly limits: LimitsService,
     private readonly snapshots: SourceSnapshotService,
   ) {}
 
@@ -198,9 +198,9 @@ export class ItemsService {
     }
 
     try {
-      // Quota + create (+ upsert nœud) + increment dans la même tx (cf. SEC-004).
+      // Plafond technique + create (+ upsert nœud) + increment dans la même tx (cf. SEC-004).
       const item = await this.prisma.$transaction(async (tx) => {
-        await this.quota.assertCanCreateItem(userId, tx);
+        await this.limits.assertCanCreateItem(userId, tx);
         let nodeId = existingNodeId;
         if (nodeCreate) {
           const node = await tx.collectionNode.create({

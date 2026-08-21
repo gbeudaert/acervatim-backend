@@ -15,6 +15,9 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CollectionPremiumGuard } from '../premium/collection-premium.guard';
+import { CollectionRef } from '../premium/collection-ref.decorator';
+import { PremiumGuard } from '../premium/premium.guard';
 import { AttachItemSourceDto } from './dto/attach-source.dto';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
@@ -29,6 +32,7 @@ export class ItemsController {
   constructor(private readonly items: ItemsService) {}
 
   @Post('collections/:collectionId/items')
+  @UseGuards(PremiumGuard)
   async create(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -38,6 +42,8 @@ export class ItemsController {
   }
 
   @Get('collections/:collectionId/items')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('collection', 'collectionId')
   async list(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -47,6 +53,8 @@ export class ItemsController {
   }
 
   @Get('items/:id')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('item', 'id')
   async findOne(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -55,6 +63,8 @@ export class ItemsController {
   }
 
   @Get('items/:id/sources')
+  @UseGuards(CollectionPremiumGuard)
+  @CollectionRef('item', 'id')
   async sources(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -63,6 +73,7 @@ export class ItemsController {
   }
 
   @Post('items/:id/sources')
+  @UseGuards(PremiumGuard)
   async attachSource(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -72,6 +83,7 @@ export class ItemsController {
   }
 
   @Patch('items/:id')
+  @UseGuards(PremiumGuard)
   async update(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -81,6 +93,7 @@ export class ItemsController {
   }
 
   @Delete('items/:id')
+  @UseGuards(PremiumGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(
     @CurrentUserId() userId: string,

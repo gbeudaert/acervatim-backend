@@ -147,6 +147,10 @@ describe('Users (e2e) — /v1/me, /v1/me/export, /v1/me delete', () => {
     const sub = `e2e-export-miroir-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
     try {
+      // Depuis S2 la sync est premium-only : sans grant, POST /collections repond 402.
+      await prisma.premiumGrant.create({
+        data: { userId, reason: 'beta_tester', expiresAt: null },
+      });
       const coll = await request(app.getHttpServer())
         .post('/v1/collections')
         .set('Authorization', `Bearer ${token}`)

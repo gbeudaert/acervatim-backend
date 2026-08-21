@@ -1,6 +1,6 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { QuotaService } from '../common/quota/quota.service';
+import { LimitsService } from '../common/limits/limits.service';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateItemDto } from './dto/create-item.dto';
@@ -49,12 +49,11 @@ function makePrismaMock(): PrismaMock {
   return mock;
 }
 
-function makeQuota(): QuotaService {
+function makeLimits(): LimitsService {
   return {
     assertCanCreateCollection: jest.fn(),
     assertCanCreateItem: jest.fn().mockResolvedValue(undefined),
-    getQuotaSummary: jest.fn(),
-  } as unknown as QuotaService;
+  } as unknown as LimitsService;
 }
 
 function makeSnapshots(): SourceSnapshotService {
@@ -66,19 +65,19 @@ function makeSnapshots(): SourceSnapshotService {
 
 function makeService(
   prisma: PrismaMock,
-  quota: QuotaService = makeQuota(),
+  limits: LimitsService = makeLimits(),
   snapshots: SourceSnapshotService = makeSnapshots(),
 ): {
   svc: ItemsService;
-  quota: QuotaService;
+  limits: LimitsService;
   snapshots: SourceSnapshotService;
 } {
   const svc = new ItemsService(
     prisma as unknown as PrismaService,
-    quota,
+    limits,
     snapshots,
   );
-  return { svc, quota, snapshots };
+  return { svc, limits, snapshots };
 }
 
 const USER_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -128,11 +127,11 @@ describe('ItemsService.create', () => {
     prisma.item.create.mockResolvedValue(itemRow());
     prisma.collection.update.mockResolvedValue({});
 
-    const quota = makeQuota();
-    const { svc } = makeService(prisma, quota);
+    const limits = makeLimits();
+    const { svc } = makeService(prisma, limits);
     await svc.create(USER_A, COLL_ID, DTO);
 
-    expect(quota.assertCanCreateItem).toHaveBeenCalledWith(USER_A, prisma);
+    expect(limits.assertCanCreateItem).toHaveBeenCalledWith(USER_A, prisma);
   });
 
   it('crée l’item ET incrémente itemCount dans la même $transaction, renvoie le curé', async () => {

@@ -7,7 +7,6 @@ import { AppModule } from '../app.module';
 import { GoogleIdentityProvider } from '../auth/providers/google.provider';
 import { ProblemDetailsExceptionFilter } from '../common/filters/problem-details.filter';
 import { CorrelationIdInterceptor } from '../common/interceptors/correlation-id.interceptor';
-import { FREE_TIER_LIMITS } from '../common/quota/quota.service';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -74,6 +73,20 @@ async function login(
   };
 }
 
+/**
+ * Depuis S2 la synchronisation est premium-only : sans grant, toutes les routes
+ * `collections`/`items`/`nodes` repondent 402. Les scenarios ci-dessous testent le comportement
+ * metier, pas le gate — ils se donnent donc le premium (le gate a ses tests dedies).
+ */
+async function grantPremium(
+  prisma: PrismaService,
+  userId: string,
+): Promise<void> {
+  await prisma.premiumGrant.create({
+    data: { userId, reason: 'beta_tester', expiresAt: null },
+  });
+}
+
 async function cleanupUser(
   prisma: PrismaService,
   userId: string,
@@ -138,6 +151,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('vinyl (plat) : create → list légère → findOne curé → PATCH → attach source → /sources → delete', async () => {
     const sub = `e2e-vinyl-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
 
     try {
       const coll = await createCollection(token, 'vinyl', 'Mes vinyles');
@@ -230,6 +244,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('vinyl autorise les doublons (pas de contrainte nodeId/volume)', async () => {
     const sub = `e2e-vinyl-dup-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'vinyl', 'dups');
       const body = { unifiedData: { title: 'Same' } };
@@ -251,6 +266,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('manga : tome (node+volume) → 201 ; 2× même (node,volume) → 409 ; hierarchy + drill-down + purge', async () => {
     const sub = `e2e-manga-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
 
     try {
       const coll = await createCollection(token, 'manga', 'Mes mangas');
@@ -345,6 +361,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('manga : ?nodeId interdit n’est pas applicable au vinyl (400) + POST série wishlist conservée', async () => {
     const sub = `e2e-wishlist-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
 
     try {
       // vinyl : ?nodeId → 400
@@ -408,6 +425,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('filtre ?provider[in]= sur sources[] des items', async () => {
     const sub = `e2e-provider-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'vinyl', 'prov');
       const withMal = await request(app.getHttpServer())
@@ -439,6 +457,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('round-trip vinyl : un item avec TOUS les champs se relit sans perte', async () => {
     const sub = `e2e-roundtrip-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'vinyl', 'miroir');
       const unifiedData = {
@@ -513,6 +532,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('releaseDate : un push qui ne connaît que l’année ne dégrade pas une date précise', async () => {
     const sub = `e2e-releasedate-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'vinyl', 'dates');
       const created = await request(app.getHttpServer())
@@ -551,6 +571,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('round-trip nœud série : note/comment se relisent, bornes du schéma appliquées', async () => {
     const sub = `e2e-node-roundtrip-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'manga', 'séries');
       const created = await request(app.getHttpServer())
@@ -600,6 +621,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('userData.status : PATCH → relecture, merge partiel préservé, valeur inconnue rejetée', async () => {
     const sub = `e2e-status-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'vinyl', 'statuts');
       const created = await request(app.getHttpServer())
@@ -658,6 +680,8 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
     const subB = `e2e-iso-B-${randomBytes(8).toString('hex')}`;
     const a = await login(app, fakeGoogle, subA);
     const b = await login(app, fakeGoogle, subB);
+    await grantPremium(prisma, a.userId);
+    await grantPremium(prisma, b.userId);
 
     try {
       const coll = await createCollection(a.token, 'manga', 'A mangas');
@@ -697,6 +721,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
   it('type non implémenté (movie) → POST permissif', async () => {
     const sub = `e2e-movie-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'movie', 'films');
       const created = await request(app.getHttpServer())
@@ -710,25 +735,26 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
     }
   });
 
-  it('quota : nœuds non comptés ; seuls les items comptent dans /me/quota', async () => {
-    const sub = `e2e-quota-nodes-${randomBytes(8).toString('hex')}`;
+  it('un nœud ne compte pas comme un item : itemCount ne bouge qu’au tome', async () => {
+    const sub = `e2e-itemcount-nodes-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
     try {
       const coll = await createCollection(token, 'manga', 'q');
 
-      // POST série (nœud) seul → items.used reste 0
+      // POST série (nœud) seul → itemCount reste 0
       await request(app.getHttpServer())
         .post(`/v1/collections/${coll}/nodes`)
         .set('Authorization', `Bearer ${token}`)
         .send({ level: 'serie', source: { provider: 'mal', externalId: '7' } })
         .expect(201);
-      const q1 = await request(app.getHttpServer())
-        .get('/v1/me/quota')
+      const c1 = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}`)
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(q1.body.items.used).toBe(0);
+      expect(c1.body.itemCount).toBe(0);
 
-      // POST tome → items.used = 1
+      // POST tome → itemCount = 1
       await request(app.getHttpServer())
         .post(`/v1/collections/${coll}/items`)
         .set('Authorization', `Bearer ${token}`)
@@ -738,14 +764,141 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
           unifiedData: {},
         })
         .expect(201);
-      const q2 = await request(app.getHttpServer())
-        .get('/v1/me/quota')
+      const c2 = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}`)
         .set('Authorization', `Bearer ${token}`)
         .expect(200);
-      expect(q2.body.items.used).toBe(1);
-      expect(q2.body.items.max).toBe(FREE_TIER_LIMITS.items);
+      expect(c2.body.itemCount).toBe(1);
     } finally {
       await cleanupUser(prisma, userId);
     }
+  });
+
+  // ---- S2 : la synchronisation est premium-only -----------------------------------------
+
+  describe('gate premium (S2)', () => {
+    it('sans premium : 402 sur toute ecriture ET sur toute lecture de ses propres donnees', async () => {
+      const sub = `e2e-gate-free-${randomBytes(8).toString('hex')}`;
+      const { token, userId } = await login(app, fakeGoogle, sub);
+      try {
+        // Ecriture : POST /collections
+        const created = await request(app.getHttpServer())
+          .post('/v1/collections')
+          .set('Authorization', `Bearer ${token}`)
+          .send({ typeCode: 'vinyl', name: 'refusee' });
+        expect(created.status).toBe(402);
+        expect(created.body.type).toContain('/probs/payment-required');
+        expect(created.headers['content-type']).toContain(
+          'application/problem+json',
+        );
+
+        // Lecture : la liste de ses propres collections
+        const list = await request(app.getHttpServer())
+          .get('/v1/collections')
+          .set('Authorization', `Bearer ${token}`);
+        expect(list.status).toBe(402);
+
+        // Rien n'a ete cree : le refus precede l'ecriture.
+        expect(await prisma.collection.count({ where: { userId } })).toBe(0);
+      } finally {
+        await cleanupUser(prisma, userId);
+      }
+    });
+
+    it('la perte du premium coupe l’acces a des donnees deja synchronisees', async () => {
+      const sub = `e2e-gate-lapse-${randomBytes(8).toString('hex')}`;
+      const { token, userId } = await login(app, fakeGoogle, sub);
+      await grantPremium(prisma, userId);
+      try {
+        const coll = await createCollection(token, 'vinyl', 'avant');
+        const item = await request(app.getHttpServer())
+          .post(`/v1/collections/${coll}/items`)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ unifiedData: { title: 'A' } })
+          .expect(201);
+        const itemId = item.body.id as string;
+
+        // Le premium expire.
+        await prisma.premiumGrant.delete({ where: { userId } });
+
+        // Thunks, pas des requetes deja construites : supertest ouvre un serveur
+        // ephemere par requete, les batir toutes d'avance les fait se fermer entre elles.
+        const calls: (() => request.Test)[] = [
+          () => request(app.getHttpServer()).get(`/v1/collections/${coll}`),
+          () =>
+            request(app.getHttpServer()).get(`/v1/collections/${coll}/items`),
+          () => request(app.getHttpServer()).get(`/v1/items/${itemId}`),
+          () => request(app.getHttpServer()).get(`/v1/items/${itemId}/sources`),
+          () =>
+            request(app.getHttpServer())
+              .patch(`/v1/items/${itemId}`)
+              .send({ unifiedData: { title: 'B' } }),
+          () => request(app.getHttpServer()).delete(`/v1/items/${itemId}`),
+        ];
+        for (const call of calls) {
+          const res = await call().set('Authorization', `Bearer ${token}`);
+          expect(res.status).toBe(402);
+        }
+
+        // Les donnees sont intactes : le gate refuse l'acces, il ne supprime rien.
+        expect(await prisma.item.count({ where: { userId } })).toBe(1);
+      } finally {
+        await cleanupUser(prisma, userId);
+      }
+    });
+
+    it('le gate de lecture regarde le PROPRIETAIRE, pas le requerant (socle S4)', async () => {
+      const subOwner = `e2e-gate-owner-${randomBytes(8).toString('hex')}`;
+      const subOther = `e2e-gate-other-${randomBytes(8).toString('hex')}`;
+      const owner = await login(app, fakeGoogle, subOwner);
+      const other = await login(app, fakeGoogle, subOther);
+      await grantPremium(prisma, owner.userId);
+      try {
+        const coll = await createCollection(owner.token, 'vinyl', 'a moi');
+
+        // Le proprietaire est premium : il lit.
+        await request(app.getHttpServer())
+          .get(`/v1/collections/${coll}`)
+          .set('Authorization', `Bearer ${owner.token}`)
+          .expect(200);
+
+        // Un tiers non-premium : 404, pas 402 — on ne confirme pas l'existence
+        // d'une collection d'autrui (le partage, qui donnera un 200 ici, viendra en S4).
+        await request(app.getHttpServer())
+          .get(`/v1/collections/${coll}`)
+          .set('Authorization', `Bearer ${other.token}`)
+          .expect(404);
+      } finally {
+        await cleanupUser(prisma, owner.userId);
+        await cleanupUser(prisma, other.userId);
+      }
+    });
+
+    it('un identifiant malforme reste un 400, le guard ne le transforme pas en 404', async () => {
+      const sub = `e2e-gate-uuid-${randomBytes(8).toString('hex')}`;
+      const { token, userId } = await login(app, fakeGoogle, sub);
+      await grantPremium(prisma, userId);
+      try {
+        await request(app.getHttpServer())
+          .get('/v1/items/pas-un-uuid')
+          .set('Authorization', `Bearer ${token}`)
+          .expect(400);
+      } finally {
+        await cleanupUser(prisma, userId);
+      }
+    });
+
+    it('GET /v1/me/quota n’existe plus (plafond technique non expose)', async () => {
+      const sub = `e2e-gate-noquota-${randomBytes(8).toString('hex')}`;
+      const { token, userId } = await login(app, fakeGoogle, sub);
+      try {
+        await request(app.getHttpServer())
+          .get('/v1/me/quota')
+          .set('Authorization', `Bearer ${token}`)
+          .expect(404);
+      } finally {
+        await cleanupUser(prisma, userId);
+      }
+    });
   });
 });

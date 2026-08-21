@@ -20,7 +20,7 @@ import { InvitationExhaustedException } from '../../invitations/invitation-exhau
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
 import { SourceTokenRequiredException } from '../../oauth/source-token-required.exception';
 import { PaymentRequiredException } from '../../premium/payment-required.exception';
-import { QuotaExceededException } from '../quota/quota-exceeded.exception';
+import { TechnicalLimitException } from '../limits/technical-limit.exception';
 
 const TYPE_BASE = 'https://api.acervatim/probs';
 
@@ -64,11 +64,11 @@ export function mapException(exception: unknown): Mapped {
       status: 401,
     };
   }
-  if (exception instanceof QuotaExceededException) {
+  if (exception instanceof TechnicalLimitException) {
     return {
-      type: `${TYPE_BASE}/quota-exceeded`,
-      title: 'Quota exceeded',
-      status: 402,
+      type: `${TYPE_BASE}/technical-limit`,
+      title: 'Technical limit reached',
+      status: 409,
     };
   }
   if (exception instanceof PaymentRequiredException) {
