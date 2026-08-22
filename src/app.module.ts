@@ -32,6 +32,7 @@ import { OauthModule } from './oauth/oauth.module';
 import { PremiumModule } from './premium/premium.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { SearchModule } from './search/search.module';
+import { SharingModule } from './sharing/sharing.module';
 import { SourcesModule } from './sources/sources.module';
 import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { UsersModule } from './users/users.module';
@@ -85,6 +86,7 @@ import { UsersModule } from './users/users.module';
     NodesModule,
     OauthModule,
     SearchModule,
+    SharingModule,
     SourcesModule,
     SubscriptionsModule,
     QueueMetricsModule,

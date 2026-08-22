@@ -18,6 +18,10 @@ export const EnvSchema = z.object({
   SUB_HASH_PEPPER: z.string().min(32),
   ENCRYPTION_KEY: base64Length(32),
   INVITE_CODE_PEPPER: z.string().min(32),
+  // Pepper dédié aux codes de partage de collection. Distinct d'INVITE_CODE_PEPPER : ces codes
+  // sont générés par n'importe quel utilisateur (pas seulement l'admin), donc surface d'exposition
+  // et cadence de rotation différentes.
+  SHARE_CODE_PEPPER: z.string().min(32),
   ADMIN_API_TOKEN: z.string().min(16),
   JWT_PRIVATE_KEY: z.string().min(1),
   JWT_PUBLIC_KEY: z.string().min(1),

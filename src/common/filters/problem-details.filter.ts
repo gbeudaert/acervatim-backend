@@ -20,6 +20,7 @@ import { InvitationExhaustedException } from '../../invitations/invitation-exhau
 import { InvitationExpiredException } from '../../invitations/invitation-expired.exception';
 import { SourceTokenRequiredException } from '../../oauth/source-token-required.exception';
 import { PaymentRequiredException } from '../../premium/payment-required.exception';
+import { ShareCodeInvalidException } from '../../sharing/share-code-invalid.exception';
 import { TechnicalLimitException } from '../limits/technical-limit.exception';
 
 const TYPE_BASE = 'https://api.acervatim/probs';
@@ -87,6 +88,15 @@ export function mapException(exception: unknown): Mapped {
   }
   if (exception instanceof ForbiddenException) {
     return { type: `${TYPE_BASE}/forbidden`, title: 'Forbidden', status: 403 };
+  }
+  // Type dédié, même statut 404 que `not-found` : l'app peut afficher un message utile
+  // sans que la réponse distingue inconnu / révoqué / expiré / épuisé — cf. l'exception.
+  if (exception instanceof ShareCodeInvalidException) {
+    return {
+      type: `${TYPE_BASE}/share-code-invalid`,
+      title: 'Share code invalid',
+      status: 404,
+    };
   }
   if (exception instanceof NotFoundException) {
     return { type: `${TYPE_BASE}/not-found`, title: 'Not found', status: 404 };

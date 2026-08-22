@@ -27,6 +27,7 @@ model User {
   subscription          Subscription?
   premiumGrant          PremiumGrant?
   invitationRedemptions InvitationRedemption[]
+  shareMemberships      CollectionShareMember[]
 
   @@map("users")
 }
@@ -61,10 +62,11 @@ model Collection {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
-  user  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type  CollectionType @relation(fields: [typeId], references: [id], onDelete: Restrict)
-  items Item[]
-  nodes CollectionNode[]
+  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   CollectionType    @relation(fields: [typeId], references: [id], onDelete: Restrict)
+  items  Item[]
+  nodes  CollectionNode[]
+  shares CollectionShare[]
 
   @@index([userId, createdAt])
   @@index([typeId])
@@ -236,4 +238,46 @@ model InvitationRedemption {
   @@id([invitationCodeHash, userId])
   @@index([userId])
   @@map("invitation_redemptions")
+}
+
+// ---------- Partage de collection (codes anonymes) ----------
+// Même patron que `Invitation` : le code voyage hors-bande (les comptes sont anonymes, il n'y a
+// aucun email en base pour « inviter » qui que ce soit), seul HMAC-SHA-256(code, SHARE_CODE_PEPPER)
+// est stocké, et le code en clair n'est retourné qu'à la création.
+// Pepper DÉDIÉ : ces codes sont générés par n'importe quel utilisateur, pas seulement l'admin.
+
+model CollectionShare {
+  id           String    @id @default(uuid()) @db.Char(36)
+  collectionId String    @map("collection_id") @db.Char(36)
+  ownerUserId  String    @map("owner_user_id") @db.Char(36) // dénormalisé : requêtes « mes partages »
+  codeHash     String    @unique @map("code_hash") @db.Char(64) // HMAC-SHA-256 hex
+  scope        String    @db.VarChar(16) // 'all' | 'owned' | 'wantlist'
+  maxUses      Int       @default(1) @map("max_uses")
+  usedCount    Int       @default(0) @map("used_count")
+  expiresAt    BigInt?   @map("expires_at") // epoch ms ; null = jamais. Borne l'usage du CODE, pas l'adhésion.
+  revokedAt    DateTime? @map("revoked_at") // révocation = marquage, jamais de suppression physique
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  collection Collection              @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  members    CollectionShareMember[]
+
+  @@index([collectionId])
+  @@index([ownerUserId])
+  @@map("collection_shares")
+}
+
+// Un membre ayant consommé le code. PK composite : on ne rejoint qu'une fois (même logique que
+// `InvitationRedemption`). `revokedAt` permet d'éjecter un membre sans révoquer tout le partage.
+model CollectionShareMember {
+  shareId      String    @map("share_id") @db.Char(36)
+  memberUserId String    @map("member_user_id") @db.Char(36)
+  redeemedAt   DateTime  @default(now()) @map("redeemed_at")
+  revokedAt    DateTime? @map("revoked_at")
+
+  share  CollectionShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  member User            @relation(fields: [memberUserId], references: [id], onDelete: Cascade)
+
+  @@id([shareId, memberUserId])
+  @@index([memberUserId]) // « collections partagées avec moi »
+  @@map("collection_share_members")
 }

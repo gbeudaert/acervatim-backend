@@ -19,6 +19,10 @@ export interface UserExport {
     subscription: unknown | null;
     premiumGrant: unknown | null;
     invitationRedemptions: unknown[];
+    /** Partages que j'ai émis sur mes collections. */
+    collectionShares: unknown[];
+    /** Partages que j'ai rejoints en tant que membre. */
+    shareMemberships: unknown[];
     auditLogs: unknown[];
   };
 }
@@ -61,6 +65,8 @@ export class UsersService {
       subscription,
       premiumGrant,
       invitationRedemptions,
+      collectionShares,
+      shareMemberships,
       auditLogs,
     ] = await Promise.all([
       this.prisma.user.findUnique({
@@ -77,6 +83,38 @@ export class UsersService {
       this.prisma.subscription.findUnique({ where: { userId } }),
       this.prisma.premiumGrant.findUnique({ where: { userId } }),
       this.prisma.invitationRedemption.findMany({ where: { userId } }),
+      // Les deux sens du partage. `codeHash` est exclu : c'est le secret qui autorise à rejoindre,
+      // il n'a rien à faire dans un fichier qui sort du serveur — et le code en clair n'existe
+      // plus nulle part de toute façon.
+      this.prisma.collectionShare.findMany({
+        where: { ownerUserId: userId },
+        select: {
+          id: true,
+          collectionId: true,
+          scope: true,
+          maxUses: true,
+          usedCount: true,
+          expiresAt: true,
+          revokedAt: true,
+          createdAt: true,
+          members: {
+            select: {
+              memberUserId: true,
+              redeemedAt: true,
+              revokedAt: true,
+            },
+          },
+        },
+      }),
+      this.prisma.collectionShareMember.findMany({
+        where: { memberUserId: userId },
+        select: {
+          shareId: true,
+          redeemedAt: true,
+          revokedAt: true,
+          share: { select: { collectionId: true, scope: true } },
+        },
+      }),
       this.prisma.auditLog.findMany({
         where: { userId },
         orderBy: { createdAt: 'asc' },
@@ -99,13 +137,16 @@ export class UsersService {
         subscription,
         premiumGrant,
         invitationRedemptions,
+        collectionShares,
+        shareMemberships,
         auditLogs,
       },
     };
   }
 
   /**
-   * Supprime le user (cascade Prisma sur collections/items/oauth/subscription/grant/redemptions).
+   * Supprime le user (cascade Prisma sur collections/items/oauth/subscription/grant/redemptions,
+   * et sur les partages : ses `CollectionShare` via `Collection`, ses adhésions via `User`).
    * On écrit l'audit AVANT le delete : sinon le cascade FK ferait disparaître la trace du grant…
    * mais `audit_logs.userId` n'a PAS de FK (volontaire) — la ligne d'audit survit donc à l'user.
    */
