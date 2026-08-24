@@ -32,6 +32,13 @@ export interface UnimarcRecord {
 export interface UnimarcParseResult {
   /** `<numberOfRecords>` annoncé par le serveur SRU (0 si absent). */
   numberOfRecords: number;
+  /**
+   * `false` quand le corps ne porte aucun `<numberOfRecords>` : ce n'est alors pas une réponse
+   * SRU (page d'erreur HTML, diagnostic, corps tronqué) et non une absence de notice. Les deux
+   * cas donnent `numberOfRecords: 0` / `records: []` mais n'ont pas la même durée de vie côté
+   * cache — l'appelant doit pouvoir les distinguer.
+   */
+  isSruResponse: boolean;
   /** Notices effectivement parsées (peut différer de numberOfRecords si pagination). */
   records: UnimarcRecord[];
 }
@@ -116,7 +123,7 @@ export function parseUnimarc(xml: string): UnimarcParseResult {
     records.push(parseRecord(m[1]));
   }
 
-  return { numberOfRecords, records };
+  return { numberOfRecords, isSruResponse: numMatch !== null, records };
 }
 
 // ----- Accesseurs -----

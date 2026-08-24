@@ -32,6 +32,13 @@ import {
 
 const DEFAULT_BASE_URL = 'https://catalogue.bnf.fr/api/SRU';
 const NOTICE_CACHE_TTL_SECONDS = 30 * 24 * 3600; // notices biblio quasi immuables.
+// TTL du cache **d'absence** (`numberOfRecords=0`). Une notice est quasi immuable, une absence ne
+// l'est pas : le catalogage BnF traîne (dépôt légal) et les éditeurs FR non français (belges,
+// suisses) n'y entrent parfois que tardivement — le TTL notice de 30 j gelait le scan d'une
+// nouveauté un mois après son catalogage réel (ex 9782808703437, Vega-Dupuis, paru 05/2026).
+// 24 h : une absence confirmée ne coûte au plus qu'un appel SRU par jour et par ISBN scanné,
+// et la notice apparaît au plus tard le lendemain de son entrée au catalogue.
+const NOT_FOUND_CACHE_TTL_SECONDS = 24 * 3600;
 const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des tomes.
 // Une notice par tome, mais le titre matche aussi le bruit (standard + collector +
 // spin-offs + guides + rééditions) : un titre populaire dépasse largement 100 notices.
@@ -122,22 +129,26 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
     const url = `${this.baseUrl}?${params.toString()}`;
     const cacheKey = `bnf:isbn:${normIsbn}`;
 
+    // Le TTL dépend de ce que le SRU renvoie (notice vs absence) : on ne peut donc pas le fixer
+    // avant le fetch comme le ferait `getOrFetch` — on déroule get / fetch / parse / set.
+    const cached = await this.cache.get<string>(cacheKey);
     let xml: string;
-    try {
-      xml = await this.cache.getOrFetch<string>(
-        cacheKey,
-        NOTICE_CACHE_TTL_SECONDS,
-        () => this.fetchSru(url, BNF_PRIORITY_INTERACTIVE),
-      );
-    } catch {
-      this.logger.warn(`bnf: SRU fetch failed isbn=${normIsbn}`);
-      return { ok: false, reason: 'bnf_unavailable' };
+    if (cached !== null) {
+      xml = cached;
+    } else {
+      try {
+        xml = await this.fetchSru(url, BNF_PRIORITY_INTERACTIVE);
+      } catch {
+        this.logger.warn(`bnf: SRU fetch failed isbn=${normIsbn}`);
+        return { ok: false, reason: 'bnf_unavailable' };
+      }
     }
 
-    let parsed;
-    try {
-      parsed = parseUnimarc(xml);
-    } catch {
+    const parsed = parseUnimarc(xml);
+    if (!parsed.isSruResponse) {
+      // Corps sans `<numberOfRecords>` : page d'erreur / diagnostic, pas une absence de notice.
+      // Transitoire comme `bnf_unavailable`, donc jamais mis en cache — sinon un incident BnF de
+      // dix minutes se figerait 24 h côté Acervatim.
       this.logger.warn(`bnf: unparsable response isbn=${normIsbn}`);
       return { ok: false, reason: 'bnf_unparsable' };
     }
@@ -146,7 +157,16 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
       `bnf: parsing isbn=${normIsbn} numberOfRecords=${parsed.numberOfRecords} parsed=${parsed.records.length}`,
     );
 
-    if (parsed.records.length === 0) {
+    const found = parsed.records.length > 0;
+    if (cached === null) {
+      await this.cache.set(
+        cacheKey,
+        xml,
+        found ? NOTICE_CACHE_TTL_SECONDS : NOT_FOUND_CACHE_TTL_SECONDS,
+      );
+    }
+
+    if (!found) {
       this.logger.warn(`bnf: not found isbn=${normIsbn}`);
       return { ok: false, reason: 'bnf_not_found' };
     }

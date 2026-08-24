@@ -30,7 +30,10 @@ const COLOSSALE_XML = `<srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov
 
 function makeService(xml: string) {
   const cache = {
-    // getOrFetch exécute simplement le fetcher (pas de cache en test).
+    // Cache toujours froid en test : `get` rate, `set` enregistre le TTL choisi (on assert dessus).
+    get: jest.fn().mockResolvedValue(null),
+    set: jest.fn().mockResolvedValue(undefined),
+    // Chemin édition : exécute simplement le fetcher (pas de cache en test).
     getOrFetch: jest.fn(
       (_k: string, _ttl: number, fetcher: () => Promise<unknown>) => fetcher(),
     ),
@@ -44,7 +47,7 @@ function makeService(xml: string) {
   // Court-circuite onModuleInit() (qui ouvrirait une vraie connexion Redis) : baseUrl garde son
   // défaut, la valeur de queueEvents est indifférente (waitUntilFinished est mocké sur le job).
   (svc as unknown as { queueEvents: unknown }).queueEvents = {};
-  return { svc, queue };
+  return { svc, queue, cache };
 }
 
 describe('BnfService', () => {
@@ -67,12 +70,48 @@ describe('BnfService', () => {
     expect(n.ark).toContain('ark:/12148');
   });
 
-  it('renvoie bnf_not_found sur 0 notice', async () => {
-    const { svc } = makeService(
+  it('renvoie bnf_not_found sur 0 notice, et ne cache l’absence que 24 h', async () => {
+    const { svc, cache } = makeService(
       `<srw:searchRetrieveResponse xmlns:srw="x"><srw:numberOfRecords>0</srw:numberOfRecords></srw:searchRetrieveResponse>`,
     );
     const res = await svc.resolveByIsbn('0000000000000');
     expect(res).toEqual({ ok: false, reason: 'bnf_not_found' });
+
+    // Une absence n'est pas immuable (catalogage BnF en retard, éditeur belge/suisse) : la garder
+    // 30 j comme une notice gèlerait le scan un mois après l'entrée réelle au catalogue.
+    expect(cache.set).toHaveBeenCalledWith(
+      'bnf:isbn:0000000000000',
+      expect.any(String),
+      24 * 3600,
+    );
+  });
+
+  it('cache la notice trouvée 30 j', async () => {
+    const { svc, cache } = makeService(COLOSSALE_XML);
+    await svc.resolveByIsbn('9782811623258');
+    expect(cache.set).toHaveBeenCalledWith(
+      'bnf:isbn:9782811623258',
+      expect.any(String),
+      30 * 24 * 3600,
+    );
+  });
+
+  it('sert le XML caché sans rappeler le SRU', async () => {
+    const { svc, queue, cache } = makeService(COLOSSALE_XML);
+    cache.get.mockResolvedValueOnce(COLOSSALE_XML);
+
+    const res = await svc.resolveByIsbn('9782811623258');
+
+    expect(res.ok).toBe(true);
+    expect(queue.add).not.toHaveBeenCalled();
+    expect(cache.set).not.toHaveBeenCalled(); // pas de ré-écriture qui prolongerait le TTL
+  });
+
+  it('ne cache pas une réponse illisible (incident BnF transitoire)', async () => {
+    const { svc, cache } = makeService('<html>503 Service Unavailable</html>');
+    const res = await svc.resolveByIsbn('9782811623258');
+    expect(res).toEqual({ ok: false, reason: 'bnf_unparsable' });
+    expect(cache.set).not.toHaveBeenCalled();
   });
 
   it('renvoie bnf_unavailable quand le fetch via la file échoue (Redis down / worker)', async () => {
