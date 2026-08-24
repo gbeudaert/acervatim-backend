@@ -46,3 +46,8 @@ docs/travail/
 
 # Images conteneur construites localement (artefacts de déploiement)
 *.tar
+
+# BMad Method — installation partagee dans C:\Appsmad, branchee par jonctions
+# Windows (voir C:\Appsmad\link-project.ps1). Non portable : on relie, on ne versionne pas.
+/_bmad/
+/_bmad-output/

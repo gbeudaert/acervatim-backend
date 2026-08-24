@@ -13,3 +13,10 @@ coverage
 .DS_Store
 docs
 README.md
+
+# Artefacts de deploiement construits localement (images .tar)
+*.tar
+
+# Installation BMad reliee par jonctions (hors depot)
+_bmad
+_bmad-output
