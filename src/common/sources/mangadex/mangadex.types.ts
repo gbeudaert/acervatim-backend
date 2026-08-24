@@ -56,10 +56,21 @@ export interface MangaDexSeriesCovers {
   status: 'found' | 'absent' | 'unresolved';
 }
 
-/** Payload d'un job `mangadex:series-covers` : titre de série + mal_id (join fiable) optionnel. */
-export interface MangaDexCoversJobData {
-  title: string;
+/**
+ * Indices d'identification d'une série pour la résolution des jaquettes, par fiabilité décroissante :
+ * `mangaId` (identité déjà connue au scan → join direct) > `malId` (join `links.mal`) > `authors`
+ * (validation du match par titre, chemin bnf_only). Tous optionnels : sans indice exploitable, la
+ * résolution MangaDex ressort `absent` et l'appelant résout les jaquettes par ISBN.
+ */
+export interface SeriesCoverLookup {
+  mangaId: string | null;
   malId: string | null;
+  authors: BnfAuthor[];
+}
+
+/** Payload d'un job `mangadex:series-covers` : titre de série + indices d'identification. */
+export interface MangaDexCoversJobData extends SeriesCoverLookup {
+  title: string;
 }
 
 /** Payload d'un job `mangadex:identify` : titre interrogé (romaji ou FR) + auteurs BnF (désambigu.). */
@@ -114,6 +125,14 @@ export interface MangaDexIdentity {
   confidence: number;
   /** Ce qui a validé le match : titre + auteur (fort) ou titre seul (fort). */
   matchedBy: 'title+author' | 'title';
+  /**
+   * Un AUTRE candidat de la recherche atteignait le même score de titre que celui retenu — le titre
+   * seul ne suffisait donc pas à départager. Le chemin nominal (BnF) l'**ignore** : l'auteur de la
+   * notice tranche. Le repli Google Books, lui, **rejette** l'identification quand `ambiguous` et
+   * qu'aucun auteur n'a matché : c'est ce qui écarte *Frieren Cinnamoroll Kamigata* (crossover
+   * parasite) sur la requête d'un seul token « Frieren », sans toucher au seuil `PIVOT_TITLE_STRONG`.
+   */
+  ambiguous: boolean;
 }
 
 /**
@@ -125,10 +144,15 @@ export interface MangaDexIdentityCacheEntry {
   identity: MangaDexIdentity | null;
 }
 
-/** Clé de cache d'une identification, par requête (titre) normalisée. */
+/**
+ * Clé de cache d'une identification, par requête (titre) normalisée. Version `v2` depuis l'ajout de
+ * {@link MangaDexIdentity.ambiguous} : les entrées v1 ne portent pas le drapeau et seraient relues
+ * comme « non ambiguë », ce qui rouvrirait le faux positif que le repli doit refuser. Le cache se
+ * remplit de nouveau en quelques scans.
+ */
 export function identityCacheKey(query: string): string {
   const norm = query.trim().toLowerCase().replace(/\s+/g, ' ');
-  return `mangadex:identify:${norm}`;
+  return `mangadex:identify:v2:${norm}`;
 }
 
 /** jobId BullMQ d'une identification (sha1 : la requête peut contenir `:`/espaces). */

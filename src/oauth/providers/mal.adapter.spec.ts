@@ -33,7 +33,12 @@ interface MockDeps {
   };
   bnf: { resolveByIsbn: jest.Mock };
   tokenResolver: { resolve: jest.Mock };
-  googleBooks: { resolveCover: jest.Mock; cachedCover: jest.Mock };
+  googleBooks: {
+    resolveCover: jest.Mock;
+    cachedCover: jest.Mock;
+    resolveCoverAndDescription: jest.Mock;
+    resolveVolumeInfo: jest.Mock;
+  };
   mangaDex: { identifySeries: jest.Mock };
   redisHealth: { isAvailable: jest.Mock };
   queue: { add: jest.Mock };
@@ -80,6 +85,14 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   const googleBooks = {
     resolveCover: jest.fn().mockResolvedValue(null),
     cachedCover: jest.fn().mockResolvedValue(null),
+    resolveCoverAndDescription: jest.fn().mockResolvedValue({
+      coverUrl: null,
+      description: null,
+      status: 'absent',
+    }),
+    // Par défaut : Google ne connaît pas l'ISBN — le repli ne produit donc rien tant qu'un test ne
+    // le décide pas. Les scénarios BnF historiques restent inchangés.
+    resolveVolumeInfo: jest.fn().mockResolvedValue(null),
   };
   // Par défaut : MangaDex n'identifie PAS (null) → le pivot replie sur MAL, ce qui préserve les
   // scénarios MAL historiques. Les tests du chemin nominal surchargent `identifySeries`.
@@ -848,6 +861,7 @@ describe('MalAdapter.searchByBarcode (chemin nominal MangaDex, MAL en repli)', (
       volumes: {},
       confidence: 0.95,
       matchedBy: 'title+author',
+      ambiguous: false,
       ...over,
     };
   }
@@ -978,4 +992,245 @@ describe('MalAdapter.searchByBarcode (chemin nominal MangaDex, MAL en repli)', (
     expect(res.items[0].source).toBe('mal');
     expect((res.items[0].metadata as any).pivot.resolutionPath).toBe('bnf+mal');
   });
+});
+
+describe('MalAdapter.searchByBarcode (repli Google Books quand la BnF est muette)', () => {
+  /** Identité MangaDex minimale, paramétrable — `ambiguous` est le pivot de ces tests. */
+  function identity(over: Partial<MangaDexIdentity> = {}): MangaDexIdentity {
+    return {
+      mangaId: 'md-hero',
+      title: 'Yuusha-kei ni Shosu',
+      titleFr: null,
+      titleRomaji: 'Yuusha-kei ni Shosu',
+      descriptionFr: 'Synopsis FR.',
+      descriptionEn: null,
+      malId: '151361',
+      anilistId: null,
+      status: 'ongoing',
+      year: 2021,
+      lastVolume: '4',
+      contentRating: 'safe',
+      genres: ['Action'],
+      authors: ['Rokurou Akashi'],
+      coverUrl: 'https://uploads.mangadex.org/covers/md-hero/c.jpg.512.jpg',
+      rating: 7.9,
+      volumes: {},
+      confidence: 0.6,
+      matchedBy: 'title',
+      ambiguous: false,
+      ...over,
+    };
+  }
+
+  /** Titre Google d'un ISBN (le repli n'a que ça comme point d'entrée). */
+  function gbooksTitle(
+    deps: MockDeps,
+    title: string,
+    authors: string[] = [],
+    publishedDate: string | null = null,
+  ) {
+    deps.googleBooks.resolveVolumeInfo.mockResolvedValue({
+      title,
+      authors,
+      publishedDate,
+    });
+  }
+
+  it('cas fondateur : ISBN inconnu de la BnF → Google Books → MangaDex, resolutionPath gbooks+mangadex', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    gbooksTitle(deps, 'Sentenced to be a Hero Tome 1', [], '2026-05-22');
+    // Le titre complet ne matche pas (MangaDex ne tolère pas le bruit) ; le préfixe tronqué, si.
+    deps.mangaDex.identifySeries.mockImplementation((query: string) =>
+      Promise.resolve(query === 'Sentenced to be a Hero' ? identity() : null),
+    );
+
+    const res = await svc.searchByBarcode('9782808703437', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items).toHaveLength(1);
+    const item = res.items[0];
+    expect(item.source).toBe('mangadex');
+    const pivot = (item.metadata as { pivot: Record<string, unknown> }).pivot;
+    expect(pivot.resolutionPath).toBe('gbooks+mangadex');
+    expect(pivot.malId).toBe('151361');
+    // Le tome vient de la queue retirée du préfixe GAGNANT, pas d'un parsing du titre brut.
+    const tome = (item.metadata as { scannedTome: Record<string, unknown> })
+      .scannedTome;
+    expect(tome.volume).toBe('1');
+    expect(tome.seriesTitleFr).toBe('Sentenced to be a Hero');
+    expect(tome.titleFr).toBe('Sentenced to be a Hero Tome 1');
+    // Aucune notice BnF : les champs proprement BnF restent nuls, on n'en invente pas.
+    expect(tome.edition).toBeNull();
+    expect(tome.publisherFr).toBeNull();
+    expect(tome.sourceVolumeRange).toBeNull();
+    // Le titre complet a bien été tenté avant la troncature.
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledWith(
+      'Sentenced to be a Hero Tome 1',
+      [],
+    );
+  });
+
+  it('descend l’échelle jusqu’au premier préfixe accepté, puis s’arrête', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    gbooksTitle(deps, 'Chainsaw Man Tome 18 . Edition collector');
+    deps.mangaDex.identifySeries.mockImplementation((query: string) =>
+      Promise.resolve(
+        query === 'Chainsaw Man'
+          ? identity({ mangaId: 'md-csm', title: 'Chainsaw Man' })
+          : null,
+      ),
+    );
+
+    const res = await svc.searchByBarcode('9782820352545', {
+      userId: USER,
+      limit: 50,
+    });
+
+    const tome = (res.items[0].metadata as { scannedTome: { volume: string } })
+      .scannedTome;
+    expect(tome.volume).toBe('18');
+    // 3 échelons interrogés : titre complet, « Chainsaw Man Tome », « Chainsaw Man ». Les échelons
+    // dont la queue n'a pas de chiffre ne coûtent aucune requête.
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledTimes(3);
+  });
+
+  it('passe les auteurs Google à MangaDex quand Google en fournit (l’arbitre du rapprochement)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    gbooksTitle(deps, 'Frieren', ['Kanehito Yamada']);
+    deps.mangaDex.identifySeries.mockResolvedValue(
+      identity({
+        mangaId: 'md-frieren',
+        title: 'Sousou no Frieren',
+        matchedBy: 'title+author',
+        ambiguous: true,
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9791032711897', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledWith('Frieren', [
+      { full: 'Kanehito Yamada' },
+    ]);
+    // Ambiguë mais l'auteur a matché : on accepte (c'est le chemin des 42 % de notices avec auteurs).
+    expect(res.items[0].source).toBe('mangadex');
+    expect(res.items[0].title).toBe('Sousou no Frieren');
+  });
+
+  it('identification ambiguë SANS auteur → refus, item minimal gbooks_only (piège Frieren)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    gbooksTitle(deps, 'Frieren');
+    // Le crossover parasite « Frieren Cinnamoroll Kamigata » sortirait vainqueur du scoring.
+    deps.mangaDex.identifySeries.mockResolvedValue(
+      identity({
+        mangaId: 'md-crossover',
+        title: 'Frieren Cinnamoroll Kamigata',
+        matchedBy: 'title',
+        ambiguous: true,
+      }),
+    );
+
+    const res = await svc.searchByBarcode('9791032711897', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].source).toBe('gbooks');
+    expect(res.items[0].title).toBe('Frieren');
+    expect(
+      (res.items[0].metadata as { pivot: { resolutionPath: string } }).pivot
+        .resolutionPath,
+    ).toBe('gbooks_only');
+    // Le faux positif n'a fui nulle part.
+    expect(JSON.stringify(res.items[0])).not.toContain('Cinnamoroll');
+  });
+
+  it('titre de tome seul (aucune série identifiée) → gbooks_only, jamais de série devinée', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    gbooksTitle(deps, 'Instinct grégaire');
+    deps.mangaDex.identifySeries.mockResolvedValue(null);
+    deps.googleBooks.resolveCoverAndDescription.mockResolvedValue({
+      coverUrl: 'https://books.google.com/c.jpg',
+      description: 'Résumé Google.',
+      status: 'found',
+    });
+
+    const res = await svc.searchByBarcode('9791032707517', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items[0].source).toBe('gbooks');
+    expect(res.items[0].coverUrl).toBe('https://books.google.com/c.jpg');
+    const tome = (
+      res.items[0].metadata as { scannedTome: Record<string, unknown> }
+    ).scannedTome;
+    expect(tome.seriesTitleFr).toBeNull();
+    expect(tome.volume).toBeNull();
+    // Un seul échelon : la queue « grégaire » n'a pas de chiffre, donc aucune troncature.
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledTimes(1);
+    expect(deps.mangaDex.identifySeries).toHaveBeenCalledWith(
+      'Instinct grégaire',
+      [],
+    );
+  });
+
+  it('ISBN absent de Google Books → liste vide (il n’y a rien à proposer)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.bnf.resolveByIsbn.mockResolvedValue({
+      ok: false,
+      reason: 'bnf_not_found',
+    });
+    deps.googleBooks.resolveVolumeInfo.mockResolvedValue(null);
+
+    const res = await svc.searchByBarcode('9782344073674', {
+      userId: USER,
+      limit: 50,
+    });
+
+    expect(res.items).toEqual([]);
+    expect(deps.mangaDex.identifySeries).not.toHaveBeenCalled();
+  });
+
+  it.each(['bnf_unavailable', 'bnf_unparsable'])(
+    'panne BnF transitoire (%s) → AUCUN repli : l’app doit retenter, pas se rabattre',
+    async (reason) => {
+      const { deps, svc } = makeDeps();
+      deps.bnf.resolveByIsbn.mockResolvedValue({ ok: false, reason });
+
+      const res = await svc.searchByBarcode('9782808703437', {
+        userId: USER,
+        limit: 50,
+      });
+
+      expect(res.items).toEqual([]);
+      expect(deps.googleBooks.resolveVolumeInfo).not.toHaveBeenCalled();
+      expect(deps.mangaDex.identifySeries).not.toHaveBeenCalled();
+    },
+  );
 });

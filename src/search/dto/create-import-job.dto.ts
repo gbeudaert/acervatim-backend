@@ -13,6 +13,9 @@ export const CreateImportJobSchema = z
     edition: z.string().max(128).optional(),
     // id MyAnimeList (pivot ISBN→MAL) : fiabilise le join MangaDex des jaquettes. Optionnel.
     malId: z.string().max(32).optional(),
+    // id MangaDex (identité produite au scan, metadata.pivot.mangaId) : join direct des jaquettes,
+    // sans recherche par titre. Optionnel.
+    mangaId: z.string().max(64).optional(),
   })
   .strict();
 

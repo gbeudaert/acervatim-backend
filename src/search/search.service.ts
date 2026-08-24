@@ -11,7 +11,10 @@ import {
 import { CoverStatus } from '../common/sources/googlebooks/googlebooks.types';
 import { isSpecialArtEdition } from '../common/sources/manga-matching';
 import { MangaDexCoverService } from '../common/sources/mangadex/mangadex.service';
-import { MangaDexSeriesCovers } from '../common/sources/mangadex/mangadex.types';
+import {
+  MangaDexSeriesCovers,
+  SeriesCoverLookup,
+} from '../common/sources/mangadex/mangadex.types';
 import { SOURCE_ADAPTERS } from '../common/sources/source-snapshot.service';
 import {
   AdapterSearchResult,
@@ -115,10 +118,12 @@ export class SearchService {
     titleFr: string,
     edition?: string,
     malId?: string,
+    mangaId?: string,
   ): Promise<EditionMappingResponse> {
     return this.buildEditionMapping(titleFr, edition, {
       resolveCovers: false,
       malId,
+      mangaId,
     });
   }
 
@@ -134,11 +139,13 @@ export class SearchService {
     edition?: string,
     onProgress?: (done: number, total: number) => void,
     malId?: string,
+    mangaId?: string,
   ): Promise<EditionMappingResponse> {
     return this.buildEditionMapping(titleFr, edition, {
       resolveCovers: true,
       onProgress,
       malId,
+      mangaId,
     });
   }
 
@@ -154,6 +161,7 @@ export class SearchService {
     opts: {
       resolveCovers: boolean;
       malId?: string;
+      mangaId?: string;
       onProgress?: (done: number, total: number) => void;
     },
   ): Promise<EditionMappingResponse> {
@@ -162,18 +170,25 @@ export class SearchService {
 
     // MangaDex, par SÉRIE : un seul appel pour toute l'édition (indexé par série + n° de tome), là où
     // Google Books coûte un appel par ISBN. Résolu réellement en réchauffage (worker), cache-only sur
-    // l'endpoint HTTP. Le mal_id (fourni par le pivot) fiabilise le join ; sans lui, repli par titre.
+    // l'endpoint HTTP. Identification par ordre de fiabilité : mangaId (identité connue au scan) >
+    // mal_id (join links.mal) > validation par l'auteur BnF (chemin bnf_only, anti-variante). Aucun
+    // match validé → MangaDex `absent` → la cascade résout chaque tome par ISBN (édition-exact).
     //
     // ⚠️ Garde-fou éditions d'art (plan §3) : MangaDex indexe par (n° de tome) SANS dimension édition.
     // Sur une édition d'art (Colossale/Perfect/Kanzenban… — visuel ET numérotation distincts), la
     // jaquette du tome N renverrait le VISUEL du standard (faux) → on saute MangaDex et on laisse la
     // cascade ISBN édition-consciente (Google Books). Les retirages (ordinaux) restent standard.
     const useMangaDex = !isSpecialArtEdition(mapping.edition);
+    const lookup: SeriesCoverLookup = {
+      mangaId: opts.mangaId ?? null,
+      malId: opts.malId ?? null,
+      authors: mapping.authors,
+    };
     const md: MangaDexSeriesCovers = !useMangaDex
       ? { mangaId: null, volumes: {}, status: 'absent' }
       : opts.resolveCovers
-        ? await this.mangaDex.resolveSeriesCovers(opts.malId ?? null, titleFr)
-        : await this.mangaDex.cachedSeriesCovers(opts.malId ?? null, titleFr);
+        ? await this.mangaDex.resolveSeriesCovers(titleFr, lookup)
+        : await this.mangaDex.cachedSeriesCovers(titleFr, lookup);
 
     let done = 0;
     const tomes = await mapWithConcurrency(

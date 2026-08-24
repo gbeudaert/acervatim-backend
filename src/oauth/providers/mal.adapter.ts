@@ -16,6 +16,7 @@ import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { BnfAuthor, BnfNotice } from '../../common/sources/bnf/bnf.types';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import { VolumeInfo } from '../../common/sources/googlebooks/googlebooks.types';
 import {
   matchesAuthor,
   PIVOT_TITLE_STRONG,
@@ -23,6 +24,7 @@ import {
 } from '../../common/sources/manga-matching';
 import { MangaDexCoverService } from '../../common/sources/mangadex/mangadex.service';
 import { MangaDexIdentity } from '../../common/sources/mangadex/mangadex.types';
+import { titleLadder } from '../../common/sources/title-ladder';
 import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
 import { SourceTokenRequiredException } from '../source-token-required.exception';
@@ -97,6 +99,18 @@ interface MalMangaNode {
   status?: string;
   num_volumes?: number;
   alternative_titles?: { synonyms?: string[]; en?: string; ja?: string };
+}
+
+/**
+ * Ce que le repli Google Books sait du tome scanné, en lieu et place de la notice BnF absente :
+ * titre commercial Google, préfixe gagnant de l'échelle (le seul « nom de série » qu'on ait, `null`
+ * quand aucun préfixe n'a été validé), n° de tome lu dans la queue retirée, date Google.
+ */
+interface GbooksTomeContext {
+  titleFr: string;
+  seriesTitleFr: string | null;
+  volume: number | null;
+  publishedDate: string | null;
 }
 
 interface PivotCandidate {
@@ -278,6 +292,15 @@ export class MalAdapter
 
     const resolution = await this.bnf.resolveByIsbn(isbn);
     if (!resolution.ok) {
+      // Seule l'ABSENCE de notice (nouveauté non cataloguée, éditeur non français) ouvre le repli
+      // Google Books : `bnf_unavailable` / `bnf_unparsable` sont des pannes transitoires, y greffer
+      // un repli dégraderait la qualité pendant un incident BnF au lieu de laisser l'app retenter.
+      if (resolution.reason === 'bnf_not_found') {
+        this.logger.log(
+          `pivot: bnf_not_found isbn=${isbn} -> repli Google Books`,
+        );
+        return this.googleBooksPivot(isbn);
+      }
       this.logger.warn(
         `pivot: bnf unresolved isbn=${isbn} reason=${resolution.reason} -> no candidate`,
       );
@@ -309,13 +332,142 @@ export class MalAdapter
         `pivot: retained via mangadex isbn=${isbn} mangaId=${identity.mangaId} mal_id=${identity.malId ?? '-'} title="${identity.title}" matchedBy=${identity.matchedBy} confidence=${identity.confidence.toFixed(2)} synopsisFr=${identity.descriptionFr ? 'y' : 'n'}`,
       );
       return {
-        items: [this.buildMangaDexItem(identity, notice, isbn, useOriginal)],
+        items: [
+          this.buildMangaDexItem(
+            identity,
+            notice,
+            isbn,
+            useOriginal ? 'bnf+mangadex' : 'bnf+mangadex-fr',
+          ),
+        ],
         nextCursor: null,
       };
     }
     this.logger.log(`pivot: mangadex no match isbn=${isbn} -> repli MAL`);
 
     return this.malPivotFallback(notice, isbn, query, useOriginal, ctx);
+  }
+
+  /**
+   * **Repli Google Books** — la BnF ne connait pas l'ISBN scanne (nouveaute au catalogage en retard,
+   * editeur non francais : les deux causes se cumulent sur la population visee). On rouvre un chemin
+   * d'entree : `Google Books (titre par ISBN)` -> {@link titleLadder} -> `MangaDex`.
+   *
+   * Pourquoi une echelle et pas un parsing : le titre Google n'est pas normalise et MangaDex ne
+   * tolere aucun bruit (`title=One Piece Tome 112` -> `total=0`). On tronque donc par la fin et on
+   * s'arrete au **premier prefixe accepte** — une requete fausse ne coute qu'un aller-retour, jamais
+   * une mauvaise serie. Le n° de tome retenu est celui de la queue retiree du prefixe gagnant : il
+   * n'est cru que parce que le prefixe, lui, a matche.
+   *
+   * Trois issues : identifie (`gbooks+mangadex`), non identifie (item minimal `gbooks_only`, pour que
+   * l'app propose la saisie manuelle), ou rien chez Google non plus (liste vide).
+   */
+  private async googleBooksPivot(isbn: string): Promise<AdapterSearchResult> {
+    const info = await this.googleBooks.resolveVolumeInfo(isbn);
+    if (!info) {
+      this.logger.warn(
+        `pivot: gbooks no title isbn=${isbn} (ISBN inconnu de Google ou echec) -> aucun candidat`,
+      );
+      return { items: [], nextCursor: null };
+    }
+
+    // Auteurs Google (presents ~42 % du temps) presentes comme des auteurs BnF : `matchesAuthor`
+    // tokenise des chaines libres, la forme complete suffit. Quand ils sont la, ils redeviennent
+    // l'arbitre du rapprochement — et levent l'ambiguite que le titre seul ne peut pas trancher.
+    const authors: BnfAuthor[] = info.authors.map((full) => ({ full }));
+    const steps = titleLadder(info.title);
+    this.logger.log(
+      `pivot: gbooks title isbn=${isbn} title="${info.title}" authors=${info.authors.length} echelons=${steps.length}`,
+    );
+
+    let queries = 0;
+    for (const step of steps) {
+      queries++;
+      const identity = await this.mangaDex.identifySeries(step.prefix, authors);
+      if (!identity) continue;
+
+      const authorMatched = identity.matchedBy === 'title+author';
+      if (identity.ambiguous && !authorMatched) {
+        // Plusieurs candidats a egalite de titre et aucun auteur pour trancher (cas « Frieren ») :
+        // on n'accepte pas. Inutile de descendre l'echelle — les prefixes suivants sont plus courts,
+        // donc plus ambigus encore.
+        this.logger.warn(
+          `pivot: gbooks ambigu isbn=${isbn} prefix="${step.prefix}" meilleur="${identity.title}" ` +
+            `requetes=${queries} -> refus (gbooks_only)`,
+        );
+        break;
+      }
+
+      this.logger.log(
+        `pivot: retained via gbooks+mangadex isbn=${isbn} prefix="${step.prefix}" cut=${step.cut} ` +
+          `tome=${step.volume ?? '-'} requetes=${queries} mangaId=${identity.mangaId} ` +
+          `mal_id=${identity.malId ?? '-'} title="${identity.title}" authorMatch=${authorMatched} ` +
+          `confidence=${identity.confidence.toFixed(2)}`,
+      );
+      return {
+        items: [
+          this.buildMangaDexItem(identity, null, isbn, 'gbooks+mangadex', {
+            titleFr: info.title,
+            seriesTitleFr: step.prefix,
+            volume: step.volume,
+            publishedDate: info.publishedDate,
+          }),
+        ],
+        nextCursor: null,
+      };
+    }
+
+    this.logger.warn(
+      `pivot: gbooks_only isbn=${isbn} title="${info.title}" requetes=${queries} ` +
+        `-> aucune serie MangaDex, item minimal`,
+    );
+    return this.gbooksOnlyResult(info, isbn);
+  }
+
+  /**
+   * Item **minimal** `source='gbooks'` : Google connait l'ISBN mais aucun prefixe n'a identifie de
+   * serie (titre du tome seul, coffret/goodies...). On rend quand meme le titre, la jaquette et le
+   * n° de tome extrait plutot qu'un « aucun resultat » muet — l'app enchaine sur la saisie manuelle.
+   *
+   * Pas de nom de serie devine : aucun prefixe n'a ete valide, en inventer un ferait passer une
+   * hypothese pour une donnee. Le n° de tome, lui, est le meme a tous les echelons (etendre la queue
+   * vers la gauche n'en change pas le dernier entier) — on prend donc le premier qui en porte un.
+   */
+  private async gbooksOnlyResult(
+    info: VolumeInfo,
+    isbn: string,
+  ): Promise<AdapterSearchResult> {
+    const volume =
+      titleLadder(info.title).find((s) => s.volume != null)?.volume ?? null;
+    // Best-effort, comme le repli bnf_only : jaquette + resume du tome scanne (meme ISBN, autre cle
+    // de cache) — `unresolved`/`absent` laissent simplement l'item sans image.
+    const cover = await this.googleBooks.resolveCoverAndDescription(isbn);
+    const item: UnifiedItem = {
+      source: 'gbooks',
+      sourceId: isbn,
+      mediaType: 'manga',
+      title: info.title,
+      creators: info.authors,
+      releaseDate: info.publishedDate ?? undefined,
+      coverUrl: cover.coverUrl ?? undefined,
+      description: cover.description ?? undefined,
+      metadata: {
+        pivot: {
+          isbn,
+          confidence: 0,
+          authorMatched: false,
+          resolutionPath: 'gbooks_only',
+        },
+        scannedTome: buildScannedTomeMeta(null, isbn, {
+          titleFr: info.title,
+          seriesTitleFr: null,
+          volume,
+          publishedDate: info.publishedDate,
+        }),
+      },
+      rawData: info,
+    };
+    return { items: [item], nextCursor: null };
   }
 
   /**
@@ -629,7 +781,8 @@ export class MalAdapter
   }
 
   /**
-   * Mappe une identité MangaDex en item `source='mangadex'` (chemin nominal du scan). Le `mal_id`
+   * Mappe une identité MangaDex en item `source='mangadex'` (chemin nominal du scan **et** repli
+   * Google Books, d'où `notice` optionnelle et `resolutionPath` fourni par l'appelant). Le `mal_id`
    * (`links.mal`) est porté dans `metadata.pivot` pour retrouver MAL trivialement plus tard (sync).
    *  - `description` (public FR) = synopsis `.fr` → note BnF 330$a → synopsis `.en` ;
    *  - `coverUrl` = jaquette principale MangaDex ;
@@ -638,13 +791,14 @@ export class MalAdapter
    */
   private buildMangaDexItem(
     identity: MangaDexIdentity,
-    notice: BnfNotice,
+    notice: BnfNotice | null,
     isbn: string,
-    useOriginal: boolean,
+    resolutionPath: string,
+    gbooks?: GbooksTomeContext,
   ): UnifiedItem {
     const description =
       identity.descriptionFr ??
-      notice.noteFr ??
+      notice?.noteFr ??
       identity.descriptionEn ??
       undefined;
     const numVolumes = toVolumeCount(identity.lastVolume);
@@ -655,10 +809,10 @@ export class MalAdapter
       title: identity.title,
       creators: identity.authors.length
         ? identity.authors
-        : bnfCreators(notice.authors),
+        : bnfCreators(notice?.authors ?? []),
       releaseDate: identity.year
         ? String(identity.year)
-        : (notice.publicationDate ?? undefined),
+        : (notice?.publicationDate ?? gbooks?.publishedDate ?? undefined),
       coverUrl: identity.coverUrl ?? undefined,
       description,
       metadata: {
@@ -666,7 +820,7 @@ export class MalAdapter
           isbn,
           confidence: identity.confidence,
           authorMatched: identity.matchedBy === 'title+author',
-          resolutionPath: useOriginal ? 'bnf+mangadex' : 'bnf+mangadex-fr',
+          resolutionPath,
           malId: identity.malId,
           anilistId: identity.anilistId,
           mangaId: identity.mangaId,
@@ -675,7 +829,7 @@ export class MalAdapter
         num_volumes: numVolumes,
         status: identity.status,
         genres: identity.genres,
-        scannedTome: buildScannedTomeMeta(notice, isbn),
+        scannedTome: buildScannedTomeMeta(notice, isbn, gbooks),
       },
       rawData: identity,
     };
@@ -724,8 +878,30 @@ function pendingKey(state: string): string {
  * Métadonnées du tome scanné, à reporter dans le tome créé côté client. Partagé
  * par le chemin enrichi (bnf+mal) et le repli bnf_only pour garantir le même
  * contrat de sortie quelle que soit la réussite de l'enrichissement MAL.
+ *
+ * `notice` à `null` = repli Google Books : il n'y a pas de notice BnF, `gbooks` en tient lieu. On ne
+ * fabrique pas de fausse notice — les champs proprement BnF (édition 205$a, éditeur, plage 454$h)
+ * restent `null`, ce qui est la vérité : personne ne les a fournis.
  */
-function buildScannedTomeMeta(notice: BnfNotice, isbn: string) {
+function buildScannedTomeMeta(
+  notice: BnfNotice | null,
+  isbn: string,
+  gbooks?: GbooksTomeContext,
+) {
+  if (!notice) {
+    return {
+      isbn,
+      titleFr: gbooks?.titleFr ?? null,
+      seriesTitleFr: gbooks?.seriesTitleFr ?? null,
+      // Aligné sur `notice.volume` (chaîne) : le zéro-padding BnF ("09") impose de toute façon une
+      // comparaison numérique côté app.
+      volume: gbooks?.volume != null ? String(gbooks.volume) : null,
+      edition: null,
+      publisherFr: null,
+      sourceVolumeRange: null,
+      sourceVolumeLabel: null,
+    };
+  }
   return {
     isbn,
     titleFr: notice.titleFr,

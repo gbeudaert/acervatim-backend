@@ -4,13 +4,19 @@ import { ApiCacheService } from '../../cache/api-cache.service';
 import { GoogleBooksResolver } from './googlebooks.resolver';
 import {
   CachedCover,
+  CachedVolumeInfo,
   CoverJobData,
   CoverResult,
   FAIL_TTL_SECONDS,
   GBOOKS_QUEUE,
+  GBOOKS_VOLUME_INFO_JOB,
+  GBooksJobData,
+  GBooksJobResult,
   HIT_TTL_SECONDS,
   MISS_TTL_SECONDS,
+  VolumeInfoJobData,
   coverCacheKey,
+  volumeInfoCacheKey,
 } from './googlebooks.types';
 
 /**
@@ -24,6 +30,10 @@ import {
  * (`isbn:` puis repli `intitle:`) et le `HttpClientService` retente 3× (503 → 3 requêtes), ce qui
  * amplifie l'engorgement. `concurrency: 1` sérialise donc les appels entre tomes ; `max: 4` laisse
  * une marge confortable vs. le seuil observé (l'ancien 10 req/s le déclenchait encore).
+ *
+ * Deux jobs, discriminés par `job.name` : `cover` (jaquette + résumé d'un tome) et `volume-info`
+ * (titre par ISBN, maillon d'entrée du repli `Google Books → MangaDex`). Même file, donc **un seul**
+ * throttle sortant pour tout ce qui parle à Google.
  *
  * Cache sur 2xx : si `fetchCover` renvoie (HTTP 2xx), on met en cache — jaquette (`HIT_TTL`) ou
  * absence d'image légitime (`url: null`, `MISS_TTL`). Si `fetchCover` **jette** (réseau / 4xx / 5xx
@@ -44,8 +54,18 @@ export class GoogleBooksProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<CoverJobData, CoverResult>): Promise<CoverResult> {
-    const { isbn, hint } = job.data;
+  async process(
+    job: Job<GBooksJobData, GBooksJobResult>,
+  ): Promise<GBooksJobResult> {
+    if (job.name === GBOOKS_VOLUME_INFO_JOB) {
+      return this.processVolumeInfo(job.data as VolumeInfoJobData);
+    }
+    return this.processCover(job.data as CoverJobData);
+  }
+
+  /** Jaquette + résumé d'un tome (jaquette `HIT_TTL`, absence confirmée `MISS_TTL`). */
+  private async processCover(data: CoverJobData): Promise<CoverResult> {
+    const { isbn, hint } = data;
     const key = coverCacheKey(isbn);
 
     let res: CoverResult;
@@ -70,5 +90,36 @@ export class GoogleBooksProcessor extends WorkerHost {
     );
 
     return res;
+  }
+
+  /**
+   * Titre par ISBN (repli `Google Books → MangaDex`). Même politique de cache que la jaquette : un
+   * titre trouvé est stable (`HIT_TTL`), une absence 2xx peut être comblée par une notice Google
+   * plus tardive (`MISS_TTL`), un échec dur pose un cache négatif court (`FAIL_TTL`) puis re-jette —
+   * le backoff BullMQ retente en fond et écrase l'entrée dès qu'une tentative aboutit.
+   */
+  private async processVolumeInfo(
+    data: VolumeInfoJobData,
+  ): Promise<CachedVolumeInfo> {
+    const key = volumeInfoCacheKey(data.isbn);
+
+    let info: CachedVolumeInfo['info'];
+    try {
+      info = await this.resolver.fetchVolumeInfo(data.isbn);
+    } catch (err) {
+      await this.cache.set<CachedVolumeInfo>(
+        key,
+        { info: null },
+        FAIL_TTL_SECONDS,
+      );
+      throw err;
+    }
+
+    await this.cache.set<CachedVolumeInfo>(
+      key,
+      { info },
+      info ? HIT_TTL_SECONDS : MISS_TTL_SECONDS,
+    );
+    return { info };
   }
 }

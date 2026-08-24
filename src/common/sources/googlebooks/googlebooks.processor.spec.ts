@@ -4,19 +4,34 @@ import {
   CoverJobData,
   CoverResult,
   FAIL_TTL_SECONDS,
+  GBOOKS_COVER_JOB,
+  GBOOKS_VOLUME_INFO_JOB,
+  GBooksJobData,
+  GBooksJobResult,
   HIT_TTL_SECONDS,
   MISS_TTL_SECONDS,
+  VolumeInfoJobData,
 } from './googlebooks.types';
 
 function make() {
   const cache = { set: jest.fn() };
-  const resolver = { fetchCover: jest.fn() };
+  const resolver = { fetchCover: jest.fn(), fetchVolumeInfo: jest.fn() };
   const proc = new GoogleBooksProcessor(resolver as never, cache as never);
   return { proc, cache, resolver };
 }
 
 function job(data: CoverJobData): Job<CoverJobData, CoverResult> {
-  return { data } as Job<CoverJobData, CoverResult>;
+  return { data, name: GBOOKS_COVER_JOB } as Job<CoverJobData, CoverResult>;
+}
+
+/** Job `volume-info` — c'est `job.name` qui discrimine les deux jobs de la file `gbooks`. */
+function volumeInfoJob(
+  data: VolumeInfoJobData,
+): Job<GBooksJobData, GBooksJobResult> {
+  return { data, name: GBOOKS_VOLUME_INFO_JOB } as Job<
+    GBooksJobData,
+    GBooksJobResult
+  >;
 }
 
 describe('GoogleBooksProcessor.process', () => {
@@ -76,6 +91,58 @@ describe('GoogleBooksProcessor.process', () => {
     expect(cache.set).toHaveBeenCalledWith(
       'gbooks:cover:9782505011943',
       { url: null, description: null, status: 'unresolved' },
+      FAIL_TTL_SECONDS,
+    );
+  });
+});
+
+describe('GoogleBooksProcessor.process — job volume-info (titre par ISBN)', () => {
+  it('cache le titre trouvé en TTL long (un titre est stable) et le renvoie', async () => {
+    const { proc, cache, resolver } = make();
+    const info = {
+      title: 'Sentenced to be a Hero Tome 1',
+      authors: ['Rokurou Akashi'],
+      publishedDate: '2026-05-22',
+    };
+    resolver.fetchVolumeInfo.mockResolvedValue(info);
+
+    const res = await proc.process(volumeInfoJob({ isbn: '9782808703437' }));
+
+    expect(res).toEqual({ info });
+    expect(cache.set).toHaveBeenCalledWith(
+      'gbooks:volume:9782808703437',
+      { info },
+      HIT_TTL_SECONDS,
+    );
+    // La jaquette n'est pas résolue au passage : deux jobs, deux clés.
+    expect(resolver.fetchCover).not.toHaveBeenCalled();
+  });
+
+  it('cache une absence légitime (Google ne connaît pas cet ISBN) en TTL court', async () => {
+    const { proc, cache, resolver } = make();
+    resolver.fetchVolumeInfo.mockResolvedValue(null);
+
+    const res = await proc.process(volumeInfoJob({ isbn: '9782344073674' }));
+
+    expect(res).toEqual({ info: null });
+    // TTL court : une notice Google peut apparaître plus tard pour une nouveauté.
+    expect(cache.set).toHaveBeenCalledWith(
+      'gbooks:volume:9782344073674',
+      { info: null },
+      MISS_TTL_SECONDS,
+    );
+  });
+
+  it('pose un cache négatif court (FAIL_TTL) sur échec dur puis propage', async () => {
+    const { proc, cache, resolver } = make();
+    resolver.fetchVolumeInfo.mockRejectedValue(new Error('google 503'));
+
+    await expect(
+      proc.process(volumeInfoJob({ isbn: '9782808703437' })),
+    ).rejects.toThrow('google 503');
+    expect(cache.set).toHaveBeenCalledWith(
+      'gbooks:volume:9782808703437',
+      { info: null },
       FAIL_TTL_SECONDS,
     );
   });

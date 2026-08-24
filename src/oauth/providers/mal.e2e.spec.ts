@@ -7,6 +7,7 @@ import { ApiCacheService } from '../../common/cache/api-cache.service';
 import { HttpClientService } from '../../common/http/http-client.service';
 import { BnfService } from '../../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../../common/sources/googlebooks/googlebooks.service';
+import { MangaDexCoverService } from '../../common/sources/mangadex/mangadex.service';
 import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService } from '../oauth.service';
 import { TokenResolverService } from '../token-resolver.service';
@@ -81,6 +82,7 @@ describe('Mal queue (e2e, Redis réel)', () => {
         { provide: OauthCredentialsService, useValue: {} },
         { provide: BnfService, useValue: {} },
         { provide: GoogleBooksCoverService, useValue: {} },
+        { provide: MangaDexCoverService, useValue: {} },
       ],
     }).compile();
 

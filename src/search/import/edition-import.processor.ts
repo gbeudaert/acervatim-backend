@@ -26,7 +26,7 @@ export class EditionImportProcessor extends WorkerHost {
   async process(
     job: Job<EditionImportJobData, EditionImportResult>,
   ): Promise<EditionImportResult> {
-    const { title, edition, malId } = job.data;
+    const { title, edition, malId, mangaId } = job.data;
 
     // Phase 1 : énumération BnF (le total n'est connu qu'après). On l'annonce pour l'UI.
     await job.updateProgress({ phase: 'enumerating', done: 0, total: 0 });
@@ -39,6 +39,7 @@ export class EditionImportProcessor extends WorkerHost {
         void job.updateProgress({ phase: 'covers', done, total });
       },
       malId ?? undefined,
+      mangaId ?? undefined,
     );
 
     return { tomeCount: mapping.tomes.length };

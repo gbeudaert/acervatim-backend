@@ -36,6 +36,7 @@ export class EditionImportService {
     title: string,
     edition?: string,
     malId?: string,
+    mangaId?: string,
   ): Promise<{ jobId: string; state: ApiJobState }> {
     // Circuit-breaker : Redis down → 503 immédiat (l'app retombe sur son import local). Évite
     // d'attendre l'erreur de connexion BullMQ (cf. RedisHealthService).
@@ -58,7 +59,12 @@ export class EditionImportService {
 
     await this.queue.add(
       EDITION_IMPORT_JOB,
-      { title, edition: edition ?? null, malId: malId ?? null },
+      {
+        title,
+        edition: edition ?? null,
+        malId: malId ?? null,
+        mangaId: mangaId ?? null,
+      },
       {
         jobId,
         // Complétion gardée assez longtemps pour que l'app poll voie `done` ; échec retiré vite

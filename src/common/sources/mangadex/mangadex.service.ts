@@ -21,6 +21,7 @@ import {
   MangaDexJobData,
   MangaDexJobResult,
   MangaDexSeriesCovers,
+  SeriesCoverLookup,
   seriesCacheKey,
   seriesJobId,
 } from './mangadex.types';
@@ -75,24 +76,25 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
    * le réchauffage réel passe par le worker d'import via {@link resolveSeriesCovers}.
    */
   async cachedSeriesCovers(
-    malId: string | null,
     title: string,
+    lookup: SeriesCoverLookup,
   ): Promise<MangaDexSeriesCovers> {
     const hit = await this.cache.get<MangaDexSeriesCovers>(
-      seriesCacheKey(malId, title),
+      seriesCacheKey(lookup.malId, title),
     );
     return hit ?? UNRESOLVED;
   }
 
   /**
    * Résout (réseau, best-effort) et met en cache les couvertures de la série. Hit de cache →
-   * immédiat. Sinon enfile un job `mangadex` (dédup par série) et attend son résultat.
+   * immédiat. Sinon enfile un job `mangadex` (dédup par série) et attend son résultat. `lookup` porte
+   * les indices d'identification (mangaId/malId/auteurs) transmis au résolveur.
    */
   async resolveSeriesCovers(
-    malId: string | null,
     title: string,
+    lookup: SeriesCoverLookup,
   ): Promise<MangaDexSeriesCovers> {
-    const key = seriesCacheKey(malId, title);
+    const key = seriesCacheKey(lookup.malId, title);
     const cached = await this.cache.get<MangaDexSeriesCovers>(key);
     if (cached) return cached;
 
@@ -101,9 +103,14 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
     try {
       const job = await this.queue.add(
         MANGADEX_COVERS_JOB,
-        { title, malId: malId ?? null },
         {
-          jobId: seriesJobId(malId, title),
+          title,
+          mangaId: lookup.mangaId ?? null,
+          malId: lookup.malId ?? null,
+          authors: lookup.authors ?? [],
+        },
+        {
+          jobId: seriesJobId(lookup.malId, title),
           removeOnComplete: { age: 60, count: 500 },
           // MangaDex 5xx est rare mais possible ; petit backoff pour absorber une vague.
           attempts: 3,
@@ -117,7 +124,7 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
       )) as MangaDexSeriesCovers;
     } catch {
       this.logger.warn(
-        `mangadex: resolve failed title="${title}" mal=${malId ?? '-'}`,
+        `mangadex: resolve failed title="${title}" mal=${lookup.malId ?? '-'}`,
       );
       return UNRESOLVED;
     }

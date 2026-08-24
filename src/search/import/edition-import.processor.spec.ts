@@ -11,9 +11,10 @@ function make() {
   return { proc, search };
 }
 
-function job(
-  data: EditionImportJobData,
-): Job<EditionImportJobData, EditionImportResult> & {
+function job(data: EditionImportJobData): Job<
+  EditionImportJobData,
+  EditionImportResult
+> & {
   updateProgress: jest.Mock;
 } {
   return {
@@ -39,15 +40,21 @@ describe('EditionImportProcessor.process', () => {
       },
     );
 
-    const j = job({ title: 'Black torch', edition: null, malId: null });
+    const j = job({
+      title: 'Black torch',
+      edition: null,
+      malId: null,
+      mangaId: null,
+    });
     const res = await proc.process(j);
 
     expect(res).toEqual<EditionImportResult>({ tomeCount: 3 });
-    // edition null + malId null → transmis en undefined à warmEditionMapping.
+    // edition null + malId/mangaId null → transmis en undefined à warmEditionMapping.
     expect(search.warmEditionMapping).toHaveBeenCalledWith(
       'Black torch',
       undefined,
       expect.any(Function),
+      undefined,
       undefined,
     );
     // Phase d'énumération annoncée, puis progression des jaquettes.
@@ -67,12 +74,15 @@ describe('EditionImportProcessor.process', () => {
     const { proc, search } = make();
     search.warmEditionMapping.mockResolvedValue({ tomes: [] });
 
-    await proc.process(job({ title: 'X', edition: 'Éd. colossale', malId: null }));
+    await proc.process(
+      job({ title: 'X', edition: 'Éd. colossale', malId: null, mangaId: null }),
+    );
 
     expect(search.warmEditionMapping).toHaveBeenCalledWith(
       'X',
       'Éd. colossale',
       expect.any(Function),
+      undefined,
       undefined,
     );
   });

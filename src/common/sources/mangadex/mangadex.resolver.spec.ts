@@ -175,3 +175,242 @@ describe('MangaDexResolver.identify', () => {
     expect(identity!.matchedBy).toBe('title');
   });
 });
+
+const ODA: BnfAuthor[] = [
+  { surname: 'Oda', given: 'Eiichiro', full: 'Eiichiro Oda' },
+];
+
+describe('MangaDexResolver.identify — drapeau ambiguous', () => {
+  /**
+   * Entrée MangaDex minimale : titre EN + alt-titres (c'est par eux que la série FR est retrouvée —
+   * « Boku no Hero Academia » porte l'alt-titre « My Hero Academia »), et des auteurs optionnels.
+   */
+  function entity(
+    id: string,
+    title: string,
+    opts: { alt?: string[]; authors?: string[] } = {},
+  ) {
+    return {
+      id,
+      attributes: {
+        title: { en: title },
+        altTitles: (opts.alt ?? []).map((t) => ({ fr: t })),
+        links: {},
+      },
+      relationships: (opts.authors ?? []).map((name) => ({
+        type: 'author',
+        attributes: { name },
+      })),
+    };
+  }
+
+  it('« Frieren » : deux candidats contiennent la requête → ambiguous, et le crossover ne passe pas devant', async () => {
+    const { resolver, http } = makeResolver();
+    // Relevé réel : la série s'appelle « Sousou no Frieren », aucun candidat n'égale « Frieren »,
+    // et le crossover parasite est mieux classé. Les deux ont un titleScore de 1.00 (contenance).
+    routeHttp(http, {
+      manga: {
+        data: [
+          entity('md-crossover', 'Frieren Cinnamoroll Kamigata'),
+          entity('md-frieren', 'Sousou no Frieren'),
+        ],
+      },
+    });
+
+    const identity = await resolver.identify('Frieren', []);
+
+    expect(identity).not.toBeNull();
+    expect(identity!.ambiguous).toBe(true);
+    // Le repli Google Books refusera sur ce drapeau (aucun auteur pour arbitrer) : c'est ainsi que
+    // « Frieren Cinnamoroll Kamigata » est écarté, sans toucher au seuil PIVOT_TITLE_STRONG.
+    expect(identity!.matchedBy).toBe('title');
+  });
+
+  it('l’auteur redevient l’arbitre quand Google Books le fournit : la vraie série gagne, malgré l’ambiguïté', async () => {
+    const { resolver, http } = makeResolver();
+    routeHttp(http, {
+      manga: {
+        data: [
+          entity('md-crossover', 'Frieren Cinnamoroll Kamigata'),
+          entity('md-frieren', 'Sousou no Frieren', {
+            authors: ['Kanehito Yamada'],
+          }),
+        ],
+      },
+    });
+
+    const identity = await resolver.identify('Frieren', [
+      { full: 'Kanehito Yamada' },
+    ]);
+
+    expect(identity!.mangaId).toBe('md-frieren');
+    expect(identity!.matchedBy).toBe('title+author');
+    // Le drapeau reste vrai (deux titres ex aequo) mais l'appelant ne s'en sert pas : l'auteur a tranché.
+    expect(identity!.ambiguous).toBe(true);
+  });
+
+  // Pièges relevés le 2026-08-23 : le spin-off / l'édition colorisée CONTIENT la requête (score de
+  // titre 1.00 comme la vraie série) et remonte devant elle. Seul le bonus d'égalité exacte départage
+  // — la série principale, elle, porte le titre FR exact en titre ou en alt-titre.
+  it.each([
+    ['Naruto', 'Naruto', 'Naruto : Uzumaki Illegitimate', []],
+    [
+      'My hero academia',
+      'Boku no Hero Academia',
+      'Vigilante : My Hero Academia Illegals',
+      ['My Hero Academia'],
+    ],
+    [
+      'Tokyo Revengers',
+      'Toukyou Revengers',
+      'Tokyo Revengers : Baji Keisuke',
+      ['Tokyo Revengers'],
+    ],
+    ['Bleach', 'Bleach', 'Bleach (Official Colored)', []],
+  ])('« %s » retient %s, jamais %s', async (query, expected, decoy, alt) => {
+    const { resolver, http } = makeResolver();
+    // Le decoy est en tête de liste, comme chez MangaDex : c'est le bonus d'égalité exacte qui
+    // départage, pas le rang.
+    routeHttp(http, {
+      manga: {
+        data: [
+          entity('md-decoy', decoy as string),
+          entity('md-main', expected as string, { alt: alt as string[] }),
+        ],
+      },
+    });
+
+    const identity = await resolver.identify(query as string, []);
+
+    expect(identity!.mangaId).toBe('md-main');
+    // `title` est le titre d'affichage (FR préféré) : c'est l'identité retenue qui compte ici, pas
+    // la langue affichée — d'où l'assertion sur `titleRomaji`, qui porte bien la série principale.
+    expect(identity!.titleRomaji).toBe(expected);
+    // Les deux candidats sont ex aequo sur le titre : sans auteur, le repli Google Books refuse.
+    expect(identity!.ambiguous).toBe(true);
+  });
+
+  it('candidat unique (cas « Sentenced to be a Hero ») → pas d’ambiguïté, le repli peut accepter', async () => {
+    const { resolver, http } = makeResolver();
+    routeHttp(http, {
+      manga: {
+        data: [entity('md-hero', 'Yuusha-kei ni Shosu Sentenced to be a Hero')],
+      },
+    });
+
+    const identity = await resolver.identify('Sentenced to be a Hero', []);
+
+    expect(identity).not.toBeNull();
+    expect(identity!.ambiguous).toBe(false);
+  });
+});
+
+describe('MangaDexResolver.fetchSeriesCovers', () => {
+  it('mangaId connu → jaquettes lues directement, SANS recherche par titre', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockImplementation((url: string) => {
+      if (url.includes('/cover?'))
+        return Promise.resolve(
+          ok({
+            data: [
+              { attributes: { volume: '1', fileName: 'v1.jpg', locale: 'fr' } },
+            ],
+          }),
+        );
+      return Promise.reject(new Error(`unexpected url ${url}`));
+    });
+
+    const res = await resolver.fetchSeriesCovers('One piece', {
+      mangaId: 'md-op',
+      malId: null,
+      authors: [],
+    });
+
+    expect(res.status).toBe('found');
+    expect(res.mangaId).toBe('md-op');
+    expect(res.volumes['1'].url).toContain('/covers/md-op/v1.jpg');
+    // Aucun /manga? : on n'a PAS cherché par titre.
+    expect(
+      http.request.mock.calls.every(([u]) => !String(u).includes('/manga?')),
+    ).toBe(true);
+  });
+
+  it('sans id → valide par auteur ET préfère l’entrée canonique (links.mal) à la variante colorisée', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockImplementation((url: string) => {
+      if (url.includes('/manga?'))
+        return Promise.resolve(
+          ok({
+            data: [
+              // Rang 0 : variante colorisée (même titre+auteur, PAS de links.mal).
+              {
+                id: 'op-colored',
+                attributes: { title: { en: 'One Piece' }, links: {} },
+                relationships: [
+                  { type: 'author', attributes: { name: 'Eiichiro Oda' } },
+                ],
+              },
+              // Rang 1 : œuvre canonique (links.mal présent).
+              {
+                id: 'op-canon',
+                attributes: {
+                  title: { en: 'One Piece' },
+                  links: { mal: '13' },
+                },
+                relationships: [
+                  { type: 'author', attributes: { name: 'Eiichiro Oda' } },
+                ],
+              },
+            ],
+          }),
+        );
+      if (url.includes('/cover?'))
+        return Promise.resolve(
+          ok({
+            data: [
+              { attributes: { volume: '1', fileName: 'c1.jpg', locale: 'fr' } },
+            ],
+          }),
+        );
+      return Promise.reject(new Error(`unexpected url ${url}`));
+    });
+
+    const res = await resolver.fetchSeriesCovers('One piece', {
+      mangaId: null,
+      malId: null,
+      authors: ODA,
+    });
+
+    expect(res.mangaId).toBe('op-canon'); // canonique préféré malgré le rang inférieur
+  });
+
+  it('sans id ni auteur exploitable (bnf_only) → absent → l’appelant replie sur l’ISBN', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockImplementation((url: string) => {
+      if (url.includes('/manga?'))
+        return Promise.resolve(
+          ok({
+            data: [
+              {
+                id: 'op-colored',
+                attributes: { title: { en: 'One Piece' }, links: {} },
+                relationships: [
+                  { type: 'author', attributes: { name: 'Eiichiro Oda' } },
+                ],
+              },
+            ],
+          }),
+        );
+      return Promise.reject(new Error(`unexpected url ${url}`));
+    });
+
+    const res = await resolver.fetchSeriesCovers('One piece', {
+      mangaId: null,
+      malId: null,
+      authors: [], // aucun auteur BnF → pas de validation possible
+    });
+
+    expect(res.status).toBe('absent');
+    expect(res.mangaId).toBeNull();
+  });
+});

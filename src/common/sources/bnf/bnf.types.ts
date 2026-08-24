@@ -99,6 +99,12 @@ export interface EditionMapping {
   tomeCount: number;
   /** Tomes ordonnés par n° d'édition. */
   tomes: EditionTome[];
+  /**
+   * Auteurs de la série (700/701 agrégés sur les tomes énumérés, dédupliqués). Sert à **valider par
+   * l'auteur** le rapprochement MangaDex des jaquettes quand aucun `mangaId`/`malId` n'est fourni
+   * (chemin bnf_only) — le titre seul peut matcher une variante (édition colorisée…), l'auteur tranche.
+   */
+  authors: BnfAuthor[];
   /** Notices BnF parcourues (pour audit du bruit). */
   recordsScanned: number;
   /** Au moins une notice en cours de publication → mapping potentiellement partiel. */

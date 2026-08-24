@@ -8,7 +8,13 @@ import { RedisHealthService } from '../../redis/redis-health.service';
 import { GoogleBooksCoverService } from './googlebooks.service';
 import { GoogleBooksProcessor } from './googlebooks.processor';
 import { GoogleBooksResolver } from './googlebooks.resolver';
-import { CachedCover, GBOOKS_QUEUE, coverCacheKey } from './googlebooks.types';
+import {
+  CachedCover,
+  CachedVolumeInfo,
+  GBOOKS_QUEUE,
+  coverCacheKey,
+  volumeInfoCacheKey,
+} from './googlebooks.types';
 
 /**
  * E2E de la file `gbooks` contre un **vrai Redis** (BullMQ producteur → worker → QueueEvents).
@@ -36,7 +42,7 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe('GoogleBooks queue (e2e, Redis réel)', () => {
   let app: INestApplication;
   let svc: GoogleBooksCoverService;
-  let resolver: { fetchCover: jest.Mock };
+  let resolver: { fetchCover: jest.Mock; fetchVolumeInfo: jest.Mock };
   let cache: InMemoryCache;
   let queue: Queue;
 
@@ -60,7 +66,10 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
       providers: [
         GoogleBooksCoverService,
         GoogleBooksProcessor,
-        { provide: GoogleBooksResolver, useValue: { fetchCover: jest.fn() } },
+        {
+          provide: GoogleBooksResolver,
+          useValue: { fetchCover: jest.fn(), fetchVolumeInfo: jest.fn() },
+        },
         { provide: ApiCacheService, useValue: cache },
         { provide: RedisHealthService, useValue: { isAvailable: () => true } },
       ],
@@ -83,6 +92,7 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
 
   beforeEach(() => {
     resolver.fetchCover.mockReset();
+    resolver.fetchVolumeInfo.mockReset();
   });
 
   it('résout de bout en bout et met en cache le résultat (2xx)', async () => {
@@ -170,5 +180,65 @@ describe('GoogleBooks queue (e2e, Redis réel)', () => {
       status: 'found',
     });
     expect(resolver.fetchCover).not.toHaveBeenCalled();
+  });
+  it('volume-info : titre par ISBN de bout en bout, mis en cache sous sa propre clé', async () => {
+    const isbn = '9782808703437';
+    resolver.fetchVolumeInfo.mockResolvedValue({
+      title: 'Sentenced to be a Hero Tome 1',
+      authors: ['Rokurou Akashi'],
+      publishedDate: '2026-05-22',
+    });
+
+    const info = await svc.resolveVolumeInfo(isbn);
+
+    expect(info?.title).toBe('Sentenced to be a Hero Tome 1');
+    expect(resolver.fetchVolumeInfo).toHaveBeenCalledTimes(1);
+    // Clé distincte de la jaquette : les deux jobs du même ISBN coexistent sans se dédupliquer.
+    expect(cache.store.get(volumeInfoCacheKey(isbn))).toEqual<CachedVolumeInfo>(
+      {
+        info: {
+          title: 'Sentenced to be a Hero Tome 1',
+          authors: ['Rokurou Akashi'],
+          publishedDate: '2026-05-22',
+        },
+      },
+    );
+    expect(cache.store.has(coverCacheKey(isbn))).toBe(false);
+
+    // 2e passage : servi du cache, aucun appel réseau.
+    resolver.fetchVolumeInfo.mockClear();
+    expect((await svc.resolveVolumeInfo(isbn))?.title).toBe(
+      'Sentenced to be a Hero Tome 1',
+    );
+    expect(resolver.fetchVolumeInfo).not.toHaveBeenCalled();
+  });
+
+  it('volume-info : ISBN inconnu de Google (2xx sans notice) → négatif caché, pas de re-tentative', async () => {
+    const isbn = '9782344073674';
+    resolver.fetchVolumeInfo.mockResolvedValue(null);
+
+    expect(await svc.resolveVolumeInfo(isbn)).toBeNull();
+    expect(cache.store.get(volumeInfoCacheKey(isbn))).toEqual<CachedVolumeInfo>(
+      { info: null },
+    );
+
+    resolver.fetchVolumeInfo.mockClear();
+    expect(await svc.resolveVolumeInfo(isbn)).toBeNull();
+    expect(resolver.fetchVolumeInfo).not.toHaveBeenCalled();
+  });
+
+  it('volume-info : single-flight — N scans concurrents du même ISBN → un seul appel sortant', async () => {
+    const isbn = '9780000000006';
+    resolver.fetchVolumeInfo.mockImplementation(async () => {
+      await delay(150);
+      return { title: 'Blue Lock Tome 33', authors: [], publishedDate: null };
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => svc.resolveVolumeInfo(isbn)),
+    );
+
+    expect(resolver.fetchVolumeInfo).toHaveBeenCalledTimes(1);
+    for (const r of results) expect(r?.title).toBe('Blue Lock Tome 33');
   });
 });

@@ -17,6 +17,13 @@ export interface GoogleBooksVolume {
     /** 200$a côté Google — titre commercial FR (ex "Jujutsu Kaisen T06"), pour le repli par titre. */
     title?: string;
     /**
+     * Auteurs de la notice. Présents dans 42 % des notices manga FR mesurées (35/83) : quand ils le
+     * sont, ils rendent son rôle d'arbitre à `matchesAuthor` sur le repli Google Books → MangaDex.
+     */
+    authors?: string[];
+    /** Date de publication brute (« 2026-05-22 », « 2026 »). */
+    publishedDate?: string;
+    /**
      * Métadonnées de série Google. `bookDisplayNumber` = n° de tome affiché ("6") — signal
      * STRUCTURÉ, plus fiable que d'extraire le tome du titre. Absent des romans/artbooks, ce qui
      * les écarte naturellement. (`seriesId` distingue les séries/éditions mais l'ISBN scanné n'en
@@ -42,6 +49,13 @@ export const GBOOKS_QUEUE = 'gbooks';
 
 /** Nom du job dans la file `gbooks`. */
 export const GBOOKS_COVER_JOB = 'cover';
+
+/**
+ * Nom du job : **titre par ISBN** (`q=isbn:<isbn>`), maillon d'entrée du repli
+ * `Google Books → MangaDex` quand la BnF ne connaît pas l'ISBN scanné. Même file que les jaquettes :
+ * un seul throttle sortant, un seul single-flight, un seul cache pour tout ce qui parle à Google.
+ */
+export const GBOOKS_VOLUME_INFO_JOB = 'volume-info';
 
 // Une jaquette est stable ; une absence peut être comblée plus tard (nouvelle notice Google).
 export const HIT_TTL_SECONDS = 90 * 24 * 3600;
@@ -125,4 +139,41 @@ export function normalizeIsbn(isbn: string): string | null {
 
 export function coverCacheKey(normIsbn: string): string {
   return `gbooks:cover:${normIsbn}`;
+}
+
+// ---------- Contrat « titre par ISBN » (repli Google Books → MangaDex) ----------
+
+/**
+ * Notice Google Books réduite au strict nécessaire du repli : le titre commercial (brut, non
+ * normalisé — c'est {@link titleLadder} qui en tire un préfixe interrogeable), les auteurs quand
+ * Google les fournit, et la date de publication.
+ */
+export interface VolumeInfo {
+  title: string;
+  authors: string[];
+  publishedDate: string | null;
+}
+
+/**
+ * Enveloppe de cache : `info: null` = « 2xx, mais Google ne connaît pas cet ISBN » (absence
+ * légitime, TTL court) — indistinguable sans enveloppe d'un « jamais résolu » (absent du cache).
+ */
+export interface CachedVolumeInfo {
+  info: VolumeInfo | null;
+}
+
+/** Payload d'un job `gbooks:volume-info` : ISBN **déjà normalisé**. */
+export interface VolumeInfoJobData {
+  isbn: string;
+}
+
+/** Payload de la file `gbooks` — discriminé par `job.name` ({@link GBOOKS_COVER_JOB} / VOLUME_INFO). */
+export type GBooksJobData = CoverJobData | VolumeInfoJobData;
+
+/** Résultat de la file `gbooks` : jaquette+résumé, ou notice réduite cachable. */
+export type GBooksJobResult = CoverResult | CachedVolumeInfo;
+
+/** Clé de cache du titre par ISBN — distincte de {@link coverCacheKey} (donc jobId distinct). */
+export function volumeInfoCacheKey(normIsbn: string): string {
+  return `gbooks:volume:${normIsbn}`;
 }

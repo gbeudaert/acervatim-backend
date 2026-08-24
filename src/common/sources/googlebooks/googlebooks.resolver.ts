@@ -7,6 +7,7 @@ import {
   GoogleBooksImageLinks,
   GoogleBooksVolume,
   GoogleBooksVolumesResponse,
+  VolumeInfo,
   normalizeIsbn,
 } from './googlebooks.types';
 
@@ -20,6 +21,14 @@ const BASE_URL = 'https://www.googleapis.com/books/v1/volumes';
  * désormais sur ce repli) ; les vagues 503 *soutenues* restent gérées par le backoff long job-level.
  */
 const FALLBACK_QUERY_ATTEMPTS = 3;
+
+/**
+ * Tentatives HTTP du **titre par ISBN** (repli `Google Books → MangaDex`). Contrairement à la
+ * jaquette, `isbn:` est ici la SEULE requête possible — il n'y a pas de repli `intitle:` derrière
+ * (c'est précisément le titre qu'on cherche). Un 503 intermittent y coûterait tout le repli : on
+ * retente comme sur `intitle:`.
+ */
+const VOLUME_INFO_ATTEMPTS = 3;
 
 /**
  * Résolution **réseau** d'une jaquette Google Books par ISBN — sans cache ni throttle : ces
@@ -88,6 +97,36 @@ export class GoogleBooksResolver {
       coverUrl,
       description: descriptionOf(chosen),
       status: coverUrl ? 'found' : 'absent',
+    };
+  }
+
+  /**
+   * **Titre par ISBN** — maillon d'entrée du repli déclenché quand la BnF ne connaît pas l'ISBN
+   * scanné (nouveauté non encore cataloguée, éditeur non français). Renvoie le titre commercial
+   * brut, les auteurs quand Google les fournit (42 % des notices manga FR mesurées) et la date.
+   *
+   * `null` = 2xx sans notice exploitable (absence légitime, à cacher en MISS). Un échec réseau/503
+   * **propage** : le worker le classera en cache négatif court et re-tentera.
+   */
+  async fetchVolumeInfo(isbn: string): Promise<VolumeInfo | null> {
+    const norm = normalizeIsbn(isbn);
+    if (!norm) return null;
+
+    const items = await this.queryVolumes(
+      `isbn:${norm}`,
+      undefined,
+      VOLUME_INFO_ATTEMPTS,
+    );
+    const info = items[0]?.volumeInfo;
+    const title = info?.title?.trim();
+    if (!title) return null;
+
+    return {
+      title,
+      authors: (info?.authors ?? [])
+        .map((a) => a.trim())
+        .filter((a) => a.length > 0),
+      publishedDate: info?.publishedDate?.trim() || null,
     };
   }
 

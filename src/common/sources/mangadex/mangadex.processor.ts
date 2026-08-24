@@ -54,12 +54,16 @@ export class MangaDexProcessor extends WorkerHost {
   private async processCovers(
     data: MangaDexCoversJobData,
   ): Promise<MangaDexSeriesCovers> {
-    const { title, malId } = data;
+    const { title, mangaId, malId, authors } = data;
     const key = seriesCacheKey(malId, title);
 
     let res: MangaDexSeriesCovers;
     try {
-      res = await this.resolver.fetchSeriesCovers(title, malId);
+      res = await this.resolver.fetchSeriesCovers(title, {
+        mangaId: mangaId ?? null,
+        malId: malId ?? null,
+        authors: authors ?? [],
+      });
     } catch (err) {
       await this.cache.set<MangaDexSeriesCovers>(
         key,

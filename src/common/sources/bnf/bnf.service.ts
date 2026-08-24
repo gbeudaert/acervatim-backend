@@ -194,6 +194,7 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
       edition,
       tomeCount: 0,
       tomes: [],
+      authors: [],
       recordsScanned: 0,
       ongoing: false,
     };
@@ -206,6 +207,9 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
     const wantSeries = normalizeSeriesKey(titleFr);
 
     const byVolume = new Map<number, EditionTome>();
+    // Auteurs de la série, agrégés sur les notices membres (toutes éditions confondues) et
+    // dédupliqués : servent à valider par l'auteur le rapprochement MangaDex des jaquettes.
+    const seriesAuthors = new Map<string, BnfAuthor>();
     let ongoing = false;
     for (const rec of records) {
       // Appartenance à la série : le catalogage BnF varie (461$t « fait partie de »,
@@ -218,6 +222,11 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
           null,
       );
       if (recSeries !== wantSeries) continue;
+
+      for (const a of extractAuthors(rec)) {
+        const key = normalizeSeriesKey(a.full ?? a.surname ?? a.given ?? '');
+        if (key && !seriesAuthors.has(key)) seriesAuthors.set(key, a);
+      }
 
       const rec205 = normalizeEdition(firstSubfield(rec, '205', 'a') ?? null);
       if (rec205 !== wantEdition) continue; // mauvaise édition (ou standard vs collector)
@@ -279,6 +288,7 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
       edition,
       tomeCount: tomes.length,
       tomes,
+      authors: [...seriesAuthors.values()],
       recordsScanned: records.length,
       ongoing,
     };

@@ -12,14 +12,18 @@ import {
   MangaDexIdentity,
   MangaDexSeriesCovers,
   MangaDexVolumeCover,
+  SeriesCoverLookup,
 } from './mangadex.types';
 
 const API_BASE = 'https://api.mangadex.org';
 const UPLOADS_BASE = 'https://uploads.mangadex.org';
 
-// Recherche de série : on ramène quelques candidats et on DÉSAMBIGUÏSE par mal_id (fiable). Sans
+// Recherche de série : on ramène des candidats et on DÉSAMBIGUÏSE par mal_id (fiable). Sans
 // mal_id (bnf_only), on n'accepte le 1er candidat que si son titre matche fortement (anti-homonyme).
-const MANGA_SEARCH_LIMIT = 10;
+// 30 et non 10 : mesuré sur `title=Sentenced to be a Hero`, MangaDex renvoie 30 résultats et la bonne
+// série est **rang 12** — sous 10, elle n'était même pas dans le lot scoré. Le surcoût est la taille
+// de la réponse, rien d'autre (un seul appel dans les deux cas).
+const MANGA_SEARCH_LIMIT = 30;
 const COVER_PAGE_SIZE = 100;
 const COVER_MAX_RECORDS = 500; // garde-fou (séries à couvertures multi-éditions nombreuses).
 
@@ -66,6 +70,8 @@ interface IdentifyCandidate {
   titleScore: number;
   authorMatched: boolean;
   confidence: number;
+  /** Un AUTRE candidat atteint le même `titleScore` — cf. {@link MangaDexIdentity.ambiguous}. */
+  ambiguous: boolean;
 }
 
 /**
@@ -153,11 +159,12 @@ export class MangaDexResolver {
       volumes,
       confidence,
       matchedBy: authorMatched ? 'title+author' : 'title',
+      ambiguous: chosen.ambiguous,
     };
 
     this.logger.log(
       `mangadex: identified query="${query}" mangaId=${mangaId} mal=${identity.malId ?? '-'} ` +
-        `titleSim=${titleScore.toFixed(2)} authorMatch=${authorMatched} conf=${confidence.toFixed(2)} ` +
+        `titleSim=${titleScore.toFixed(2)} authorMatch=${authorMatched} ambiguous=${chosen.ambiguous} conf=${confidence.toFixed(2)} ` +
         `tomes=${Object.keys(volumes).length} synopsisFr=${identity.descriptionFr ? 'y' : 'n'}`,
     );
     return identity;
@@ -169,6 +176,13 @@ export class MangaDexResolver {
    * même auteur, ex *Jigokuraku* qui remonte plusieurs entrées). Accepté si l'auteur matche ET que le
    * titre reste proche ({@link IDENTIFY_TITLE_FLOOR}), OU si le titre matche fortement seul (anti
    * faux-positif quand la BnF n'a pas d'auteur exploitable). Sinon `null`.
+   *
+   * Calcule aussi `ambiguous` — un AUTRE candidat atteint exactement le même `titleScore` que le
+   * retenu. Le drapeau est calculé **toujours** et porté par l'identité (donc par le cache) plutôt
+   * que piloté par un mode d'appel : `identityCacheKey`/`identityJobId` sont indexés sur la seule
+   * requête, un paramètre de mode empoisonnerait le cache entre chemin nominal et repli. Ici on ne
+   * fait que l'exposer : c'est l'appelant qui décide (le chemin nominal l'ignore, l'auteur BnF
+   * tranche ; le repli Google Books rejette quand `ambiguous` et que l'auteur n'a pas matché).
    */
   private chooseIdentity(
     candidates: MangaEntity[],
@@ -176,6 +190,7 @@ export class MangaDexResolver {
     authors: BnfAuthor[],
   ): IdentifyCandidate | null {
     let best: IdentifyCandidate | null = null;
+    const scored: IdentifyCandidate[] = [];
 
     candidates.forEach((entity, rank) => {
       if (!entity.id) return;
@@ -203,12 +218,21 @@ export class MangaDexResolver {
         titleScore,
         authorMatched,
         confidence,
+        ambiguous: false,
       };
+      scored.push(cand);
       if (!best || cand.confidence > best.confidence) best = cand;
     });
 
     if (!best) return null;
     const b: IdentifyCandidate = best;
+    // Ex aequo de titre : « Frieren » (titre FR = troncature de « Sousou no Frieren ») donne un
+    // titleScore 1.00 au crossover parasite *Frieren Cinnamoroll Kamigata* comme à la vraie série —
+    // le titre seul ne peut plus départager. Tolérance flottante : ces scores viennent du même calcul.
+    b.ambiguous =
+      scored.filter((c) => Math.abs(c.titleScore - b.titleScore) < 1e-9)
+        .length > 1;
+
     const accepted = b.authorMatched
       ? b.titleScore >= IDENTIFY_TITLE_FLOOR
       : b.titleScore >= PIVOT_TITLE_STRONG;
@@ -231,58 +255,111 @@ export class MangaDexResolver {
 
   async fetchSeriesCovers(
     title: string,
-    malId: string | null,
+    lookup: SeriesCoverLookup,
   ): Promise<MangaDexSeriesCovers> {
-    const mangaId = await this.findManga(title, malId);
-    if (!mangaId) {
+    const found = await this.findManga(title, lookup);
+    if (!found) {
       this.logger.log(
-        `mangadex: no manga match title="${title}" mal=${malId ?? '-'}`,
+        `mangadex: no manga match title="${title}" mangaId=${lookup.mangaId ?? '-'} ` +
+          `mal=${lookup.malId ?? '-'} authors=${lookup.authors.length} -> repli ISBN`,
       );
       return { mangaId: null, volumes: {}, status: 'absent' };
     }
 
-    const volumes = await this.fetchVolumeCovers(mangaId);
+    const volumes = await this.fetchVolumeCovers(found.mangaId);
     const count = Object.keys(volumes).length;
     this.logger.log(
-      `mangadex: series title="${title}" mal=${malId ?? '-'} mangaId=${mangaId} tomes=${count}`,
+      `mangadex: series title="${title}" mangaId=${found.mangaId} mal=${lookup.malId ?? '-'} ` +
+        `via=${found.via} tomes=${count}`,
     );
     return {
-      mangaId,
+      mangaId: found.mangaId,
       volumes,
       status: count > 0 ? 'found' : 'absent',
     };
   }
 
   /**
-   * Manga MangaDex correspondant. Avec `malId` : on retient le candidat dont `links.mal` égale le
-   * mal_id (join exact). Sans `malId` : on ne retient le 1er candidat que si son titre (ou un alt.)
-   * matche fortement la série voulue — sinon `null` (mieux vaut pas de jaquette qu'une mauvaise).
+   * Résout le manga MangaDex dont on tirera les jaquettes, par ordre de fiabilité décroissante :
+   *  1. **`mangaId`** déjà connu (identité produite au scan) → on l'utilise **directement**, sans
+   *     recherche par titre (le join le plus sûr : ni homonyme ni variante possible) ;
+   *  2. **`malId`** connu → recherche par titre puis retenue du candidat dont `links.mal` égale le
+   *     mal_id (join exact) ;
+   *  3. **sinon** (chemin bnf_only) → recherche par titre **validée par l'auteur** BnF, avec
+   *     préférence pour l'entrée canonique (présence `links.mal`) — le titre seul retiendrait une
+   *     variante (édition colorisée…). Aucun candidat validé → `null` (l'appelant replie sur l'ISBN).
    */
   private async findManga(
     title: string,
-    malId: string | null,
-  ): Promise<string | null> {
+    lookup: SeriesCoverLookup,
+  ): Promise<{ mangaId: string; via: 'mangaId' | 'mal' | 'author' } | null> {
+    // 1) Identité déjà connue : pas de recherche, pas d'ambiguïté.
+    if (lookup.mangaId) return { mangaId: lookup.mangaId, via: 'mangaId' };
+
     const params = new URLSearchParams({
       title,
       limit: String(MANGA_SEARCH_LIMIT),
     });
+    for (const inc of ['author', 'artist']) params.append('includes[]', inc);
     const res = await this.http.request<MangaListResponse>(
       `${API_BASE}/manga?${params.toString()}`,
       { method: 'GET', maxAttempts: 2 },
     );
     const candidates = res.data?.data ?? [];
 
-    if (malId) {
+    // 2) Join fiable par mal_id.
+    if (lookup.malId) {
       const byMal = candidates.find(
-        (m) => String(m.attributes?.links?.mal ?? '') === String(malId),
+        (m) => String(m.attributes?.links?.mal ?? '') === String(lookup.malId),
       );
-      return byMal?.id ?? null;
+      return byMal?.id ? { mangaId: byMal.id, via: 'mal' } : null;
     }
 
-    const want = normalizeTitle(title);
-    const top = candidates[0];
-    if (top && titleMatchesStrongly(top, want)) return top.id ?? null;
-    return null;
+    // 3) Validation par l'auteur (bnf_only).
+    const chosen = this.chooseCoverCandidate(candidates, title, lookup.authors);
+    return chosen?.id ? { mangaId: chosen.id, via: 'author' } : null;
+  }
+
+  /**
+   * Choisit le manga d'une série **sans identifiant** (ni `mangaId` ni `malId`) : on **exige un match
+   * auteur** (le titre seul retiendrait une variante — « One Piece » colorisée…), avec un titre qui
+   * reste proche. Départage : titre, égalité exacte, puis **présence d'un `links.mal`** (l'œuvre
+   * canonique porte un lien MAL, la variante colorisée fan souvent pas), enfin le rang MangaDex.
+   * `null` si aucun candidat ne matche l'auteur → l'appelant résout les jaquettes par ISBN.
+   */
+  private chooseCoverCandidate(
+    candidates: MangaEntity[],
+    title: string,
+    authors: BnfAuthor[],
+  ): MangaEntity | null {
+    let best: MangaEntity | null = null;
+    let bestScore = -1;
+
+    candidates.forEach((entity, rank) => {
+      if (!entity.id) return;
+      if (!matchesAuthor(authors, extractAuthors(entity.relationships))) return;
+
+      const titles = allTitles(entity.attributes);
+      const titleScore = titles.reduce(
+        (max, t) => Math.max(max, titleSimilarity(title, t)),
+        0,
+      );
+      if (titleScore < IDENTIFY_TITLE_FLOOR) return;
+
+      const exact = titles.some((t) => normName(t) === normName(title));
+      const hasMal = !!entity.attributes?.links?.mal;
+      const score =
+        0.6 * titleScore +
+        0.2 * (exact ? 1 : 0) +
+        0.2 * (hasMal ? 1 : 0) -
+        rank * 0.001;
+      if (score > bestScore) {
+        bestScore = score;
+        best = entity;
+      }
+    });
+
+    return best;
   }
 
   /** Récupère toutes les couvertures du manga (paginées) → map n° tome → meilleure locale. */
@@ -342,32 +419,6 @@ function pickByLocale(list: { fileName: string; locale: string }[]): {
     if (hit) return hit;
   }
   return list[0];
-}
-
-/** Titre comparable : minuscules, sans accents ni ponctuation, espaces compactés. */
-function normalizeTitle(s: string): string {
-  return s
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-/**
- * Match fort (sans mal_id) : le titre voulu et un des titres/alt-titres du candidat se contiennent
- * l'un l'autre une fois normalisés. Garde-fou anti-homonyme (« Kingdom Hearts » vs « Kingdom Hearts
- * III ») quand on n'a pas la clé mal_id pour désambiguïser.
- */
-function titleMatchesStrongly(
-  candidate: NonNullable<MangaListResponse['data']>[number],
-  want: string,
-): boolean {
-  const titles = [
-    ...Object.values(candidate.attributes?.title ?? {}),
-    ...(candidate.attributes?.altTitles ?? []).flatMap((t) => Object.values(t)),
-  ].map(normalizeTitle);
-  return titles.some((t) => t === want);
 }
 
 /** Tous les libellés d'un manga (titre principal + alt-titres), toutes langues, pour le scoring. */

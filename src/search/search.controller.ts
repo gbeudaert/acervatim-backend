@@ -40,7 +40,12 @@ export class SearchController {
   async editionMapping(
     @Query() query: EditionMappingQueryDto,
   ): Promise<EditionMappingResponse> {
-    return this.search.editionMapping(query.title, query.edition, query.malId);
+    return this.search.editionMapping(
+      query.title,
+      query.edition,
+      query.malId,
+      query.mangaId,
+    );
   }
 
   /**

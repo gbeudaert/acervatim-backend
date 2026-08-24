@@ -11,17 +11,22 @@ import { ApiCacheService } from '../../cache/api-cache.service';
 import { RedisHealthService } from '../../redis/redis-health.service';
 import {
   CachedCover,
+  CachedVolumeInfo,
   CoverHint,
-  CoverJobData,
   CoverResult,
   GBOOKS_COVER_JOB,
   GBOOKS_QUEUE,
+  GBOOKS_VOLUME_INFO_JOB,
+  GBooksJobData,
+  GBooksJobResult,
+  VolumeInfo,
   cachedStatus,
   coverCacheKey,
   normalizeIsbn,
+  volumeInfoCacheKey,
 } from './googlebooks.types';
 
-export type { CoverHint, CoverResult } from './googlebooks.types';
+export type { CoverHint, CoverResult, VolumeInfo } from './googlebooks.types';
 
 // Deux « vides » distincts (cf. CoverStatus) : `ABSENT` = pas de jaquette, définitif (ISBN invalide) ;
 // `UNRESOLVED` = non déterminé/transitoire (Redis down, timeout d'attente, pas encore résolu).
@@ -55,7 +60,7 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     @InjectQueue(GBOOKS_QUEUE)
-    private readonly queue: Queue<CoverJobData, CoverResult>,
+    private readonly queue: Queue<GBooksJobData, GBooksJobResult>,
     private readonly config: ConfigService,
     private readonly cache: ApiCacheService,
     private readonly redisHealth: RedisHealthService,
@@ -167,13 +172,63 @@ export class GoogleBooksCoverService implements OnModuleInit, OnModuleDestroy {
           removeOnFail: true,
         },
       );
-      return await job.waitUntilFinished(this.queueEvents, WAIT_TIMEOUT_MS);
+      return (await job.waitUntilFinished(
+        this.queueEvents,
+        WAIT_TIMEOUT_MS,
+      )) as CoverResult;
     } catch {
       // Redis indisponible, worker en échec (réseau/quota Google) ou timeout d'attente : best-effort
       // → `unresolved` (transitoire), jamais d'exception (ne casse pas l'énumération d'édition). Le
       // worker retente en arrière-plan ; le prochain passage servira le cache réchauffé.
       this.logger.warn(`gbooks: resolve failed isbn=${norm}`);
       return UNRESOLVED;
+    }
+  }
+
+  /**
+   * **Titre par ISBN** — maillon d'entrée du repli `Google Books → MangaDex` (scan d'un ISBN que la
+   * BnF ne connaît pas : nouveauté non cataloguée, éditeur non français). Même pipeline que la
+   * jaquette : cache → enqueue `gbooks` (throttle + single-flight) → attente du worker.
+   *
+   * Best-effort : `null` couvre les trois vides — ISBN invalide, Google ne connaît pas cet ISBN
+   * (négatif caché), échec/timeout (cache négatif court, retry BullMQ en fond). L'appelant
+   * ({@link MalAdapter}) rend alors un résultat vide plutôt que d'échouer.
+   */
+  async resolveVolumeInfo(isbn: string): Promise<VolumeInfo | null> {
+    const norm = normalizeIsbn(isbn);
+    if (!norm) return null;
+
+    const key = volumeInfoCacheKey(norm);
+    const cached = await this.cache.get<CachedVolumeInfo>(key);
+    if (cached) return cached.info;
+
+    if (!this.redisHealth.isAvailable()) return null;
+
+    try {
+      const job = await this.queue.add(
+        GBOOKS_VOLUME_INFO_JOB,
+        { isbn: norm },
+        {
+          // jobId distinct de celui de la jaquette (clés de cache distinctes) : les deux jobs du
+          // même ISBN coexistent sans se dédupliquer l'un l'autre.
+          jobId: key,
+          removeOnComplete: { age: 60, count: 500 },
+          // Horizon de retry plus court que la jaquette (5 tentatives / ~3,75 min) : ce chemin est
+          // interactif (un scan attend), et le cache négatif `FAIL_TTL` couvre la vague 503 le temps
+          // que ces trois tentatives réchauffent le cache pour le scan suivant.
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 15_000 },
+          removeOnFail: true,
+        },
+      );
+      const res = (await job.waitUntilFinished(
+        this.queueEvents,
+        WAIT_TIMEOUT_MS,
+      )) as CachedVolumeInfo;
+      return res?.info ?? null;
+    } catch {
+      this.logger.warn(`gbooks: volume-info failed isbn=${norm}`);
+      return null;
     }
   }
 }
