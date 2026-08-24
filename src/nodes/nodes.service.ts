@@ -4,16 +4,26 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CollectionNode, Prisma } from '@prisma/client';
+import { ZodValidationException } from 'nestjs-zod';
 import {
+  HierarchyLevel,
   SourceEntry,
   SourceRef,
   SourceRefView,
 } from '../collections/types/common';
 import { getProfile } from '../collections/types/registry';
+import { LimitsService } from '../common/limits/limits.service';
 import { CursorPage, paginate } from '../common/pagination/paginate';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { UnifiedItem } from '../oauth/providers/types';
+import {
+  accessStatuses,
+  CollectionAccess,
+} from '../premium/collection-access.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ShareFilterService } from '../sharing/share-filter.service';
+import { isAllStatuses } from '../sharing/share-statuses';
+import { sharedNodeUserData } from '../sharing/shared-user-data';
 import { AttachNodeSourceDto } from './dto/attach-source.dto';
 import { CreateNodeDto } from './dto/create-node.dto';
 import { ListNodesQueryDto } from './dto/list-nodes.query';
@@ -35,7 +45,9 @@ export interface NodeResponse {
 export class NodesService {
   constructor(
     private readonly prisma: PrismaService,
+    private readonly limits: LimitsService,
     private readonly snapshots: SourceSnapshotService,
+    private readonly shareFilter: ShareFilterService,
   ) {}
 
   /** 404 si la collection n'existe pas OU appartient à un autre user. */
@@ -65,32 +77,32 @@ export class NodesService {
     }));
   }
 
-  private toResponse(node: CollectionNode, ownedCount: number): NodeResponse {
+  /**
+   * `ownedCount` compte les tomes **visibles par le requérant**, pas les tomes absolus : annoncer
+   * « 12 tomes » sur une série dont un partage « désirés » n'en montre aucun serait un compte faux.
+   * `role` réduit par ailleurs le `userData` à sa part partageable.
+   */
+  private toResponse(
+    node: CollectionNode,
+    ownedCount: number,
+    role: 'owner' | 'shared' = 'owner',
+  ): NodeResponse {
     const unified = (node.unifiedData ?? {}) as JsonRecord;
+    const userData = (node.userData ?? {}) as JsonRecord;
     return {
       ...unified,
       id: node.id,
       level: node.level,
       ownedCount,
       isWishlist: node.isWishlist,
-      userData: (node.userData ?? {}) as JsonRecord,
+      userData: role === 'shared' ? sharedNodeUserData(userData) : userData,
       sources: this.toRefs(node.sources),
     };
   }
 
-  // ownedCount = nombre d'items rattachés, par nœud (un seul groupBy pour la page).
-  private async ownedCounts(
-    nodeIds: string[],
-  ): Promise<Record<string, number>> {
-    if (nodeIds.length === 0) return {};
-    const groups = await this.prisma.item.groupBy({
-      by: ['nodeId'],
-      where: { nodeId: { in: nodeIds } },
-      _count: { _all: true },
-    });
-    return Object.fromEntries(
-      groups.map((g) => [g.nodeId as string, g._count._all]),
-    );
+  /** Accès d'un propriétaire sur sa propre collection (chemins d'écriture, portée `all`). */
+  private ownerAccess(userId: string, collectionId: string): CollectionAccess {
+    return { collectionId, ownerUserId: userId, role: 'owner' };
   }
 
   private async findNodeBySource(
@@ -110,6 +122,23 @@ export class NodesService {
     return rows[0]?.id ?? null;
   }
 
+  /**
+   * Valide un `unifiedData` **venu du client** contre le schéma du niveau.
+   *
+   * `safeParse` + [ZodValidationException] et non `.parse()` : une `ZodError` nue ne serait pas
+   * reconnue par le filtre RFC 9457 et sortirait en 500 alors que la faute est au corps envoyé.
+   */
+  private validateNodeUnified(
+    level: HierarchyLevel,
+    raw: JsonRecord,
+  ): JsonRecord {
+    const result = level.nodeSchema.safeParse(raw);
+    if (!result.success) {
+      throw new ZodValidationException(result.error);
+    }
+    return result.data as JsonRecord;
+  }
+
   async create(
     userId: string,
     collectionId: string,
@@ -124,51 +153,94 @@ export class NodesService {
       );
     }
 
-    // Dédup : un nœud de cette collection matche déjà la source → idempotent.
-    const existingId = await this.findNodeBySource(
-      collectionId,
-      userId,
-      dto.level,
-      dto.source,
-    );
-    if (existingId) {
-      return this.findOne(userId, existingId);
-    }
-
-    const entry = await this.snapshots.snapshot(dto.source, userId);
-    if (entry.rawData === null) {
-      throw new BadRequestException(
-        `node provider '${dto.source.provider}' has no adapter; cannot enrich node`,
-      );
-    }
-    const unifiedData = level.nodeSchema.parse(
-      level.mapSnapshot(entry.rawData as UnifiedItem),
-    ) as JsonRecord;
-
-    const node = await this.prisma.collectionNode.create({
-      data: {
+    // Dédup : un nœud de cette collection matche déjà la source → idempotent. Sans `source`
+    // (saisie manuelle) il n'y a rien sur quoi dédupliquer : le client garde l'id rendu et
+    // repasse ensuite par PATCH, comme il le fait pour une collection.
+    if (dto.source) {
+      const existingId = await this.findNodeBySource(
         collectionId,
         userId,
-        level: dto.level,
-        unifiedData: unifiedData as Prisma.InputJsonValue,
-        sources: [entry] as unknown as Prisma.InputJsonValue,
-        isWishlist: dto.isWishlist ?? false,
-      },
+        dto.level,
+        dto.source,
+      );
+      if (existingId) {
+        return this.findOne(this.ownerAccess(userId, collectionId), existingId);
+      }
+    }
+
+    const entry = dto.source
+      ? await this.snapshots.snapshot(dto.source, userId)
+      : null;
+    const unifiedData = this.resolveUnified(level, dto, entry);
+
+    const node = await this.prisma.$transaction(async (tx) => {
+      await this.limits.assertCanCreateNode(userId, tx);
+      return tx.collectionNode.create({
+        data: {
+          collectionId,
+          userId,
+          level: dto.level,
+          unifiedData: unifiedData as Prisma.InputJsonValue,
+          sources: (entry ? [entry] : []) as unknown as Prisma.InputJsonValue,
+          isWishlist: dto.isWishlist ?? false,
+        },
+      });
     });
     return this.toResponse(node, 0);
   }
 
+  /**
+   * Vérité curée du nœud à créer.
+   *
+   * Le `unifiedData` du client l'emporte quand il est fourni : c'est ce que l'utilisateur voit
+   * dans son app, et le seul contenu disponible pour une série saisie à la main. À défaut, on la
+   * dérive du snapshot provider. Reste le cas sans issue — une référence vers un provider sans
+   * adapter (bnf, mangadex, isbn…) et aucun `unifiedData` : rien ne décrit le nœud, c'est un 400.
+   */
+  private resolveUnified(
+    level: HierarchyLevel,
+    dto: CreateNodeDto,
+    entry: SourceEntry | null,
+  ): JsonRecord {
+    if (dto.unifiedData) {
+      return this.validateNodeUnified(level, dto.unifiedData as JsonRecord);
+    }
+    if (entry?.rawData) {
+      return level.nodeSchema.parse(
+        level.mapSnapshot(entry.rawData as UnifiedItem),
+      ) as JsonRecord;
+    }
+    throw new BadRequestException(
+      entry
+        ? `node provider '${entry.provider}' has no adapter; send 'unifiedData' to describe the node`
+        : "'source' or 'unifiedData' is required",
+    );
+  }
+
+  /**
+   * Liste des nœuds visibles pour ce requérant.
+   *
+   * `access` remplace le `userId` d'avant S4 : les nœuds restent scopés sur le **propriétaire** de
+   * la collection, et les statuts du partage — jamais reçus du client — restreignent le `where`.
+   * Un propriétaire les a tous : sa propre lecture est inchangée.
+   */
   async list(
-    userId: string,
-    collectionId: string,
+    access: CollectionAccess,
     query: ListNodesQueryDto,
   ): Promise<CursorPage<NodeResponse>> {
-    await this.assertCollectionOwned(userId, collectionId);
+    const statuses = accessStatuses(access);
     const where: Prisma.CollectionNodeWhereInput = {
-      collectionId,
-      userId,
+      collectionId: access.collectionId,
+      userId: access.ownerUserId,
       ...(query.level ? { level: query.level } : {}),
     };
+    const scoped = await this.shareFilter.nodeWhere(
+      access.collectionId,
+      statuses,
+    );
+    if (scoped) {
+      where.AND = [scoped];
+    }
     const page = await paginate(
       (take, cursor) =>
         this.prisma.collectionNode.findMany({
@@ -180,34 +252,68 @@ export class NodesService {
       query.cursor,
       query.limit,
     );
-    const counts = await this.ownedCounts(page.data.map((n) => n.id));
+    const counts = await this.shareFilter.countItemsByNode(
+      page.data.map((n) => n.id),
+      statuses,
+    );
     return {
       ...page,
-      data: page.data.map((n) => this.toResponse(n, counts[n.id] ?? 0)),
+      data: page.data.map((n) =>
+        this.toResponse(n, counts[n.id] ?? 0, access.role),
+      ),
     };
   }
 
-  /** 404 si le nœud appartient à un autre user. */
-  async findOne(userId: string, id: string): Promise<NodeResponse> {
+  /**
+   * Nœud chargé sous l'angle du requérant, ou `null` s'il est hors de ce qui lui est exposé — même
+   * absence qu'un nœud inexistant, pour ne pas transformer un balayage d'ids en oracle d'existence.
+   *
+   * Pour un membre, un nœud n'existe que par ses tomes visibles. Seule exception : quand `WISHLIST`
+   * est exposé, une série marquée désirée sort **même sans aucun tome** — c'est tout son objet.
+   */
+  private async visibleNode(
+    access: CollectionAccess,
+    id: string,
+  ): Promise<{ node: CollectionNode; ownedCount: number } | null> {
     const node = await this.prisma.collectionNode.findFirst({
-      where: { id, userId },
+      where: {
+        id,
+        collectionId: access.collectionId,
+        userId: access.ownerUserId,
+      },
     });
-    if (!node) {
-      throw new NotFoundException('Node not found');
-    }
-    const ownedCount = await this.prisma.item.count({ where: { nodeId: id } });
-    return this.toResponse(node, ownedCount);
+    if (!node) return null;
+    const statuses = accessStatuses(access);
+    const counts = await this.shareFilter.countItemsByNode([id], statuses);
+    const ownedCount = counts[id] ?? 0;
+    // Miroir exact de `ShareFilterService.nodeWhere` : tout est visible quand rien n'est filtré
+    // (propriétaire, ou partage exposant les trois statuts), y compris un nœud encore vide.
+    const visible =
+      isAllStatuses(statuses) ||
+      ownedCount > 0 ||
+      (statuses.includes('WISHLIST') && node.isWishlist);
+    return visible ? { node, ownedCount } : null;
   }
 
-  async getSources(userId: string, id: string): Promise<SourceEntry[]> {
-    const node = await this.prisma.collectionNode.findFirst({
-      where: { id, userId },
-      select: { sources: true },
-    });
-    if (!node) {
+  /** 404 si le nœud n'existe pas, sort de la collection visée, ou tombe hors des statuts exposés. */
+  async findOne(access: CollectionAccess, id: string): Promise<NodeResponse> {
+    const found = await this.visibleNode(access, id);
+    if (!found) {
       throw new NotFoundException('Node not found');
     }
-    return this.toEntries(node.sources);
+    return this.toResponse(found.node, found.ownedCount, access.role);
+  }
+
+  /** Snapshots bruts d'un nœud — catalogue public, rien de personnel (cf. `ItemsService`). */
+  async getSources(
+    access: CollectionAccess,
+    id: string,
+  ): Promise<SourceEntry[]> {
+    const found = await this.visibleNode(access, id);
+    if (!found) {
+      throw new NotFoundException('Node not found');
+    }
+    return this.toEntries(found.node.sources);
   }
 
   /** Retourne le nœud mis à jour, ou `null` si purgé (isWishlist=false & vide). */
@@ -235,7 +341,7 @@ export class NodesService {
       const profile = getProfile(node.collection.type.code);
       const level = profile.hierarchy.find((l) => l.key === node.level);
       const validated = level
-        ? (level.nodeSchema.parse(dto.unifiedData) as JsonRecord)
+        ? this.validateNodeUnified(level, dto.unifiedData as JsonRecord)
         : dto.unifiedData;
       data.unifiedData = validated as Prisma.InputJsonValue;
     }

@@ -1,6 +1,8 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { LimitsService } from '../common/limits/limits.service';
+import { CollectionAccess } from '../premium/collection-access.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ShareFilterService } from '../sharing/share-filter.service';
 import { CollectionsService } from './collections.service';
 
 type PrismaMock = {
@@ -9,6 +11,7 @@ type PrismaMock = {
     create: jest.Mock;
     findMany: jest.Mock;
     findFirst: jest.Mock;
+    findUnique: jest.Mock;
     update: jest.Mock;
     delete: jest.Mock;
   };
@@ -23,6 +26,7 @@ function makePrismaMock(): PrismaMock {
       create: jest.fn(),
       findMany: jest.fn(),
       findFirst: jest.fn(),
+      findUnique: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
     },
@@ -38,8 +42,26 @@ function makeService(prisma: PrismaMock): CollectionsService {
     assertCanCreateCollection: jest.fn().mockResolvedValue(undefined),
     assertCanCreateItem: jest.fn().mockResolvedValue(undefined),
   } as unknown as LimitsService;
-  return new CollectionsService(prisma as unknown as PrismaService, limits);
+  // Proprietaire : tous les statuts, le filtrage de partage ne restreint rien.
+  const shareFilter = {
+    nodeWhere: jest.fn().mockResolvedValue(null),
+    countItems: jest.fn(),
+  } as unknown as ShareFilterService;
+  return new CollectionsService(
+    prisma as unknown as PrismaService,
+    limits,
+    shareFilter,
+  );
 }
+
+const ownerAccess = (
+  userId: string,
+  collectionId: string,
+): CollectionAccess => ({
+  collectionId,
+  ownerUserId: userId,
+  role: 'owner',
+});
 
 const USER_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const USER_B = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
@@ -105,12 +127,14 @@ describe('CollectionsService.findOne', () => {
       updatedAt: new Date('2026-05-20T00:00:00.000Z'),
       type: { code: 'vinyl' },
     };
-    prisma.collection.findFirst.mockResolvedValue(row);
+    prisma.collection.findUnique.mockResolvedValue(row);
 
-    const result = await makeService(prisma).findOne(USER_A, COLL_ID);
+    const result = await makeService(prisma).findOne(
+      ownerAccess(USER_A, COLL_ID),
+    );
 
-    expect(prisma.collection.findFirst).toHaveBeenCalledWith({
-      where: { id: COLL_ID, userId: USER_A },
+    expect(prisma.collection.findUnique).toHaveBeenCalledWith({
+      where: { id: COLL_ID },
       include: { type: { select: { code: true } } },
     });
     expect(result).toEqual({
@@ -126,13 +150,16 @@ describe('CollectionsService.findOne', () => {
     });
   });
 
-  it('throw NotFound (jamais 403) si la collection appartient à un autre user', async () => {
+  // L'acces d'autrui est desormais refuse en amont, par le guard : `resolveAccess` ne rend
+  // aucun `CollectionAccess` a qui n'est ni proprietaire ni membre. Il reste au service a couvrir
+  // la collection disparue entre la resolution et la lecture.
+  it('throw NotFound si la collection a disparu entre le guard et la lecture', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(null); // findFirst scope sur userId
+    prisma.collection.findUnique.mockResolvedValue(null);
 
-    await expect(makeService(prisma).findOne(USER_B, COLL_ID)).rejects.toThrow(
-      NotFoundException,
-    );
+    await expect(
+      makeService(prisma).findOne(ownerAccess(USER_B, COLL_ID)),
+    ).rejects.toThrow(NotFoundException);
   });
 });
 

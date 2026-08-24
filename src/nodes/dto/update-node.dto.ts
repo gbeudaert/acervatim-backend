@@ -1,15 +1,10 @@
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
+import {
+  boundedJsonRecord,
+  UNIFIED_DATA_MAX_BYTES,
+} from '../../common/validation/bounded-json';
 import { nodeUserDataShape } from './node-user-data.schema';
-
-const UNIFIED_DATA_MAX_BYTES = 32_000;
-
-const boundedJsonRecord = (maxBytes: number, field: string) =>
-  z
-    .record(z.unknown())
-    .refine((v) => Buffer.byteLength(JSON.stringify(v), 'utf8') <= maxBytes, {
-      message: `${field} must be ≤${maxBytes} bytes once serialized`,
-    });
 
 export const UpdateNodeSchema = z
   .object({

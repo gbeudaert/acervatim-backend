@@ -1,5 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  ALL_SHARE_STATUSES,
+  parseStatuses,
+  ShareStatus,
+  unionStatuses,
+} from '../sharing/share-statuses';
 
 /**
  * Entité par laquelle une route désigne sa collection. `collection` = le paramètre EST l'id de la
@@ -7,27 +13,41 @@ import { PrismaService } from '../prisma/prisma.service';
  */
 export type CollectionRefVia = 'collection' | 'item' | 'node';
 
-/**
- * Rôle du requérant sur une collection.
- *
- * **Point d'extension de S4** : le partage ajoutera `'shared'` (+ la portée `scope`) ici et dans
- * [CollectionAccessService.resolveAccess]. Tant qu'il n'existe pas, seul le propriétaire a un rôle.
- */
-export type CollectionRole = 'owner';
+/** Rôle du requérant sur une collection. */
+export type CollectionRole = 'owner' | 'shared';
 
-export interface CollectionAccess {
+interface AccessBase {
   collectionId: string;
   /** Propriétaire de la collection — c'est **son** statut premium qui conditionne la lecture. */
   ownerUserId: string;
-  role: CollectionRole;
+}
+
+export interface OwnerAccess extends AccessBase {
+  role: 'owner';
+}
+
+export interface SharedAccess extends AccessBase {
+  role: 'shared';
+  /**
+   * Statuts que les partages actifs exposent de cette collection, réunis. Résolus serveur-side,
+   * jamais fournis par le client.
+   */
+  statuses: ShareStatus[];
+}
+
+export type CollectionAccess = OwnerAccess | SharedAccess;
+
+/** Statuts effectivement lisibles : le propriétaire voit toujours 100 % de sa collection. */
+export function accessStatuses(access: CollectionAccess): ShareStatus[] {
+  return access.role === 'shared' ? access.statuses : [...ALL_SHARE_STATUSES];
 }
 
 /**
  * Résolution unique « quelle collection cette requête vise-t-elle, et à quel titre ».
  *
- * Centralisé plutôt que dispersé dans chaque route : S4 n'aura qu'un seul endroit à étendre pour
- * faire exister le rôle `shared`, et le jour où une route s'ajoute, elle déclare simplement d'où
- * vient son identifiant (cf. `@CollectionRef`).
+ * Centralisé plutôt que dispersé dans chaque route : `collections`, `items` et `nodes` lisent tous
+ * la même règle, et une route qui s'ajoute déclare simplement d'où vient son identifiant
+ * (cf. `@CollectionRef`).
  */
 @Injectable()
 export class CollectionAccessService {
@@ -54,9 +74,14 @@ export class CollectionAccessService {
   }
 
   /**
-   * Rôle du requérant sur la collection, `null` s'il n'y a aucun accès (collection inexistante ou
-   * appartenant à quelqu'un d'autre — indistinguables volontairement, cf. la convention 404 des
-   * services : on ne confirme jamais l'existence d'une ressource d'autrui).
+   * Rôle du requérant sur la collection, `null` s'il n'y a aucun accès (collection inexistante,
+   * appartenant à quelqu'un d'autre, ou partage/adhésion révoqués — indistinguables volontairement,
+   * cf. la convention 404 des services : on ne confirme jamais l'existence d'une ressource d'autrui).
+   *
+   * `expiresAt` n'entre **pas** dans le filtre : il borne l'usage du *code*, pas l'adhésion déjà
+   * acquise (invariant posé en S3, cf. le commentaire du modèle Prisma et `listReceived`). Un
+   * partage expiré cesse d'être rejoignable ; ceux qui l'ont rejoint continuent de lire jusqu'à
+   * révocation. Faire l'inverse ici ferait mentir `GET /v1/shares/received`, qui les liste encore.
    */
   async resolveAccess(
     userId: string,
@@ -74,7 +99,35 @@ export class CollectionAccessService {
         role: 'owner',
       };
     }
-    // S4 : chercher ici un CollectionShareMember actif → { role: 'shared', scope }.
-    return null;
+
+    // Les entrées qui exposent CETTE collection, parmi les partages vivants que ce membre a
+    // rejoints. Un partage porte N collections : c'est l'entrée, pas le partage, qui dit ce qu'on
+    // voit d'ici.
+    const entries = await this.prisma.collectionShareEntry.findMany({
+      where: {
+        collectionId,
+        share: {
+          revokedAt: null,
+          members: { some: { memberUserId: userId, revokedAt: null } },
+        },
+      },
+      select: { statuses: true },
+    });
+    if (entries.length === 0) return null;
+
+    // Plusieurs partages actifs de la même collection : le membre voit la réunion de ce que chacun
+    // lui accorde — ni plus, ni moins.
+    const statuses = unionStatuses(
+      entries.map((entry) => parseStatuses(entry.statuses)),
+    );
+    // Ensemble vide (ligne abîmée) : pas d'accès du tout plutôt qu'un accès qui ne montre rien.
+    if (statuses.length === 0) return null;
+
+    return {
+      collectionId: collection.id,
+      ownerUserId: collection.userId,
+      role: 'shared',
+      statuses,
+    };
   }
 }

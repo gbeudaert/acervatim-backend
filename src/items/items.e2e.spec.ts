@@ -422,6 +422,115 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
     }
   });
 
+  it('manga saisi a la main : serie sans provider, tomes par nodeId, deplacement et purge', async () => {
+    const sub = `e2e-manga-manuel-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
+
+    try {
+      const coll = await createCollection(token, 'manga', 'Saisie manuelle');
+
+      // 1. Serie saisie a la main : aucune reference provider, seulement la verite curee.
+      const serie = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/nodes`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          level: 'serie',
+          unifiedData: {
+            title: 'Vinland Saga',
+            author: 'Makoto Yukimura',
+            status: 'ongoing',
+            totalCount: 27,
+          },
+        })
+        .expect(201);
+      expect(serie.body).toMatchObject({
+        level: 'serie',
+        title: 'Vinland Saga',
+        author: 'Makoto Yukimura',
+        status: 'ongoing',
+        totalCount: 27,
+        ownedCount: 0,
+        sources: [],
+      });
+      const serieId = serie.body.id as string;
+
+      // 2. Tome rattache par nodeId (chemin de la synchronisation : noeuds puis items).
+      const t1 = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          nodeId: serieId,
+          volume: 1,
+          unifiedData: { title: 'Vinland Saga - T.1', publisherFr: 'Kurokawa' },
+        })
+        .expect(201);
+      expect(t1.body).toMatchObject({ nodeId: serieId, volume: 1 });
+
+      // 3. Tome hors numerotation dans la meme serie (artbook) : volume null accepte.
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          nodeId: serieId,
+          volume: null,
+          unifiedData: { title: 'Artbook' },
+        })
+        .expect(201);
+
+      // 4. Serie d'un autre compte / hors collection : 404, jamais 400.
+      const otherColl = await createCollection(token, 'manga', 'autre');
+      await request(app.getHttpServer())
+        .post(`/v1/collections/${otherColl}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ nodeId: serieId, volume: 1, unifiedData: {} })
+        .expect(404);
+
+      // 5. La serie se relit avec ses tomes.
+      const nodes = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/nodes?level=serie`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(nodes.body.data).toHaveLength(1);
+      expect(nodes.body.data[0]).toMatchObject({
+        id: serieId,
+        title: 'Vinland Saga',
+        ownedCount: 2,
+      });
+
+      // 6. Le tome est detache (serie supprimee cote app) puis le second aussi : purge.
+      await request(app.getHttpServer())
+        .patch(`/v1/items/${t1.body.id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ nodeId: null })
+        .expect(200);
+      const drill = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/items?nodeId=${serieId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(drill.body.data).toHaveLength(1);
+
+      await request(app.getHttpServer())
+        .patch(`/v1/items/${drill.body.data[0].id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ nodeId: null })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/v1/nodes/${serieId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(404);
+
+      // 7. Une serie sans identite ni contenu curé n'a rien a decrire : 400.
+      const empty = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/nodes`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ level: 'serie' });
+      expect(empty.status).toBe(400);
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
   it('filtre ?provider[in]= sur sources[] des items', async () => {
     const sub = `e2e-provider-${randomBytes(8).toString('hex')}`;
     const { token, userId } = await login(app, fakeGoogle, sub);

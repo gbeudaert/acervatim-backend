@@ -15,9 +15,11 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CollectionAccess } from '../premium/collection-access.service';
 import { CollectionPremiumGuard } from '../premium/collection-premium.guard';
 import { CollectionRef } from '../premium/collection-ref.decorator';
-import { PremiumGuard } from '../premium/premium.guard';
+import { CollectionWriteGuard } from '../premium/collection-write.guard';
+import { CurrentCollectionAccess } from '../premium/current-collection-access.decorator';
 import { AttachItemSourceDto } from './dto/attach-source.dto';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
@@ -32,7 +34,8 @@ export class ItemsController {
   constructor(private readonly items: ItemsService) {}
 
   @Post('collections/:collectionId/items')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('collection', 'collectionId')
   async create(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -45,35 +48,38 @@ export class ItemsController {
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('collection', 'collectionId')
   async list(
-    @CurrentUserId() userId: string,
-    @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
+    // Non consomme (deja dans `access`), mais le pipe doit rester : sans lui un
+    // identifiant malforme ne serait plus un 400, le guard le laissant passer.
+    @Param('collectionId', new ParseUUIDPipe()) _collectionId: string,
     @Query() query: ListItemsQueryDto,
   ) {
-    return this.items.list(userId, collectionId, query);
+    return this.items.list(access, query);
   }
 
   @Get('items/:id')
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('item', 'id')
   async findOne(
-    @CurrentUserId() userId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.items.findOne(userId, id);
+    return this.items.findOne(access, id);
   }
 
   @Get('items/:id/sources')
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('item', 'id')
   async sources(
-    @CurrentUserId() userId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.items.getSources(userId, id);
+    return this.items.getSources(access, id);
   }
 
   @Post('items/:id/sources')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('item', 'id')
   async attachSource(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -83,7 +89,8 @@ export class ItemsController {
   }
 
   @Patch('items/:id')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('item', 'id')
   async update(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -93,7 +100,8 @@ export class ItemsController {
   }
 
   @Delete('items/:id')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('item', 'id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(
     @CurrentUserId() userId: string,

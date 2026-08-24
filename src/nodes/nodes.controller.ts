@@ -15,9 +15,11 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { CurrentUserId } from '../common/decorators/current-user-id.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { CollectionAccess } from '../premium/collection-access.service';
 import { CollectionPremiumGuard } from '../premium/collection-premium.guard';
 import { CollectionRef } from '../premium/collection-ref.decorator';
-import { PremiumGuard } from '../premium/premium.guard';
+import { CollectionWriteGuard } from '../premium/collection-write.guard';
+import { CurrentCollectionAccess } from '../premium/current-collection-access.decorator';
 import { AttachNodeSourceDto } from './dto/attach-source.dto';
 import { CreateNodeDto } from './dto/create-node.dto';
 import { ListNodesQueryDto } from './dto/list-nodes.query';
@@ -32,7 +34,8 @@ export class NodesController {
   constructor(private readonly nodes: NodesService) {}
 
   @Post('collections/:collectionId/nodes')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('collection', 'collectionId')
   async create(
     @CurrentUserId() userId: string,
     @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
@@ -45,35 +48,38 @@ export class NodesController {
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('collection', 'collectionId')
   async list(
-    @CurrentUserId() userId: string,
-    @Param('collectionId', new ParseUUIDPipe()) collectionId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
+    // Non consomme (deja dans `access`), mais le pipe doit rester : sans lui un
+    // identifiant malforme ne serait plus un 400, le guard le laissant passer.
+    @Param('collectionId', new ParseUUIDPipe()) _collectionId: string,
     @Query() query: ListNodesQueryDto,
   ) {
-    return this.nodes.list(userId, collectionId, query);
+    return this.nodes.list(access, query);
   }
 
   @Get('nodes/:id')
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('node', 'id')
   async findOne(
-    @CurrentUserId() userId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.nodes.findOne(userId, id);
+    return this.nodes.findOne(access, id);
   }
 
   @Get('nodes/:id/sources')
   @UseGuards(CollectionPremiumGuard)
   @CollectionRef('node', 'id')
   async sources(
-    @CurrentUserId() userId: string,
+    @CurrentCollectionAccess() access: CollectionAccess,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.nodes.getSources(userId, id);
+    return this.nodes.getSources(access, id);
   }
 
   @Patch('nodes/:id')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('node', 'id')
   async update(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -90,7 +96,8 @@ export class NodesController {
   }
 
   @Post('nodes/:id/sources')
-  @UseGuards(PremiumGuard)
+  @UseGuards(CollectionWriteGuard)
+  @CollectionRef('node', 'id')
   async attachSource(
     @CurrentUserId() userId: string,
     @Param('id', new ParseUUIDPipe()) id: string,

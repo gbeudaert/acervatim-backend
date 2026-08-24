@@ -6,7 +6,12 @@ import {
 import { Collection, Prisma } from '@prisma/client';
 import { CursorPage, paginate } from '../common/pagination/paginate';
 import { LimitsService } from '../common/limits/limits.service';
+import {
+  accessStatuses,
+  CollectionAccess,
+} from '../premium/collection-access.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ShareFilterService } from '../sharing/share-filter.service';
 import { HierarchySummaryEntry, summarizeHierarchy } from './types/hierarchy';
 import { getProfile } from './types/registry';
 import { CreateCollectionDto } from './dto/create-collection.dto';
@@ -41,6 +46,7 @@ export class CollectionsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly limits: LimitsService,
+    private readonly shareFilter: ShareFilterService,
   ) {}
 
   private toResponse(
@@ -185,20 +191,31 @@ export class CollectionsService {
     return { ...page, data: page.data.map((c) => this.toResponse(c)) };
   }
 
-  async findOne(userId: string, id: string): Promise<CollectionDetailResponse> {
-    const collection = await this.prisma.collection.findFirst({
-      where: { id, userId },
+  /**
+   * Détail d'une collection, du point de vue du requérant.
+   *
+   * Pour un membre, les compteurs sont **recalculés sous ce qui lui est exposé** : `itemCount` est
+   * dénormalisé sur la collection entière et le résumé de hiérarchie compte tous les nœuds. Servis
+   * tels quels, ils afficheraient « 240 éléments » et « 30 séries » sur une vue qui en montre 12 et
+   * 3. Le compte reste utile au membre — il doit juste être celui de ce qu'il voit.
+   */
+  async findOne(access: CollectionAccess): Promise<CollectionDetailResponse> {
+    const id = access.collectionId;
+    const collection = await this.prisma.collection.findUnique({
+      where: { id },
       include: TYPE_INCLUDE,
     });
     if (!collection) {
       throw new NotFoundException('Collection not found');
     }
+    const statuses = accessStatuses(access);
     const profile = getProfile(collection.type.code);
     let hierarchy: HierarchySummaryEntry[] = [];
     if (profile.hierarchy.length > 0) {
+      const scoped = await this.shareFilter.nodeWhere(id, statuses);
       const groups = await this.prisma.collectionNode.groupBy({
         by: ['level'],
-        where: { collectionId: id },
+        where: { collectionId: id, ...(scoped ? { AND: [scoped] } : {}) },
         _count: { _all: true },
       });
       const counts: Record<string, number> = Object.fromEntries(
@@ -206,7 +223,11 @@ export class CollectionsService {
       );
       hierarchy = summarizeHierarchy(profile, counts);
     }
-    return { ...this.toResponse(collection), hierarchy };
+    const response = this.toResponse(collection);
+    if (access.role === 'shared') {
+      response.itemCount = await this.shareFilter.countItems(id, statuses);
+    }
+    return { ...response, hierarchy };
   }
 
   async update(

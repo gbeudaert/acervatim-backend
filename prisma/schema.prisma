@@ -27,6 +27,7 @@ model User {
   subscription          Subscription?
   premiumGrant          PremiumGrant?
   invitationRedemptions InvitationRedemption[]
+  collectionShares      CollectionShare[]
   shareMemberships      CollectionShareMember[]
 
   @@map("users")
@@ -62,11 +63,11 @@ model Collection {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
-  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type   CollectionType    @relation(fields: [typeId], references: [id], onDelete: Restrict)
-  items  Item[]
-  nodes  CollectionNode[]
-  shares CollectionShare[]
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type         CollectionType         @relation(fields: [typeId], references: [id], onDelete: Restrict)
+  items        Item[]
+  nodes        CollectionNode[]
+  shareEntries CollectionShareEntry[]
 
   @@index([userId, createdAt])
   @@index([typeId])
@@ -76,10 +77,10 @@ model Collection {
 // Table de constantes : 'vinyl' | 'manga' | 'movie' | ...
 // Le code reste l'identifiant logique stable ; l'id UUID est la PK opaque.
 model CollectionType {
-  id          String   @id @default(uuid()) @db.Char(36)
-  code        String   @unique @db.VarChar(32)
-  label       String   @db.VarChar(64)
-  createdAt   DateTime @default(now()) @map("created_at")
+  id        String   @id @default(uuid()) @db.Char(36)
+  code      String   @unique @db.VarChar(32)
+  label     String   @db.VarChar(64)
+  createdAt DateTime @default(now()) @map("created_at")
 
   collections Collection[]
 
@@ -174,15 +175,15 @@ model ApiCache {
 // ---------- Premium (subscriptions + grants) ----------
 
 model Subscription {
-  userId         String    @id @map("user_id") @db.Char(36)
-  status         String    @db.VarChar(16) // 'active' | 'grace_period' | 'on_hold' | 'paused' | 'cancelled' | 'expired'
-  productId      String    @map("product_id") @db.VarChar(64)
-  purchaseToken  String    @unique @map("purchase_token") @db.VarChar(512)
-  expiresAt      BigInt    @map("expires_at") // epoch ms
-  autoRenew      Boolean   @default(true) @map("auto_renew")
-  startedAt      DateTime  @default(now()) @map("started_at")
-  lastVerifiedAt DateTime  @default(now()) @map("last_verified_at")
-  cancelReason   String?   @map("cancel_reason") @db.VarChar(64)
+  userId         String   @id @map("user_id") @db.Char(36)
+  status         String   @db.VarChar(16) // 'active' | 'grace_period' | 'on_hold' | 'paused' | 'cancelled' | 'expired'
+  productId      String   @map("product_id") @db.VarChar(64)
+  purchaseToken  String   @unique @map("purchase_token") @db.VarChar(512)
+  expiresAt      BigInt   @map("expires_at") // epoch ms
+  autoRenew      Boolean  @default(true) @map("auto_renew")
+  startedAt      DateTime @default(now()) @map("started_at")
+  lastVerifiedAt DateTime @default(now()) @map("last_verified_at")
+  cancelReason   String?  @map("cancel_reason") @db.VarChar(64)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -246,24 +247,44 @@ model InvitationRedemption {
 // est stocké, et le code en clair n'est retourné qu'à la création.
 // Pepper DÉDIÉ : ces codes sont générés par n'importe quel utilisateur, pas seulement l'admin.
 
+// Un partage = UN code, N collections, chacune avec son propre jeu de statuts (S5). Le partage
+// n'appartient donc plus à une collection : il appartient à un utilisateur, d'où la FK vers `User`
+// (avant S5 la cascade de suppression de compte passait par `collection_id`, qui n'existe plus).
 model CollectionShare {
-  id           String    @id @default(uuid()) @db.Char(36)
-  collectionId String    @map("collection_id") @db.Char(36)
-  ownerUserId  String    @map("owner_user_id") @db.Char(36) // dénormalisé : requêtes « mes partages »
-  codeHash     String    @unique @map("code_hash") @db.Char(64) // HMAC-SHA-256 hex
-  scope        String    @db.VarChar(16) // 'all' | 'owned' | 'wantlist'
-  maxUses      Int       @default(1) @map("max_uses")
-  usedCount    Int       @default(0) @map("used_count")
-  expiresAt    BigInt?   @map("expires_at") // epoch ms ; null = jamais. Borne l'usage du CODE, pas l'adhésion.
-  revokedAt    DateTime? @map("revoked_at") // révocation = marquage, jamais de suppression physique
-  createdAt    DateTime  @default(now()) @map("created_at")
+  id          String    @id @default(uuid()) @db.Char(36)
+  ownerUserId String    @map("owner_user_id") @db.Char(36)
+  codeHash    String    @unique @map("code_hash") @db.Char(64) // HMAC-SHA-256 hex
+  // Libellé libre du PROPRIÉTAIRE (« Wantlist manga avec Alice »). Aide-mémoire privé : ne sort
+  // jamais vers les membres, n'est ni journalisé ni mis en métadonnée d'audit.
+  label       String?   @db.VarChar(200)
+  maxUses     Int       @default(1) @map("max_uses")
+  usedCount   Int       @default(0) @map("used_count")
+  expiresAt   BigInt?   @map("expires_at") // epoch ms ; null = jamais. Borne l'usage du CODE, pas l'adhésion.
+  revokedAt   DateTime? @map("revoked_at") // révocation = marquage, jamais de suppression physique
+  createdAt   DateTime  @default(now()) @map("created_at")
 
-  collection Collection              @relation(fields: [collectionId], references: [id], onDelete: Cascade)
-  members    CollectionShareMember[]
+  owner   User                    @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  entries CollectionShareEntry[]
+  members CollectionShareMember[]
 
-  @@index([collectionId])
   @@index([ownerUserId])
   @@map("collection_shares")
+}
+
+// Ce qu'un partage expose d'UNE collection. PK composite : une collection n'apparaît qu'une fois
+// par partage. `statuses` est un tableau JSON de `ItemStatus` (['OWNED','WISHLIST',...]), non vide :
+// les anciennes portées all/owned/wantlist n'en sont plus que des raccourcis d'UI.
+model CollectionShareEntry {
+  shareId      String @map("share_id") @db.Char(36)
+  collectionId String @map("collection_id") @db.Char(36)
+  statuses     Json
+
+  share      CollectionShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  collection Collection      @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@id([shareId, collectionId])
+  @@index([collectionId]) // « qui me partage cette collection »
+  @@map("collection_share_entries")
 }
 
 // Un membre ayant consommé le code. PK composite : on ne rejoint qu'une fois (même logique que
@@ -271,6 +292,9 @@ model CollectionShare {
 model CollectionShareMember {
   shareId      String    @map("share_id") @db.Char(36)
   memberUserId String    @map("member_user_id") @db.Char(36)
+  // Libellé libre du MEMBRE (« Wantlist manga de Bob »). Symétrique de `CollectionShare.label`,
+  // et tout aussi privé : le propriétaire ne le voit pas.
+  label        String?   @db.VarChar(200)
   redeemedAt   DateTime  @default(now()) @map("redeemed_at")
   revokedAt    DateTime? @map("revoked_at")
 

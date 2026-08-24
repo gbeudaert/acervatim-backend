@@ -90,13 +90,14 @@ export class UsersService {
         where: { ownerUserId: userId },
         select: {
           id: true,
-          collectionId: true,
-          scope: true,
+          // Le libellé est une donnée saisie par cet utilisateur : elle lui revient.
+          label: true,
           maxUses: true,
           usedCount: true,
           expiresAt: true,
           revokedAt: true,
           createdAt: true,
+          entries: { select: { collectionId: true, statuses: true } },
           members: {
             select: {
               memberUserId: true,
@@ -110,9 +111,15 @@ export class UsersService {
         where: { memberUserId: userId },
         select: {
           shareId: true,
+          // Son propre libellé, pas celui du propriétaire du partage.
+          label: true,
           redeemedAt: true,
           revokedAt: true,
-          share: { select: { collectionId: true, scope: true } },
+          share: {
+            select: {
+              entries: { select: { collectionId: true, statuses: true } },
+            },
+          },
         },
       }),
       this.prisma.auditLog.findMany({

@@ -2,14 +2,21 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { LimitsService } from '../common/limits/limits.service';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
+import { CollectionAccess } from '../premium/collection-access.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ShareFilterService } from '../sharing/share-filter.service';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ItemsService } from './items.service';
 
 type PrismaMock = {
-  collection: { findFirst: jest.Mock; update: jest.Mock };
+  collection: {
+    findFirst: jest.Mock;
+    findUnique: jest.Mock;
+    update: jest.Mock;
+  };
   collectionNode: {
     create: jest.Mock;
+    findFirst: jest.Mock;
     findUnique: jest.Mock;
     delete: jest.Mock;
   };
@@ -27,9 +34,14 @@ type PrismaMock = {
 
 function makePrismaMock(): PrismaMock {
   const mock: PrismaMock = {
-    collection: { findFirst: jest.fn(), update: jest.fn() },
+    collection: {
+      findFirst: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
+    },
     collectionNode: {
       create: jest.fn(),
+      findFirst: jest.fn(),
       findUnique: jest.fn(),
       delete: jest.fn(),
     },
@@ -72,13 +84,26 @@ function makeService(
   limits: LimitsService;
   snapshots: SourceSnapshotService;
 } {
+  // Proprietaire : tous les statuts, le filtrage de partage ne restreint rien.
+  const shareFilter = {
+    itemWhere: jest.fn().mockResolvedValue(null),
+    nodeWhere: jest.fn().mockResolvedValue(null),
+    countItems: jest.fn(),
+    countItemsByNode: jest.fn().mockResolvedValue({}),
+  } as unknown as ShareFilterService;
   const svc = new ItemsService(
     prisma as unknown as PrismaService,
     limits,
     snapshots,
+    shareFilter,
   );
   return { svc, limits, snapshots };
 }
+
+const ownerAccess = (
+  userId: string,
+  collectionId: string,
+): CollectionAccess => ({ collectionId, ownerUserId: userId, role: 'owner' });
 
 const USER_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const USER_B = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
@@ -237,13 +262,13 @@ describe('ItemsService.create', () => {
 });
 
 describe('ItemsService.list', () => {
-  it('scope par userId + collectionId et applique le tiebreaker id desc', async () => {
+  it('scope sur le proprietaire + collectionId et applique le tiebreaker id desc', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.collection.findUnique.mockResolvedValue(VINYL_COLL);
     prisma.item.findMany.mockResolvedValue([]);
 
     const { svc } = makeService(prisma);
-    await svc.list(USER_A, COLL_ID, { limit: 50 } as never);
+    await svc.list(ownerAccess(USER_A, COLL_ID), { limit: 50 } as never);
 
     const call = prisma.item.findMany.mock.calls[0][0];
     expect(call.where).toEqual({ collectionId: COLL_ID, userId: USER_A });
@@ -253,17 +278,20 @@ describe('ItemsService.list', () => {
 
   it('rejette ?nodeId sur un type plat (400)', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.collection.findUnique.mockResolvedValue(VINYL_COLL);
 
     const { svc } = makeService(prisma);
     await expect(
-      svc.list(USER_A, COLL_ID, { limit: 50, nodeId: NODE_ID } as never),
+      svc.list(ownerAccess(USER_A, COLL_ID), {
+        limit: 50,
+        nodeId: NODE_ID,
+      } as never),
     ).rejects.toThrow(/flat collection type/);
   });
 
   it('projette en vue légère vinyl', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.collection.findUnique.mockResolvedValue(VINYL_COLL);
     prisma.item.findMany.mockResolvedValue([
       {
         id: ITEM_ID,
@@ -276,7 +304,9 @@ describe('ItemsService.list', () => {
     ]);
 
     const { svc } = makeService(prisma);
-    const page = await svc.list(USER_A, COLL_ID, { limit: 50 } as never);
+    const page = await svc.list(ownerAccess(USER_A, COLL_ID), {
+      limit: 50,
+    } as never);
     expect(page.data[0]).toEqual({
       id: ITEM_ID,
       type: 'vinyl',
@@ -291,7 +321,7 @@ describe('ItemsService.list', () => {
 
   it('projette status=OWNED pour un item sans userData.status (avant S1)', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+    prisma.collection.findUnique.mockResolvedValue(VINYL_COLL);
     prisma.item.findMany.mockResolvedValue([
       {
         id: ITEM_ID,
@@ -304,17 +334,21 @@ describe('ItemsService.list', () => {
     ]);
 
     const { svc } = makeService(prisma);
-    const page = await svc.list(USER_A, COLL_ID, { limit: 50 } as never);
+    const page = await svc.list(ownerAccess(USER_A, COLL_ID), {
+      limit: 50,
+    } as never);
     expect(page.data[0]).toMatchObject({ status: 'OWNED' });
   });
 
-  it('throw NotFound si la collection n’appartient pas au user', async () => {
+  // L'acces d'autrui est refuse en amont par le guard : reste au service la collection
+  // disparue entre la resolution de l'acces et la lecture.
+  it('throw NotFound si la collection a disparu entre le guard et la lecture', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(null);
+    prisma.collection.findUnique.mockResolvedValue(null);
 
     const { svc } = makeService(prisma);
     await expect(
-      svc.list(USER_B, COLL_ID, { limit: 50 } as never),
+      svc.list(ownerAccess(USER_B, COLL_ID), { limit: 50 } as never),
     ).rejects.toThrow(NotFoundException);
   });
 });
@@ -336,9 +370,9 @@ describe('ItemsService.findOne', () => {
     );
 
     const { svc } = makeService(prisma);
-    const r = await svc.findOne(USER_A, ITEM_ID);
+    const r = await svc.findOne(ownerAccess(USER_A, COLL_ID), ITEM_ID);
     expect(prisma.item.findFirst).toHaveBeenCalledWith({
-      where: { id: ITEM_ID, userId: USER_A },
+      where: { id: ITEM_ID, collectionId: COLL_ID, userId: USER_A },
     });
     expect(r.sources).toEqual([
       {
@@ -357,9 +391,9 @@ describe('ItemsService.findOne', () => {
     prisma.item.findFirst.mockResolvedValue(null);
 
     const { svc } = makeService(prisma);
-    await expect(svc.findOne(USER_B, ITEM_ID)).rejects.toThrow(
-      NotFoundException,
-    );
+    await expect(
+      svc.findOne(ownerAccess(USER_B, COLL_ID), ITEM_ID),
+    ).rejects.toThrow(NotFoundException);
   });
 });
 
@@ -481,5 +515,155 @@ describe('ItemsService.remove', () => {
       NotFoundException,
     );
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('ItemsService - tomes manga sans provider', () => {
+  const MANGA_COLL = { id: COLL_ID, type: { code: 'manga' } };
+
+  const mangaItem = (overrides: Record<string, unknown> = {}) => ({
+    ...itemRow({ nodeId: NODE_ID, volume: 3, ...overrides }),
+    collection: { type: { code: 'manga' } },
+  });
+
+  it('rattache le tome a une serie deja creee via nodeId, sans appel provider', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(MANGA_COLL);
+    prisma.collectionNode.findFirst.mockResolvedValue({ id: NODE_ID });
+    prisma.item.create.mockResolvedValue(
+      itemRow({ nodeId: NODE_ID, volume: 3 }),
+    );
+    prisma.collection.update.mockResolvedValue({});
+
+    const { svc, snapshots } = makeService(prisma);
+    await svc.create(USER_A, COLL_ID, {
+      nodeId: NODE_ID,
+      volume: 3,
+      unifiedData: { title: 'T.3' },
+    } as CreateItemDto);
+
+    expect(prisma.item.create.mock.calls[0][0].data).toMatchObject({
+      nodeId: NODE_ID,
+      volume: 3,
+    });
+    expect(snapshots.snapshot).not.toHaveBeenCalled();
+  });
+
+  it('nodeId hors de la collection (ou d un autre compte) : 404, pas 400', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(MANGA_COLL);
+    prisma.collectionNode.findFirst.mockResolvedValue(null);
+
+    const { svc } = makeService(prisma);
+    await expect(
+      svc.create(USER_A, COLL_ID, {
+        nodeId: NODE_ID,
+        volume: 1,
+        unifiedData: {},
+      } as CreateItemDto),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepte un tome orphelin et hors numerotation (serie supprimee, hors-serie)', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(MANGA_COLL);
+    prisma.item.create.mockResolvedValue(itemRow());
+    prisma.collection.update.mockResolvedValue({});
+
+    const { svc } = makeService(prisma);
+    await svc.create(USER_A, COLL_ID, {
+      unifiedData: { title: 'Artbook' },
+    } as CreateItemDto);
+
+    expect(prisma.item.create.mock.calls[0][0].data).toMatchObject({
+      nodeId: null,
+      volume: null,
+    });
+  });
+
+  it('rejette nodeId sur un type plat (400)', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.findFirst.mockResolvedValue(VINYL_COLL);
+
+    const { svc } = makeService(prisma);
+    await expect(
+      svc.create(USER_A, COLL_ID, {
+        nodeId: NODE_ID,
+        unifiedData: { title: 'x' },
+      } as CreateItemDto),
+    ).rejects.toThrow(/flat collection type/);
+  });
+
+  it('PATCH deplace un tome vers une autre serie', async () => {
+    const OTHER_NODE = '11111111-1111-4111-1111-111111111111';
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(mangaItem());
+    prisma.collectionNode.findFirst.mockResolvedValue({ id: OTHER_NODE });
+    prisma.item.update.mockResolvedValue(
+      itemRow({ nodeId: OTHER_NODE, volume: 1 }),
+    );
+    prisma.item.count.mockResolvedValue(2); // l ancienne serie garde des tomes
+
+    const { svc } = makeService(prisma);
+    await svc.update(USER_A, ITEM_ID, {
+      nodeId: OTHER_NODE,
+      volume: 1,
+    } as never);
+
+    const data = prisma.item.update.mock.calls[0][0].data;
+    expect(data).toMatchObject({
+      node: { connect: { id: OTHER_NODE } },
+      volume: 1,
+    });
+    expect(prisma.collectionNode.delete).not.toHaveBeenCalled();
+  });
+
+  it('PATCH nodeId=null detache le tome et purge la serie devenue vide', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(mangaItem());
+    prisma.item.update.mockResolvedValue(itemRow({ nodeId: null, volume: 3 }));
+    prisma.item.count.mockResolvedValue(0);
+    prisma.collectionNode.findUnique.mockResolvedValue({ isWishlist: false });
+
+    const { svc } = makeService(prisma);
+    await svc.update(USER_A, ITEM_ID, { nodeId: null } as never);
+
+    expect(prisma.item.update.mock.calls[0][0].data).toMatchObject({
+      node: { disconnect: true },
+    });
+    expect(prisma.collectionNode.delete).toHaveBeenCalledWith({
+      where: { id: NODE_ID },
+    });
+  });
+
+  it('PATCH nodeId/volume rejete sur un type plat (400)', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue({
+      ...itemRow(),
+      collection: { type: { code: 'vinyl' } },
+    });
+
+    const { svc } = makeService(prisma);
+    await expect(
+      svc.update(USER_A, ITEM_ID, { volume: 2 } as never),
+    ).rejects.toThrow(/flat collection type/);
+    expect(prisma.item.update).not.toHaveBeenCalled();
+  });
+
+  it('PATCH sur (serie, volume) deja pris : 409', async () => {
+    const prisma = makePrismaMock();
+    prisma.item.findFirst.mockResolvedValue(mangaItem());
+    prisma.item.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('dup', {
+        code: 'P2002',
+        clientVersion: 'test',
+      }),
+    );
+
+    const { svc } = makeService(prisma);
+    await expect(
+      svc.update(USER_A, ITEM_ID, { volume: 1 } as never),
+    ).rejects.toThrow(ConflictException);
   });
 });

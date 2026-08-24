@@ -18,7 +18,16 @@ import { CursorPage, paginate } from '../common/pagination/paginate';
 import { LimitsService } from '../common/limits/limits.service';
 import { SourceSnapshotService } from '../common/sources/source-snapshot.service';
 import { UnifiedItem } from '../oauth/providers/types';
+import {
+  accessStatuses,
+  CollectionAccess,
+} from '../premium/collection-access.service';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  itemVisibleUnderStatuses,
+  ShareFilterService,
+} from '../sharing/share-filter.service';
+import { sharedItemUserData } from '../sharing/shared-user-data';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsQueryDto } from './dto/list-items.query';
 import { UpdateItemDto } from './dto/update-item.dto';
@@ -49,6 +58,7 @@ export class ItemsService {
     private readonly prisma: PrismaService,
     private readonly limits: LimitsService,
     private readonly snapshots: SourceSnapshotService,
+    private readonly shareFilter: ShareFilterService,
   ) {}
 
   /** 404 si la collection n'existe pas OU appartient à un autre user (pas de leak). */
@@ -94,6 +104,27 @@ export class ItemsService {
     return rows[0]?.id ?? null;
   }
 
+  /**
+   * Vérifie que `nodeId` désigne bien un nœud de **cette** collection et de ce propriétaire.
+   *
+   * 404 et non 400 : un nœud d'un autre utilisateur doit être indiscernable d'un nœud inexistant,
+   * sinon un balayage d'ids devient un oracle d'existence (même règle qu'en lecture).
+   */
+  private async assertNodeOwned(
+    userId: string,
+    collectionId: string,
+    nodeId: string,
+  ): Promise<string> {
+    const node = await this.prisma.collectionNode.findFirst({
+      where: { id: nodeId, userId, collectionId },
+      select: { id: true },
+    });
+    if (!node) {
+      throw new NotFoundException('Node not found');
+    }
+    return node.id;
+  }
+
   // ids des items de la collection dont sources[] contient l'un des providers (OR).
   private async itemIdsByProvider(
     userId: string,
@@ -116,7 +147,16 @@ export class ItemsService {
     return Array.isArray(value) ? (value as unknown as SourceEntry[]) : [];
   }
 
-  private toCurated(item: Item): CuratedItem {
+  /**
+   * `role` conditionne le `userData` rendu : un membre n'en voit que la part partageable
+   * (cf. `sharedItemUserData`). Le reste du DTO est identique — même forme de réponse pour le
+   * propriétaire et pour le membre, c'est ce qui permet à l'app de réutiliser ses écrans.
+   */
+  private toCurated(
+    item: Item,
+    role: 'owner' | 'shared' = 'owner',
+  ): CuratedItem {
+    const userData = (item.userData ?? {}) as JsonRecord;
     return {
       id: item.id,
       collectionId: item.collectionId,
@@ -125,7 +165,7 @@ export class ItemsService {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       unifiedData: (item.unifiedData ?? {}) as JsonRecord,
-      userData: (item.userData ?? {}) as JsonRecord,
+      userData: role === 'shared' ? sharedItemUserData(userData) : userData,
       sources: this.toEntries(item.sources).map((e) => ({
         provider: e.provider,
         externalId: e.externalId,
@@ -144,17 +184,14 @@ export class ItemsService {
     const profile = getProfile(typeCode);
     const hierarchical = profile.hierarchy.length > 0;
 
-    if (hierarchical) {
-      if (!dto.node || dto.volume === undefined) {
-        throw new BadRequestException(
-          'node and volume are required for this collection type',
-        );
-      }
-    } else if (dto.node || dto.volume !== undefined) {
+    if (!hierarchical && (dto.node || dto.nodeId || dto.volume !== undefined)) {
       throw new BadRequestException(
-        'node/volume are not allowed for a flat collection type',
+        'node/nodeId/volume are not allowed for a flat collection type',
       );
     }
+    // Sur un type hiérarchique, ni la série ni le n° de tome ne sont exigés : supprimer une série
+    // laisse ses tomes orphelins (le modèle app les conserve), et un hors-série n'a pas de numéro.
+    // Les refuser ferait de la synchronisation une perte de données, pas un miroir.
 
     const unifiedData = this.validateUnified(typeCode, dto.unifiedData);
 
@@ -165,7 +202,13 @@ export class ItemsService {
       unifiedData: JsonRecord;
       sources: SourceEntry[];
     } | null = null;
-    if (hierarchical && dto.node) {
+    if (hierarchical && dto.nodeId) {
+      existingNodeId = await this.assertNodeOwned(
+        userId,
+        collectionId,
+        dto.nodeId,
+      );
+    } else if (hierarchical && dto.node) {
       const level = profile.hierarchy[0];
       existingNodeId = await this.findNodeBySource(
         collectionId,
@@ -176,8 +219,11 @@ export class ItemsService {
       if (!existingNodeId) {
         const entry = await this.snapshots.snapshot(dto.node, userId);
         if (entry.rawData === null) {
+          // Sans adapter, rien ici ne sait de quoi la série est faite. La créer d'abord
+          // (POST /collections/:id/nodes avec son `unifiedData`) puis passer `nodeId` est le
+          // chemin prévu — un item ne porte pas la vérité curée de son parent.
           throw new BadRequestException(
-            `node provider '${dto.node.provider}' has no adapter; cannot enrich series node`,
+            `node provider '${dto.node.provider}' has no adapter; create the node first and pass 'nodeId'`,
           );
         }
         const nodeUnified = level.nodeSchema.parse(
@@ -244,15 +290,25 @@ export class ItemsService {
     }
   }
 
+  /**
+   * Liste des items visibles pour ce requérant.
+   *
+   * `access` remplace le `userId` d'avant S4 : la collection reste scopée sur son **propriétaire**
+   * (`ownerUserId`), et les statuts du partage — jamais reçus du client — restreignent le `where`.
+   * Un propriétaire les a tous : sa propre lecture est inchangée.
+   */
   async list(
-    userId: string,
-    collectionId: string,
+    access: CollectionAccess,
     query: ListItemsQueryDto,
   ): Promise<CursorPage<LightItem>> {
-    const collection = await this.assertCollectionOwned(userId, collectionId);
-    const profile = getProfile(collection.type.code);
+    const collectionId = access.collectionId;
+    const typeCode = await this.collectionTypeCode(collectionId);
+    const profile = getProfile(typeCode);
 
-    const where: Prisma.ItemWhereInput = { collectionId, userId };
+    const where: Prisma.ItemWhereInput = {
+      collectionId,
+      userId: access.ownerUserId,
+    };
     if (query.nodeId) {
       if (profile.hierarchy.length === 0) {
         throw new BadRequestException(
@@ -263,7 +319,7 @@ export class ItemsService {
     }
     if (query.provider) {
       const ids = await this.itemIdsByProvider(
-        userId,
+        access.ownerUserId,
         collectionId,
         query.provider.in,
       );
@@ -274,6 +330,14 @@ export class ItemsService {
         };
       }
       where.id = { in: ids };
+    }
+    // `AND` et non `where.id` : le filtre par provider occupe déjà `id`.
+    const scoped = await this.shareFilter.itemWhere(
+      collectionId,
+      accessStatuses(access),
+    );
+    if (scoped) {
+      where.AND = [scoped];
     }
 
     const page = await paginate(
@@ -324,21 +388,63 @@ export class ItemsService {
     };
   }
 
-  /** 404 si l'item appartient à un autre user (scope via `userId` dénormalisé). */
-  async findOne(userId: string, id: string): Promise<CuratedItem> {
-    const item = await this.prisma.item.findFirst({ where: { id, userId } });
+  /** Type de la collection visée. Son existence est déjà acquise (résolue par le guard). */
+  private async collectionTypeCode(collectionId: string): Promise<string> {
+    const collection = await this.prisma.collection.findUnique({
+      where: { id: collectionId },
+      select: { type: { select: { code: true } } },
+    });
+    if (!collection) {
+      throw new NotFoundException('Collection not found');
+    }
+    return collection.type.code;
+  }
+
+  /**
+   * Item chargé sous l'angle du requérant, ou `null` s'il est hors de sa portée.
+   *
+   * Hors des statuts exposés renvoie la **même** absence qu'un item inexistant : sans ça, un membre
+   * à qui l'on ne partage que les possédés déduirait l'existence d'un désiré en balayant des ids.
+   */
+  private async visibleItem(
+    access: CollectionAccess,
+    id: string,
+  ): Promise<Item | null> {
+    const item = await this.prisma.item.findFirst({
+      where: {
+        id,
+        collectionId: access.collectionId,
+        userId: access.ownerUserId,
+      },
+    });
+    if (!item) return null;
+    // Sur une lecture unitaire, le prédicat TS suffit : pas d'aller-retour SQL pour un seul item.
+    return itemVisibleUnderStatuses(item.userData, accessStatuses(access))
+      ? item
+      : null;
+  }
+
+  /** 404 si l'item n'existe pas, sort de la collection visée, ou tombe hors des statuts exposés. */
+  async findOne(access: CollectionAccess, id: string): Promise<CuratedItem> {
+    const item = await this.visibleItem(access, id);
     if (!item) {
       throw new NotFoundException('Item not found');
     }
-    return this.toCurated(item);
+    return this.toCurated(item, access.role);
   }
 
-  /** Snapshots bruts d'un item (pour l'UI de comparaison). */
-  async getSources(userId: string, id: string): Promise<SourceEntry[]> {
-    const item = await this.prisma.item.findFirst({
-      where: { id, userId },
-      select: { sources: true },
-    });
+  /**
+   * Snapshots bruts d'un item (pour l'UI de comparaison).
+   *
+   * Rendus tels quels à un membre : `sources[].rawData` est la réponse d'un catalogue public
+   * (BnF, Google Books, MangaDex, Discogs, MAL, TMDB) sur une œuvre, jamais une donnée de compte —
+   * les adapters ne récupèrent que des fiches d'œuvres (`fetchDetails(id)`).
+   */
+  async getSources(
+    access: CollectionAccess,
+    id: string,
+  ): Promise<SourceEntry[]> {
+    const item = await this.visibleItem(access, id);
     if (!item) {
       throw new NotFoundException('Item not found');
     }
@@ -381,8 +487,71 @@ export class ItemsService {
       };
       data.userData = merged as Prisma.InputJsonValue;
     }
-    const updated = await this.prisma.item.update({ where: { id }, data });
-    return this.toCurated(updated);
+    // Rattachement : mêmes règles qu'à la création — interdit sur un type plat, et un `nodeId`
+    // hors de la collection (ou d'un autre compte) est un 404, pas un 400.
+    const structural = dto.nodeId !== undefined || dto.volume !== undefined;
+    if (structural) {
+      const profile = getProfile(item.collection.type.code);
+      if (profile.hierarchy.length === 0) {
+        throw new BadRequestException(
+          'nodeId/volume are not allowed for a flat collection type',
+        );
+      }
+      if (dto.nodeId !== undefined) {
+        data.node = dto.nodeId
+          ? {
+              connect: {
+                id: await this.assertNodeOwned(
+                  userId,
+                  item.collectionId,
+                  dto.nodeId,
+                ),
+              },
+            }
+          : { disconnect: true };
+      }
+      if (dto.volume !== undefined) {
+        data.volume = dto.volume;
+      }
+    }
+
+    const previousNodeId = item.nodeId;
+    try {
+      const updated = await this.prisma.$transaction(async (tx) => {
+        const row = await tx.item.update({ where: { id }, data });
+        // Le tome quitte sa série : celle-ci peut devenir vide, et une série vide non désirée
+        // n'a plus de raison d'exister (même purge qu'à la suppression d'un tome).
+        if (previousNodeId && previousNodeId !== row.nodeId) {
+          await this.purgeNodeIfEmpty(tx, previousNodeId);
+        }
+        return row;
+      });
+      return this.toCurated(updated);
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        throw new ConflictException('item déjà ajouté (série + volume)');
+      }
+      throw err;
+    }
+  }
+
+  /** Supprime un nœud devenu vide et non désiré (dernier tome parti ou supprimé). */
+  private async purgeNodeIfEmpty(
+    tx: Prisma.TransactionClient,
+    nodeId: string,
+  ): Promise<void> {
+    const remaining = await tx.item.count({ where: { nodeId } });
+    if (remaining > 0) return;
+    const node = await tx.collectionNode.findUnique({
+      where: { id: nodeId },
+      select: { isWishlist: true },
+    });
+    if (node && !node.isWishlist) {
+      await tx.collectionNode.delete({ where: { id: nodeId } });
+    }
   }
 
   async attachSource(
@@ -419,18 +588,7 @@ export class ItemsService {
       });
       // Purge du nœud devenu vide et non-wishlist (dernier tome supprimé).
       if (item.nodeId) {
-        const remaining = await tx.item.count({
-          where: { nodeId: item.nodeId },
-        });
-        if (remaining === 0) {
-          const node = await tx.collectionNode.findUnique({
-            where: { id: item.nodeId },
-            select: { isWishlist: true },
-          });
-          if (node && !node.isWishlist) {
-            await tx.collectionNode.delete({ where: { id: item.nodeId } });
-          }
-        }
+        await this.purgeNodeIfEmpty(tx, item.nodeId);
       }
     });
   }

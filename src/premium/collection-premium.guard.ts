@@ -1,32 +1,23 @@
-import {
-  CanActivate,
-  ExecutionContext,
-  Injectable,
-  InternalServerErrorException,
-  NotFoundException,
-} from '@nestjs/common';
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import {
   CollectionAccess,
   CollectionAccessService,
 } from './collection-access.service';
-import {
-  COLLECTION_REF_KEY,
-  CollectionRefMeta,
-} from './collection-ref.decorator';
+import { resolveCollectionRef } from './collection-ref.resolve';
 import { PaymentRequiredException } from './payment-required.exception';
 import { PremiumService } from './premium.service';
 
 declare module 'express-serve-static-core' {
   interface Request {
-    /** Posé par [CollectionPremiumGuard] : évite au service de re-résoudre l'accès. */
+    /**
+     * Posé par les guards de collection : évite au service de re-résoudre l'accès, et lui donne
+     * la portée du partage (jamais fournie par le client).
+     */
     collectionAccess?: CollectionAccess;
   }
 }
-
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Gate premium **en lecture**, sur le statut du **propriétaire** de la collection.
@@ -36,11 +27,11 @@ const UUID_RE =
  * ce qui viderait le chantier partage de son sens. Ici, ce qui compte est que **le propriétaire**
  * paie le stockage qu'on lit.
  *
- * À ce sprint (S2) le requérant est forcément le propriétaire, le partage n'existant pas encore :
- * le guard est fonctionnellement équivalent à `PremiumGuard`. La forme owner-aware est posée
- * maintenant pour que S4 s'y branche en étendant `resolveAccess`, sans refonte des routes.
+ * Corollaire assumé (S4) : un propriétaire qui perd son premium **suspend** les partages qu'il a
+ * émis — ses membres reçoivent 402, comme lui. Rien n'est supprimé ; le jour où il repaie, les
+ * partages reprennent.
  *
- * À empiler APRÈS `JwtAuthGuard`, sur une route portant `@CollectionRef(...)`.
+ * À empiler APRÈS `JwtAuthGuard`, sur une route de lecture portant `@CollectionRef(...)`.
  */
 @Injectable()
 export class CollectionPremiumGuard implements CanActivate {
@@ -51,41 +42,17 @@ export class CollectionPremiumGuard implements CanActivate {
   ) {}
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
-    const req = ctx.switchToHttp().getRequest<Request>();
-    if (!req.userId) {
-      throw new InternalServerErrorException(
-        'CollectionPremiumGuard used without JwtAuthGuard',
-      );
-    }
-    const meta = this.reflector.get<CollectionRefMeta | undefined>(
-      COLLECTION_REF_KEY,
-      ctx.getHandler(),
+    const access = await resolveCollectionRef(
+      this.reflector,
+      this.access,
+      ctx,
+      'CollectionPremiumGuard',
     );
-    if (!meta) {
-      throw new InternalServerErrorException(
-        'CollectionPremiumGuard used without @CollectionRef',
-      );
-    }
-
-    const raw = (req.params as Record<string, string>)[meta.param];
-    // Les guards passent AVANT les pipes : un identifiant malformé n'est pas notre affaire, on
-    // laisse `ParseUUIDPipe` rendre son 400 plutôt que de le transformer en 404.
-    if (!raw || !UUID_RE.test(raw)) return true;
-
-    const collectionId = await this.access.resolveCollectionId(meta.via, raw);
-    if (!collectionId) {
-      throw new NotFoundException('Not found');
-    }
-    const access = await this.access.resolveAccess(req.userId, collectionId);
-    if (!access) {
-      throw new NotFoundException('Not found');
-    }
+    if (!access) return true; // identifiant malformé : au pipe de rendre son 400
     const { isPremium } = await this.premium.getStatus(access.ownerUserId);
     if (!isPremium) {
       throw new PaymentRequiredException();
     }
-    // Évite au service de refaire la résolution, et donnera à S4 le `scope` déjà calculé.
-    req.collectionAccess = access;
     return true;
   }
 }

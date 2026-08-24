@@ -1,16 +1,12 @@
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
+import {
+  boundedJsonRecord,
+  UNIFIED_DATA_MAX_BYTES,
+} from '../../common/validation/bounded-json';
 import { ItemUserDataSchema } from './item-user-data.schema';
 
-const UNIFIED_DATA_MAX_BYTES = 32_000;
 const MAX_SOURCES = 20;
-
-const boundedJsonRecord = (maxBytes: number, field: string) =>
-  z
-    .record(z.unknown())
-    .refine((v) => Buffer.byteLength(JSON.stringify(v), 'utf8') <= maxBytes, {
-      message: `${field} must be ≤${maxBytes} bytes once serialized`,
-    });
 
 // Référence d'une source candidate. `provider` libre (un adapter peut exister ou non :
 // mal/discogs/tmdb → snapshot ; isbn/anilist → réf sans snapshot).
@@ -23,10 +19,15 @@ const SourceRefSchema = z
 
 export const CreateItemSchema = z
   .object({
-    // Série parente (types hiérarchiques uniquement) — upsert si absente.
+    // Série parente désignée par une référence provider — le nœud est upserté si absent.
+    // Chemin des imports enrichis (MAL), qui ne connaissent pas encore l'id serveur du nœud.
     node: SourceRefSchema.optional(),
-    // N° de tome (types hiérarchiques uniquement).
-    volume: z.number().int().nonnegative().optional(),
+    // Série parente déjà créée (POST /collections/:id/nodes) désignée par son id. Chemin de la
+    // synchronisation : le client pousse ses nœuds, puis ses items, comme collections → items.
+    nodeId: z.string().uuid().optional(),
+    // N° de tome (types hiérarchiques uniquement). `null` = tome hors numérotation (hors-série,
+    // artbook) : le modèle app l'autorise, le refuser bloquerait sa synchronisation.
+    volume: z.number().int().nonnegative().nullable().optional(),
     // Vérité curée — validée ensuite par le profil du type (discriminant forcé).
     unifiedData: boundedJsonRecord(UNIFIED_DATA_MAX_BYTES, 'unifiedData'),
     // Données perso/subjectives (rating, prix, dernière écoute) — optionnel.
@@ -34,6 +35,9 @@ export const CreateItemSchema = z
     // Sources propres à l'item (ex. isbn) — snapshot si adapter.
     sources: z.array(SourceRefSchema).max(MAX_SOURCES).optional(),
   })
-  .strict();
+  .strict()
+  .refine((v) => v.node === undefined || v.nodeId === undefined, {
+    message: 'node and nodeId are mutually exclusive',
+  });
 
 export class CreateItemDto extends createZodDto(CreateItemSchema) {}

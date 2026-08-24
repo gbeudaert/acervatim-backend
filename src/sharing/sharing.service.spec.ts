@@ -3,7 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import { AuditLogService } from '../common/audit/audit-log.service';
 import { HashService } from '../common/crypto/hash.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { CreateShareDto } from './dto/create-share.dto';
 import { ShareCodeInvalidException } from './share-code-invalid.exception';
+import { ShareFilterService } from './share-filter.service';
 import { SharingService } from './sharing.service';
 
 const PEPPER = 'share-pepper-share-pepper-share-p'; // >= 32 chars
@@ -11,18 +13,23 @@ const PEPPER = 'share-pepper-share-pepper-share-p'; // >= 32 chars
 const OWNER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const MEMBER = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
 const COLLECTION = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
+const COLLECTION_2 = 'eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee';
 const SHARE = 'dddddddd-dddd-4ddd-dddd-dddddddddddd';
 const CODE = 'rawShareCode123';
 
-const COLLECTION_ROW = {
-  id: COLLECTION,
-  name: 'Vinyles',
-  itemCount: 12,
-  type: { code: 'vinyl' },
-};
+/** Ce que le membre verra sous les statuts du partage. Distinct d'un total de collection, exprès. */
+const VISIBLE_ITEM_COUNT = 7;
+
+function entryRow(collectionId: string, statuses: string[]) {
+  return {
+    collectionId,
+    statuses,
+    collection: { name: 'Vinyles', type: { code: 'vinyl' } },
+  };
+}
 
 type PrismaMock = {
-  collection: { findFirst: jest.Mock };
+  collection: { count: jest.Mock };
   collectionShare: {
     findUnique: jest.Mock;
     findFirst: jest.Mock;
@@ -33,6 +40,7 @@ type PrismaMock = {
   };
   collectionShareMember: {
     findUnique: jest.Mock;
+    findFirst: jest.Mock;
     findMany: jest.Mock;
     create: jest.Mock;
     update: jest.Mock;
@@ -43,7 +51,8 @@ type PrismaMock = {
 
 function makePrismaMock(): PrismaMock {
   const mock: PrismaMock = {
-    collection: { findFirst: jest.fn().mockResolvedValue({ id: COLLECTION }) },
+    // Par defaut : le requerant possede toutes les collections qu'il demande a partager.
+    collection: { count: jest.fn().mockResolvedValue(1) },
     collectionShare: {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
@@ -54,6 +63,7 @@ function makePrismaMock(): PrismaMock {
     },
     collectionShareMember: {
       findUnique: jest.fn().mockResolvedValue(null),
+      findFirst: jest.fn().mockResolvedValue(null),
       findMany: jest.fn().mockResolvedValue([]),
       create: jest.fn().mockResolvedValue({ redeemedAt: new Date(0) }),
       update: jest.fn(),
@@ -67,6 +77,13 @@ function makePrismaMock(): PrismaMock {
     ),
   };
   return mock;
+}
+
+// Le compte visible est l'affaire de ShareFilterService : ici il n'est pas l'objet du test.
+function makeFilter(): ShareFilterService {
+  return {
+    countItems: jest.fn().mockResolvedValue(VISIBLE_ITEM_COUNT),
+  } as unknown as ShareFilterService;
 }
 
 function makeService(prisma: PrismaMock): {
@@ -84,6 +101,7 @@ function makeService(prisma: PrismaMock): {
     config,
     new HashService(),
     audit as unknown as AuditLogService,
+    makeFilter(),
   );
   service.onModuleInit();
   return { service, audit };
@@ -93,23 +111,28 @@ function expectedHash(code: string): string {
   return new HashService().hmacSha256Hex(PEPPER, code);
 }
 
-/** Partage nominal : actif, une place libre, jamais expiré. */
+/** Partage nominal : actif, une place libre, jamais expiré, une collection en « possédés ». */
 function activeShare(overrides: Record<string, unknown> = {}) {
   return {
     id: SHARE,
-    collectionId: COLLECTION,
     ownerUserId: OWNER,
     codeHash: expectedHash(CODE),
-    scope: 'owned',
+    label: 'Wantlist manga avec Alice',
     maxUses: 1,
     usedCount: 0,
     expiresAt: null,
     revokedAt: null,
     createdAt: new Date(0),
-    collection: COLLECTION_ROW,
+    entries: [entryRow(COLLECTION, ['OWNED'])],
     ...overrides,
   };
 }
+
+const dto = (over: Partial<CreateShareDto> = {}): CreateShareDto =>
+  ({
+    collections: [{ collectionId: COLLECTION, statuses: ['OWNED'] }],
+    ...over,
+  }) as CreateShareDto;
 
 describe('SharingService.onModuleInit', () => {
   it('refuse de démarrer sans SHARE_CODE_PEPPER', () => {
@@ -121,6 +144,7 @@ describe('SharingService.onModuleInit', () => {
       config,
       new HashService(),
       { record: jest.fn() } as unknown as AuditLogService,
+      makeFilter(),
     );
     expect(() => service.onModuleInit()).toThrow(/SHARE_CODE_PEPPER/);
   });
@@ -134,6 +158,7 @@ describe('SharingService.onModuleInit', () => {
       config,
       new HashService(),
       { record: jest.fn() } as unknown as AuditLogService,
+      makeFilter(),
     );
     expect(() => service.onModuleInit()).toThrow(/SHARE_CODE_PEPPER/);
   });
@@ -142,19 +167,20 @@ describe('SharingService.onModuleInit', () => {
 describe('SharingService.create', () => {
   it('stocke le HMAC du code, jamais le code, et ne le rend qu’une fois', async () => {
     const prisma = makePrismaMock();
+    // `data.entries` est une instruction d'ecriture imbriquee ({ create: [...] }) : elle ne doit
+    // pas ecraser les entrees relues, que Prisma renvoie a plat.
     prisma.collectionShare.create.mockImplementation(
       ({ data }: { data: Record<string, unknown> }) =>
         Promise.resolve({
           ...activeShare(),
           ...data,
+          entries: activeShare().entries,
           id: SHARE,
-          usedCount: 0,
-          createdAt: new Date(0),
         }),
     );
     const { service, audit } = makeService(prisma);
 
-    const created = await service.create(OWNER, COLLECTION, { scope: 'owned' });
+    const created = await service.create(OWNER, dto());
 
     expect(created.code).toMatch(/^[A-Za-z0-9_-]{24}$/);
     const stored = prisma.collectionShare.create.mock.calls[0][0].data;
@@ -162,26 +188,85 @@ describe('SharingService.create', () => {
     expect(JSON.stringify(stored)).not.toContain(created.code);
     expect(stored.maxUses).toBe(1);
     expect(stored.expiresAt).toBeNull();
+  });
+
+  it('enregistre une entrée par collection, statuts normalisés', async () => {
+    const prisma = makePrismaMock();
+    prisma.collection.count.mockResolvedValue(2);
+    prisma.collectionShare.create.mockImplementation(
+      ({ data }: { data: Record<string, unknown> }) =>
+        Promise.resolve({
+          ...activeShare(),
+          ...data,
+          id: SHARE,
+          entries: [
+            entryRow(COLLECTION, ['WISHLIST']),
+            entryRow(COLLECTION_2, ['OWNED', 'WISHLIST']),
+          ],
+        }),
+    );
+    const { service } = makeService(prisma);
+
+    const created = await service.create(
+      OWNER,
+      dto({
+        label: 'Wantlist manga avec Alice',
+        collections: [
+          { collectionId: COLLECTION, statuses: ['WISHLIST'] },
+          // Ordre inverse et doublon : doit ressortir normalisé.
+          {
+            collectionId: COLLECTION_2,
+            statuses: ['WISHLIST', 'OWNED', 'OWNED'],
+          },
+        ],
+      } as Partial<CreateShareDto>),
+    );
+
+    const stored = prisma.collectionShare.create.mock.calls[0][0].data;
+    expect(stored.entries.create).toEqual([
+      { collectionId: COLLECTION, statuses: ['WISHLIST'] },
+      { collectionId: COLLECTION_2, statuses: ['OWNED', 'WISHLIST'] },
+    ]);
+    expect(stored.label).toBe('Wantlist manga avec Alice');
+    expect(created.collections).toHaveLength(2);
+  });
+
+  // Le libelle nomme souvent quelqu'un : il reste dans sa colonne.
+  it('ne met ni le libellé ni les collections dans l’audit', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShare.create.mockResolvedValue(activeShare());
+    const { service, audit } = makeService(prisma);
+
+    await service.create(OWNER, dto({ label: 'Partage avec Alice' }));
+
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({
         action: 'share.create',
         target: SHARE,
-        metadata: { scope: 'owned' },
+        metadata: { collections: 1 },
       }),
     );
-    // Jamais le code en clair dans l'audit.
-    expect(JSON.stringify(audit.record.mock.calls[0][0])).not.toContain(
-      created.code,
-    );
+    const recorded = JSON.stringify(audit.record.mock.calls[0][0]);
+    expect(recorded).not.toContain('Alice');
+    expect(recorded).not.toContain(COLLECTION);
   });
 
-  it('404 si la collection est celle de quelqu’un d’autre', async () => {
+  it('404 si l’une des collections est celle de quelqu’un d’autre', async () => {
     const prisma = makePrismaMock();
-    prisma.collection.findFirst.mockResolvedValue(null);
+    // Deux demandées, une seule possédée.
+    prisma.collection.count.mockResolvedValue(1);
     const { service } = makeService(prisma);
 
     await expect(
-      service.create(OWNER, COLLECTION, { scope: 'all' }),
+      service.create(
+        OWNER,
+        dto({
+          collections: [
+            { collectionId: COLLECTION, statuses: ['OWNED'] },
+            { collectionId: COLLECTION_2, statuses: ['OWNED'] },
+          ],
+        } as Partial<CreateShareDto>),
+      ),
     ).rejects.toThrow(NotFoundException);
     expect(prisma.collectionShare.create).not.toHaveBeenCalled();
   });
@@ -193,6 +278,7 @@ describe('SharingService.redeem', () => {
     prisma.collectionShare.findUnique.mockResolvedValue(activeShare());
     prisma.collectionShareMember.create.mockResolvedValue({
       redeemedAt: new Date(1),
+      label: null,
     });
     const { service, audit } = makeService(prisma);
 
@@ -207,14 +293,37 @@ describe('SharingService.redeem', () => {
     });
     expect(res).toMatchObject({
       shareId: SHARE,
-      collectionId: COLLECTION,
-      scope: 'owned',
       alreadyMember: false,
-      collection: { id: COLLECTION, name: 'Vinyles', type: 'vinyl' },
+      collections: [
+        {
+          collectionId: COLLECTION,
+          statuses: ['OWNED'],
+          // Le compte est celui des statuts exposés, pas le total de la collection.
+          itemCount: VISIBLE_ITEM_COUNT,
+        },
+      ],
     });
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'share.redeem', target: SHARE }),
     );
+  });
+
+  // Le libelle du proprietaire nomme peut-etre le membre lui-meme, ou un autre membre du code.
+  it('ne transmet jamais le libellé du propriétaire au membre', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShare.findUnique.mockResolvedValue(
+      activeShare({ label: 'Wantlist manga avec Alice' }),
+    );
+    prisma.collectionShareMember.create.mockResolvedValue({
+      redeemedAt: new Date(1),
+      label: 'Wantlist manga de Bob',
+    });
+    const { service } = makeService(prisma);
+
+    const res = await service.redeem(CODE, MEMBER, 'Wantlist manga de Bob');
+
+    expect(res.label).toBe('Wantlist manga de Bob');
+    expect(JSON.stringify(res)).not.toContain('Alice');
   });
 
   it('est idempotent pour un membre déjà actif : aucune place reconsommée', async () => {
@@ -225,15 +334,35 @@ describe('SharingService.redeem', () => {
     prisma.collectionShareMember.findUnique.mockResolvedValue({
       redeemedAt: new Date(2),
       revokedAt: null,
+      label: 'deja nomme',
     });
     const { service, audit } = makeService(prisma);
 
     const res = await service.redeem(CODE, MEMBER);
 
     expect(res.alreadyMember).toBe(true);
+    expect(res.label).toBe('deja nomme');
     expect(prisma.collectionShare.updateMany).not.toHaveBeenCalled();
     expect(prisma.collectionShareMember.create).not.toHaveBeenCalled();
     expect(audit.record).not.toHaveBeenCalled();
+  });
+
+  it('applique tout de même un libellé fourni par un membre déjà actif', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShare.findUnique.mockResolvedValue(activeShare());
+    prisma.collectionShareMember.findUnique.mockResolvedValue({
+      redeemedAt: new Date(2),
+      revokedAt: null,
+      label: null,
+    });
+    const { service } = makeService(prisma);
+
+    const res = await service.redeem(CODE, MEMBER, 'renomme');
+
+    expect(res.label).toBe('renomme');
+    expect(prisma.collectionShareMember.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { label: 'renomme' } }),
+    );
   });
 
   it.each([
@@ -295,12 +424,91 @@ describe('SharingService.redeem', () => {
   });
 });
 
+describe('SharingService.updateLabel', () => {
+  it('renomme un partage émis, sans toucher à ce qu’il expose', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShare.findFirst.mockResolvedValue({
+      id: SHARE,
+      revokedAt: null,
+    });
+    prisma.collectionShare.update.mockResolvedValue({
+      ...activeShare({ label: 'Nouveau nom' }),
+      members: [],
+    });
+    const { service } = makeService(prisma);
+
+    const res = await service.updateLabel(OWNER, SHARE, 'Nouveau nom');
+
+    expect(prisma.collectionShare.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: SHARE },
+        data: { label: 'Nouveau nom' },
+      }),
+    );
+    expect(res.label).toBe('Nouveau nom');
+    expect(res.collections).toEqual([
+      {
+        collectionId: COLLECTION,
+        name: 'Vinyles',
+        type: 'vinyl',
+        statuses: ['OWNED'],
+      },
+    ]);
+  });
+
+  it('404 sur le partage d’un autre propriétaire', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShare.findFirst.mockResolvedValue(null);
+    const { service } = makeService(prisma);
+
+    await expect(service.updateLabel(MEMBER, SHARE, 'x')).rejects.toThrow(
+      NotFoundException,
+    );
+    expect(prisma.collectionShare.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('SharingService.updateMembershipLabel', () => {
+  it('renomme côté membre une adhésion vivante', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShareMember.findFirst.mockResolvedValue({
+      shareId: SHARE,
+    });
+    prisma.collectionShareMember.update.mockResolvedValue({
+      shareId: SHARE,
+      label: 'Full collection de Charlie',
+      redeemedAt: new Date(4),
+      share: activeShare(),
+    });
+    const { service } = makeService(prisma);
+
+    const res = await service.updateMembershipLabel(
+      MEMBER,
+      SHARE,
+      'Full collection de Charlie',
+    );
+
+    expect(res.label).toBe('Full collection de Charlie');
+    expect(res.collections[0].itemCount).toBe(VISIBLE_ITEM_COUNT);
+  });
+
+  it('404 si l’adhésion n’existe pas ou a été révoquée', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionShareMember.findFirst.mockResolvedValue(null);
+    const { service } = makeService(prisma);
+
+    await expect(
+      service.updateMembershipLabel(MEMBER, SHARE, 'x'),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.collectionShareMember.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('SharingService.revoke', () => {
   it('marque le partage ET ses membres, sans rien supprimer', async () => {
     const prisma = makePrismaMock();
     prisma.collectionShare.findFirst.mockResolvedValue({
       id: SHARE,
-      scope: 'all',
       revokedAt: null,
     });
     const { service, audit } = makeService(prisma);
@@ -322,7 +530,6 @@ describe('SharingService.revoke', () => {
     const prisma = makePrismaMock();
     prisma.collectionShare.findFirst.mockResolvedValue({
       id: SHARE,
-      scope: 'all',
       revokedAt: new Date(),
     });
     const { service, audit } = makeService(prisma);
@@ -349,7 +556,6 @@ describe('SharingService.revokeMember', () => {
     const prisma = makePrismaMock();
     prisma.collectionShare.findFirst.mockResolvedValue({
       id: SHARE,
-      scope: 'wantlist',
       revokedAt: null,
     });
     prisma.collectionShareMember.findUnique.mockResolvedValue({
@@ -371,7 +577,6 @@ describe('SharingService.revokeMember', () => {
       expect.objectContaining({
         action: 'share.member.revoke',
         target: SHARE,
-        metadata: { scope: 'wantlist' },
       }),
     );
   });
@@ -380,7 +585,6 @@ describe('SharingService.revokeMember', () => {
     const prisma = makePrismaMock();
     prisma.collectionShare.findFirst.mockResolvedValue({
       id: SHARE,
-      scope: 'all',
       revokedAt: null,
     });
     prisma.collectionShareMember.findUnique.mockResolvedValue(null);
@@ -388,61 +592,6 @@ describe('SharingService.revokeMember', () => {
 
     await expect(service.revokeMember(OWNER, SHARE, MEMBER)).rejects.toThrow(
       NotFoundException,
-    );
-  });
-});
-
-describe('SharingService.list', () => {
-  it('ne renvoie ni le code ni son hash', async () => {
-    const prisma = makePrismaMock();
-    prisma.collectionShare.findMany.mockResolvedValue([
-      {
-        ...activeShare({ expiresAt: BigInt(1_700_000_000_000) }),
-        members: [{ memberUserId: MEMBER, redeemedAt: new Date(0) }],
-      },
-    ]);
-    const { service } = makeService(prisma);
-
-    const [view] = await service.list(OWNER, COLLECTION);
-
-    expect(view).not.toHaveProperty('codeHash');
-    expect(view).not.toHaveProperty('code');
-    // BigInt -> number : sinon la sérialisation JSON de la réponse échoue.
-    expect(view.expiresAt).toBe(1_700_000_000_000);
-    expect(view.members).toEqual([
-      { memberUserId: MEMBER, redeemedAt: new Date(0) },
-    ]);
-  });
-
-  it('ne liste que les partages non révoqués', async () => {
-    const prisma = makePrismaMock();
-    const { service } = makeService(prisma);
-
-    await service.list(OWNER, COLLECTION);
-
-    expect(prisma.collectionShare.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { collectionId: COLLECTION, revokedAt: null },
-      }),
-    );
-  });
-});
-
-describe('SharingService.listReceived', () => {
-  it('exclut les adhésions révoquées et les partages révoqués, pas les codes expirés', async () => {
-    const prisma = makePrismaMock();
-    const { service } = makeService(prisma);
-
-    await service.listReceived(MEMBER);
-
-    expect(prisma.collectionShareMember.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          memberUserId: MEMBER,
-          revokedAt: null,
-          share: { revokedAt: null },
-        },
-      }),
     );
   });
 });
