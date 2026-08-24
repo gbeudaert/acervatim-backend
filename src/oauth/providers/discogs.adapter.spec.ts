@@ -314,6 +314,136 @@ describe('DiscogsAdapter.search', () => {
     expect(res.nextCursor).toBe('2');
   });
 
+  it('le curseur repart en `page=` chez Discogs (la page suivante est atteignable)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 2, pages: 3 },
+    });
+
+    const res = await svc.search('jazz', {
+      userId: USER,
+      cursor: '2',
+      limit: 10,
+    });
+
+    const url = deps.queue.add.mock.calls[0][1].url as string;
+    expect(url).toContain('page=2');
+    expect(url).toContain('per_page=10');
+    // La clé de cache porte la page : deux pages d'une même requête ne se recouvrent pas.
+    expect(deps.cache.getOrFetch.mock.calls[0][0]).toBe(
+      'discogs:search:q:jazz:2:10',
+    );
+    expect(res.nextCursor).toBe('3');
+  });
+
+  it('curseur illisible → page 1 (pas de 500 sur un curseur bricolé)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    await svc.search('jazz', { userId: USER, cursor: 'nope', limit: 10 });
+
+    expect(deps.queue.add.mock.calls[0][1].url as string).toContain('page=1');
+  });
+
+  it('désambiguïsation (SD1) : catno, barcodes normalisés et masterId remontent', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [
+        {
+          id: 1,
+          title: 'Air - Moon Safari',
+          year: 1998,
+          catno: 'MOVLP2464',
+          barcode: ['0 81227 97108 3', '081227971083', 'none'],
+          master_id: 12345,
+          label: ['Music On Vinyl'],
+          country: 'Europe',
+          format: ['Vinyl', 'LP', 'Album', 'Reissue'],
+        },
+      ],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    const res = await svc.search('moon safari', { userId: USER, limit: 10 });
+
+    expect(res.items[0].metadata).toMatchObject({
+      catno: 'MOVLP2464',
+      // Digits only + dédupliqué : comparable à un EAN scanné. "none" (< 6 digits) est écarté.
+      barcodes: ['081227971083'],
+      masterId: '12345',
+      label: ['Music On Vinyl'],
+      country: 'Europe',
+    });
+    expect(res.items[0].releaseDate).toBe('1998-01-01');
+  });
+
+  it('résultat sans catno/barcode/master : les champs restent absents (pas de null bruyant)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [{ id: 2, title: 'Degiheugi - Endless Smile' }],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    const res = await svc.search('degiheugi', { userId: USER, limit: 10 });
+
+    expect(res.items[0].metadata).toMatchObject({
+      catno: undefined,
+      barcodes: undefined,
+      masterId: undefined,
+    });
+  });
+
+  it('multi-artistes : split sur " / " et strip du suffixe d\'homonymie " (N)"', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [
+        { id: 3, title: 'Bob Dylan / The Band (2) - Before The Flood' },
+      ],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    const res = await svc.search('before the flood', {
+      userId: USER,
+      limit: 10,
+    });
+
+    expect(res.items[0].creators).toEqual(['Bob Dylan', 'The Band']);
+    expect(res.items[0].title).toBe('Before The Flood');
+  });
+
+  it('titre contenant un tiret : le split se fait au PREMIER " - "', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [{ id: 4, title: 'Various - Rock - The Early Years' }],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    const res = await svc.search('rock', { userId: USER, limit: 10 });
+
+    expect(res.items[0].creators).toEqual(['Various']);
+    expect(res.items[0].title).toBe('Rock - The Early Years');
+  });
+
+  it('famille de cache : `q` et `barcode` sont mesurés séparément (pression quota)', async () => {
+    const { deps, svc } = makeDeps();
+    deps.waitUntilFinished.mockResolvedValue({
+      results: [],
+      pagination: { page: 1, pages: 1 },
+    });
+
+    await svc.search('jazz', { userId: USER, limit: 10 });
+    await svc.searchByBarcode('0081227971083', { userId: USER, limit: 10 });
+
+    expect(deps.cache.getOrFetch.mock.calls[0][3]).toBe('discogs:search:q');
+    expect(deps.cache.getOrFetch.mock.calls[1][3]).toBe(
+      'discogs:search:barcode',
+    );
+  });
+
   it('jeton user résolu : enfile le job (le worker signera) sans appel direct', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({

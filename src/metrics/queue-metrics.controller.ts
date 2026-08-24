@@ -16,6 +16,11 @@ export class QueueMetricsController {
   @UseGuards(AdminTokenGuard)
   @SkipThrottle()
   async queues() {
-    return { queues: await this.metrics.snapshot() };
+    return {
+      queues: await this.metrics.snapshot(),
+      // Taux de hit du cache partagé par famille de clés : la mesure de la pression quota
+      // d'une recherche texte (peu cachable) face à un code-barres (très cachable) — SD1.
+      cache: this.metrics.cacheSnapshot(),
+    };
   }
 }

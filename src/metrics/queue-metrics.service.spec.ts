@@ -17,6 +17,7 @@ const ZERO = {
 
 function make(available = true) {
   const redisHealth = { isAvailable: jest.fn().mockReturnValue(available) };
+  const apiCache = { stats: jest.fn().mockReturnValue([]) };
   const queues = {
     gbooks: makeQueue(ZERO),
     bnf: makeQueue(ZERO),
@@ -27,6 +28,7 @@ function make(available = true) {
   };
   const svc = new QueueMetricsService(
     redisHealth as never,
+    apiCache as never,
     queues.gbooks as never,
     queues.bnf as never,
     queues.mal as never,
@@ -34,7 +36,7 @@ function make(available = true) {
     queues.tmdb as never,
     queues.editionImport as never,
   );
-  return { svc, redisHealth, queues };
+  return { svc, redisHealth, queues, apiCache };
 }
 
 describe('QueueMetricsService', () => {
@@ -109,6 +111,36 @@ describe('QueueMetricsService', () => {
       expect(line).toContain('mal[w5 a1 d0 f0 c2]');
       expect(line).not.toContain('gbooks'); // au repos → absent
       log.mockRestore();
+    });
+
+    it('cache API loggé même Redis down (il vit en base, pas dans Redis)', async () => {
+      const { svc, apiCache } = make(false);
+      apiCache.stats.mockReturnValue([
+        { family: 'discogs:search:q', hits: 1, misses: 9, hitRate: 0.1 },
+      ]);
+      const log = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation(() => undefined);
+
+      await svc.logMetrics();
+
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0] as string).toContain(
+        'discogs:search:q[h1 m9 r0.1]',
+      );
+      log.mockRestore();
+    });
+  });
+
+  describe('cacheSnapshot', () => {
+    it('expose le taux de hit par famille (mesure SD1 de la pression quota)', () => {
+      const { svc, apiCache } = make();
+      const stats = [
+        { family: 'discogs:search:barcode', hits: 8, misses: 2, hitRate: 0.8 },
+      ];
+      apiCache.stats.mockReturnValue(stats);
+
+      expect(svc.cacheSnapshot()).toBe(stats);
     });
   });
 });

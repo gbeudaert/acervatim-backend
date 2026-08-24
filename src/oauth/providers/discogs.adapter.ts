@@ -68,6 +68,14 @@ interface DiscogsSearchResult {
   style?: string[];
   label?: string[];
   country?: string;
+  // Numéro de catalogue du pressage ("MOVLP2464", "88875174261"). Discriminant le plus
+  // fort entre deux pressages d'un même album chez un même label la même année.
+  catno?: string;
+  // Codes-barres portés par le pressage (souvent formatés : "0 81227 97108 3").
+  barcode?: string[];
+  // Identifiant du « master » Discogs : commun à TOUS les pressages d'un même album.
+  // Permet de regrouper les 20-30 résultats d'une recherche texte en quelques albums.
+  master_id?: number;
 }
 
 interface DiscogsReleaseResponse {
@@ -269,12 +277,19 @@ export class DiscogsAdapter
     // Clé de cache partagée (réponse Discogs publique) : pas de userId, pour que le
     // repli premium et le mode dégradé (cache-only) profitent des hits inter-users.
     const cacheKey = `discogs:search:${mode}:${page}:${ctx.limit}`;
+    // Famille de mesure : on sépare volontairement `q` de `barcode`. Une clé code-barres est
+    // très partagée entre utilisateurs (même EAN = même clé), une requête texte l'est peu —
+    // c'est cet écart de taux de hit qui pilote la pression réelle sur le quota Discogs (SD1).
+    const cacheFamily = criteria.barcode
+      ? 'discogs:search:barcode'
+      : 'discogs:search:q';
 
     const raw = await this.discogsResolvedGet<DiscogsSearchResponse>(
       url,
       cacheKey,
       SEARCH_CACHE_TTL_SECONDS,
       ctx.userId,
+      cacheFamily,
     );
 
     const items = (raw.results ?? []).map((r) => this.mapSearchResult(r));
@@ -296,6 +311,7 @@ export class DiscogsAdapter
       cacheKey,
       DETAILS_CACHE_TTL_SECONDS,
       ctx.userId,
+      'discogs:release',
     );
     return this.mapRelease(raw);
   }
@@ -319,11 +335,12 @@ export class DiscogsAdapter
     cacheKey: string,
     ttlSeconds: number,
     userId: string,
+    cacheFamily: string,
   ): Promise<T> {
     const resolution = await this.tokenResolver.resolve(userId, 'discogs');
 
     if (resolution.source === 'none') {
-      const cached = await this.cache.get<T>(cacheKey);
+      const cached = await this.cache.get<T>(cacheKey, cacheFamily);
       if (cached !== null && cached !== undefined) return cached;
       throw new SourceTokenRequiredException('discogs');
     }
@@ -342,8 +359,11 @@ export class DiscogsAdapter
       throw new ServiceUnavailableException('discogs: not configured');
     }
 
-    return this.cache.getOrFetch<T>(cacheKey, ttlSeconds, () =>
-      this.enqueueFetch<T>(url, cacheKey, userId),
+    return this.cache.getOrFetch<T>(
+      cacheKey,
+      ttlSeconds,
+      () => this.enqueueFetch<T>(url, cacheKey, userId),
+      cacheFamily,
     );
   }
 
@@ -383,6 +403,12 @@ export class DiscogsAdapter
     }
   }
 
+  /**
+   * Mappe un résultat de recherche vers `UnifiedItem`. En mode texte, Discogs renvoie couramment
+   * 20-30 pressages du même album : la charge utile doit donc porter de quoi **choisir** (SD1).
+   * D'où `catno`, `barcodes` et `masterId` dans `metadata`, en plus de l'année / label / pays /
+   * format / jaquette. Sans eux, deux pressages voisins sont indiscernables dans la liste.
+   */
   private mapSearchResult(r: DiscogsSearchResult): UnifiedItem {
     const id = r.id !== undefined ? String(r.id) : '';
     return {
@@ -400,6 +426,14 @@ export class DiscogsAdapter
         recordingSpeed: deriveRecordingSpeed(r.format),
         label: r.label,
         country: r.country,
+        // Numéro de catalogue : le discriminant décisif entre deux pressages d'un même
+        // album chez un même label la même année (cf. SD1).
+        catno: r.catno,
+        // Normalisés en digits (Discogs formate : "0 81227 97108 3") pour être comparables
+        // à un code-barres scanné et permettre à l'app de repérer un doublon.
+        barcodes: normalizeBarcodes(r.barcode),
+        // Commun à tous les pressages d'un même album : permet de regrouper la liste.
+        masterId: r.master_id !== undefined ? String(r.master_id) : undefined,
         uri: r.uri,
       },
       rawData: r,
@@ -497,6 +531,18 @@ function extractBarcode(
   return digits.length > 0 ? digits : undefined;
 }
 
+function normalizeBarcodes(values: string[] | undefined): string[] | undefined {
+  // Discogs formate ses codes-barres de recherche ("0 81227 97108 3", "081227-971083").
+  // On ne garde que les digits pour qu'ils soient comparables à un EAN scanné, en
+  // dédupliquant (le même code y figure souvent en plusieurs graphies).
+  if (!values?.length) return undefined;
+  const digits = values
+    .map((v) => v.replace(/\D/g, ''))
+    .filter((v) => v.length >= 6);
+  const unique = [...new Set(digits)];
+  return unique.length > 0 ? unique : undefined;
+}
+
 function releaseFormatDescriptors(
   formats: DiscogsReleaseResponse['formats'],
 ): string[] {
@@ -530,10 +576,21 @@ function deriveRecordingSpeed(
 function extractCreatorsFromTitle(title: string | undefined): string[] {
   // Discogs search renvoie les results sous la forme "Artist - Title" — pas d'array artists.
   // Best-effort : split au premier " - ". Le fetchDetails donne le vrai array.
+  //
+  // Deux raffinements (SD1), pour que la liste de résultats texte soit lisible :
+  //  - multi-artistes : Discogs les joint par " / " ("Bob Dylan / The Band - Before The Flood")
+  //    → on rend un vrai tableau, pas une chaîne unique ;
+  //  - suffixe d'homonymie " (N)" ("Nirvana (2)") → strippé, comme dans `cleanArtistName`.
+  // Limite assumée : un nom d'artiste contenant lui-même " - " reste indécidable ici ;
+  // seul `fetchDetails` (array `artists`) tranche.
   if (!title) return [];
   const idx = title.indexOf(' - ');
   if (idx === -1) return [];
-  return [title.slice(0, idx).trim()].filter(Boolean);
+  return title
+    .slice(0, idx)
+    .split(' / ')
+    .map((a) => a.replace(/\s*\(\d+\)$/, '').trim())
+    .filter(Boolean);
 }
 
 function stripArtistFromTitle(title: string | undefined): string {

@@ -2,6 +2,10 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { Queue } from 'bullmq';
+import {
+  ApiCacheService,
+  CacheFamilyStat,
+} from '../common/cache/api-cache.service';
 import { RedisHealthService } from '../common/redis/redis-health.service';
 import { BNF_QUEUE } from '../common/sources/bnf/bnf.types';
 import { GBOOKS_QUEUE } from '../common/sources/googlebooks/googlebooks.types';
@@ -51,6 +55,7 @@ export class QueueMetricsService {
 
   constructor(
     private readonly redisHealth: RedisHealthService,
+    private readonly apiCache: ApiCacheService,
     @InjectQueue(GBOOKS_QUEUE) gbooks: Queue,
     @InjectQueue(BNF_QUEUE) bnf: Queue,
     @InjectQueue(MAL_QUEUE) mal: Queue,
@@ -91,8 +96,28 @@ export class QueueMetricsService {
     );
   }
 
+  /**
+   * Taux de hit du cache partagé par famille de clés (`discogs:search:q` vs
+   * `discogs:search:barcode`, ...). C'est la mesure qui remplace la supposition sur la pression
+   * quota d'une recherche texte : cf. {@link ApiCacheService.stats}. Compteurs en mémoire du
+   * processus, remis à zéro au redémarrage.
+   */
+  cacheSnapshot(): CacheFamilyStat[] {
+    return this.apiCache.stats();
+  }
+
   @Interval(METRICS_INTERVAL_MS)
   async logMetrics(): Promise<void> {
+    // Le cache API ne dépend pas de Redis (il vit en base) : on le logue avant tout court-circuit.
+    const cache = this.cacheSnapshot();
+    if (cache.length > 0) {
+      this.logger.log(
+        `api-cache ${cache
+          .map((c) => `${c.family}[h${c.hits} m${c.misses} r${c.hitRate}]`)
+          .join(' ')}`,
+      );
+    }
+
     // Rien à mesurer si Redis est down (le circuit-breaker a déjà tranché) — évite un sondage vain.
     if (!this.redisHealth.isAvailable()) return;
 
