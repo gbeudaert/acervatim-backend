@@ -1,6 +1,6 @@
 {
   "name": "acervus-backend",
-  "version": "0.7.0",
+  "version": "0.8.1",
   "private": true,
   "description": "Backend NestJS pour Acervatim (Raspberry Pi 4 + MariaDB).",
   "engines": {
