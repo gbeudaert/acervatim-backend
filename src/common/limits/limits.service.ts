@@ -14,6 +14,10 @@ import { TechnicalLimitException } from './technical-limit.exception';
 export const TECHNICAL_LIMITS = {
   collections: 500,
   items: 100_000,
+  // Les nœuds (séries) sont par construction bien moins nombreux que les items qu'ils regroupent.
+  // Le plafond existe depuis qu'un nœud peut naître d'un simple `unifiedData` : la création n'est
+  // plus adossée à un appel provider, donc plus freinée par rien d'autre.
+  nodes: 20_000,
 } as const;
 
 /**
@@ -36,6 +40,16 @@ export class LimitsService {
     if (used >= TECHNICAL_LIMITS.collections) {
       throw new TechnicalLimitException(
         `technical-limit: max ${TECHNICAL_LIMITS.collections} collections`,
+      );
+    }
+  }
+
+  async assertCanCreateNode(userId: string, db?: DbClient): Promise<void> {
+    const client = db ?? this.prisma;
+    const used = await client.collectionNode.count({ where: { userId } });
+    if (used >= TECHNICAL_LIMITS.nodes) {
+      throw new TechnicalLimitException(
+        `technical-limit: max ${TECHNICAL_LIMITS.nodes} nodes`,
       );
     }
   }

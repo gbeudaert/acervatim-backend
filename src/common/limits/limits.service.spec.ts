@@ -6,10 +6,14 @@ const USER = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 
 type PrismaMock = {
   collection: { count: jest.Mock; aggregate: jest.Mock };
+  collectionNode: { count: jest.Mock };
 };
 
 function makePrismaMock(): PrismaMock {
-  return { collection: { count: jest.fn(), aggregate: jest.fn() } };
+  return {
+    collection: { count: jest.fn(), aggregate: jest.fn() },
+    collectionNode: { count: jest.fn() },
+  };
 }
 
 function makeService(prisma: PrismaMock): LimitsService {
@@ -75,6 +79,33 @@ describe('LimitsService.assertCanCreateItem', () => {
     await expect(
       makeService(prisma).assertCanCreateItem(USER),
     ).rejects.toBeInstanceOf(TechnicalLimitException);
+  });
+});
+
+describe('LimitsService.assertCanCreateNode', () => {
+  it('passe sous le plafond', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionNode.count.mockResolvedValue(TECHNICAL_LIMITS.nodes - 1);
+    await expect(
+      makeService(prisma).assertCanCreateNode(USER),
+    ).resolves.toBeUndefined();
+  });
+
+  it('throw TechnicalLimitException quand used == max', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionNode.count.mockResolvedValue(TECHNICAL_LIMITS.nodes);
+    await expect(
+      makeService(prisma).assertCanCreateNode(USER),
+    ).rejects.toBeInstanceOf(TechnicalLimitException);
+  });
+
+  it('compte les noeuds de tout le compte, pas ceux d une collection', async () => {
+    const prisma = makePrismaMock();
+    prisma.collectionNode.count.mockResolvedValue(0);
+    await makeService(prisma).assertCanCreateNode(USER);
+    expect(prisma.collectionNode.count).toHaveBeenCalledWith({
+      where: { userId: USER },
+    });
   });
 });
 
