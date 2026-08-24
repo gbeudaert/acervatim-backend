@@ -187,6 +187,7 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
         genre: [],
         releaseDate: null,
         status: 'OWNED', // défaut serveur : userData.status absent
+        playCount: 0, // défaut serveur : userData.playCount absent
       });
 
       // PATCH unifiedData (curation)
@@ -779,6 +780,65 @@ describe('Collections typées / nœuds / sources (e2e) — sprint 03b', () => {
         .send({ userData: { status: 'FOO' } });
       expect(bad.status).toBe(400);
       expect(bad.body.type).toContain('/probs/validation-error');
+    } finally {
+      await cleanupUser(prisma, userId);
+    }
+  });
+
+  it('userData.playCount : PATCH → relecture, merge partiel préservé, négatif rejeté', async () => {
+    const sub = `e2e-playcount-${randomBytes(8).toString('hex')}`;
+    const { token, userId } = await login(app, fakeGoogle, sub);
+    await grantPremium(prisma, userId);
+    try {
+      const coll = await createCollection(token, 'vinyl', 'ecoutes');
+      const created = await request(app.getHttpServer())
+        .post(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ unifiedData: { title: 'Degiheugi — Endless Smile' } })
+        .expect(201);
+      const itemId = created.body.id as string;
+      // Item créé sans compteur : relu sans erreur, projeté 0.
+      expect(created.body.userData.playCount).toBeUndefined();
+
+      // PATCH playCount (valeur absolue calculée par l'app) → relecture
+      await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userData: { playCount: 12 } })
+        .expect(200);
+      const detail = await request(app.getHttpServer())
+        .get(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(detail.body.userData.playCount).toBe(12);
+
+      // La liste expose le compteur : la galerie trie sans re-fetch item par item.
+      const list = await request(app.getHttpServer())
+        .get(`/v1/collections/${coll}/items`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(list.body.data[0].playCount).toBe(12);
+
+      // PATCH d'un autre champ : le compteur ne doit pas être effacé (merge partiel)
+      const patched = await request(app.getHttpServer())
+        .patch(`/v1/items/${itemId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userData: { lastPlayedAt: '2026-08-24T20:00:00.000Z' } })
+        .expect(200);
+      expect(patched.body.userData).toMatchObject({
+        playCount: 12,
+        lastPlayedAt: '2026-08-24T20:00:00.000Z',
+      });
+
+      // Négatif et non-entier → 400 Problem Details
+      for (const playCount of [-1, 1.5]) {
+        const bad = await request(app.getHttpServer())
+          .patch(`/v1/items/${itemId}`)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ userData: { playCount } });
+        expect(bad.status).toBe(400);
+        expect(bad.body.type).toContain('/probs/validation-error');
+      }
     } finally {
       await cleanupUser(prisma, userId);
     }

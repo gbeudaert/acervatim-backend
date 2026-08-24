@@ -1,5 +1,8 @@
 import { z } from 'zod';
-import { resolveItemStatus } from '../../items/dto/item-user-data.schema';
+import {
+  resolveItemStatus,
+  resolvePlayCount,
+} from '../../items/dto/item-user-data.schema';
 import { UnifiedItem } from '../../oauth/providers/types';
 import {
   CollectionTypeProfile,
@@ -111,6 +114,7 @@ export const mangaProfile: CollectionTypeProfile = {
       // Statut du TOME (possédé/désiré) — sans rapport avec le `status` de la
       // série (ongoing/finished), qui n'est pas projeté ici.
       status: resolveItemStatus(row.userData),
+      playCount: resolvePlayCount(row.userData),
     };
   },
 };

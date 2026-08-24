@@ -45,7 +45,13 @@ export interface ItemProjectionRow {
   nodeId: string | null;
   volume: number | null;
   unifiedData: Record<string, unknown>;
-  /** Données perso — la projection n'en expose que le `status` (cf. resolveItemStatus). */
+  /**
+   * Données perso — la projection n'en expose que `status` et `playCount`
+   * (cf. `resolveItemStatus` / `resolvePlayCount`).
+   *
+   * La liste sert aussi les **membres** d'un partage : n'y projeter que des champs de
+   * `SHARED_ITEM_USER_DATA_KEYS`, sinon la liste contourne le masquage du détail.
+   */
   userData: Record<string, unknown>;
   node: { unifiedData: Record<string, unknown> } | null;
 }

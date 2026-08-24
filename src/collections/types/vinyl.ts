@@ -1,5 +1,8 @@
 import { z } from 'zod';
-import { resolveItemStatus } from '../../items/dto/item-user-data.schema';
+import {
+  resolveItemStatus,
+  resolvePlayCount,
+} from '../../items/dto/item-user-data.schema';
 import {
   CollectionTypeProfile,
   ItemProjectionRow,
@@ -97,6 +100,7 @@ export const vinylProfile: CollectionTypeProfile = {
       genre: u.genre ?? [],
       releaseDate: u.releaseDate ?? null,
       status: resolveItemStatus(row.userData),
+      playCount: resolvePlayCount(row.userData),
     };
   },
 };

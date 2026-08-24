@@ -103,17 +103,19 @@ describe('ensembles de statuts', () => {
 });
 
 describe('userData rendu a un membre', () => {
-  it('item : le statut, la note et la derniere ecoute passent', () => {
+  it('item : le statut, la note, la derniere ecoute et le compteur passent', () => {
     expect(
       sharedItemUserData({
         status: 'OWNED',
         rating: 4,
         lastPlayedAt: '2026-08-01T10:00:00.000Z',
+        playCount: 12,
       }),
     ).toEqual({
       status: 'OWNED',
       rating: 4,
       lastPlayedAt: '2026-08-01T10:00:00.000Z',
+      playCount: 12,
     });
   });
 

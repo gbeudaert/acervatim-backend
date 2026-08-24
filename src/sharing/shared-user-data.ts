@@ -8,13 +8,19 @@ type JsonRecord = Record<string, unknown>;
  * « un champ manque dans une vue partagée », jamais « un champ privé a fuité ».
  *
  * Règle appliquée : passent l'appréciation et le fait de collection (`status` — indispensable au
- * filtrage —, `rating`, `lastPlayedAt`) ; ne passent ni le texte libre (`note`, qui peut contenir
- * n'importe quoi de personnel) ni le financier (`purchasePrice`).
+ * filtrage —, `rating`, `lastPlayedAt`, `playCount`) ; ne passent ni le texte libre (`note`, qui
+ * peut contenir n'importe quoi de personnel) ni le financier (`purchasePrice`).
+ *
+ * `playCount` (SD3) est jugé partageable au même titre que `lastPlayedAt` : un compteur d'écoutes
+ * en dit moins sur les habitudes d'une personne que l'horodatage déjà partagé. Il est de surcroît
+ * projeté en liste, et la projection sert aussi les membres : l'omettre ici le masquerait sur le
+ * détail sans le masquer sur la liste.
  */
 export const SHARED_ITEM_USER_DATA_KEYS = [
   'status',
   'rating',
   'lastPlayedAt',
+  'playCount',
 ] as const;
 
 /**

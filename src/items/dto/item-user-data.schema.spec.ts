@@ -1,7 +1,9 @@
 import {
   DEFAULT_ITEM_STATUS,
+  DEFAULT_PLAY_COUNT,
   ItemUserDataSchema,
   resolveItemStatus,
+  resolvePlayCount,
 } from './item-user-data.schema';
 
 describe('ItemUserDataSchema — status', () => {
@@ -50,5 +52,51 @@ describe('resolveItemStatus — défaut serveur', () => {
   it('retombe sur OWNED sur une valeur non reconnue en base (jamais de crash en lecture)', () => {
     expect(resolveItemStatus({ status: 'FOO' })).toBe('OWNED');
     expect(resolveItemStatus({ status: 42 })).toBe('OWNED');
+  });
+});
+
+describe('ItemUserDataSchema — playCount', () => {
+  it('accepte un entier positif ou zéro', () => {
+    expect(ItemUserDataSchema.parse({ playCount: 12 }).playCount).toBe(12);
+    expect(ItemUserDataSchema.parse({ playCount: 0 }).playCount).toBe(0);
+  });
+
+  it('accepte null (compteur explicitement effacé)', () => {
+    expect(ItemUserDataSchema.parse({ playCount: null }).playCount).toBeNull();
+  });
+
+  it('accepte l’absence de playCount (PATCH partiel)', () => {
+    expect(ItemUserDataSchema.parse({ rating: 4 }).playCount).toBeUndefined();
+  });
+
+  it('rejette un négatif et un non-entier', () => {
+    expect(() => ItemUserDataSchema.parse({ playCount: -1 })).toThrow();
+    expect(() => ItemUserDataSchema.parse({ playCount: 1.5 })).toThrow();
+    expect(() => ItemUserDataSchema.parse({ playCount: '3' })).toThrow();
+  });
+});
+
+describe('resolvePlayCount — défaut serveur', () => {
+  it('vaut 0 par défaut', () => {
+    expect(DEFAULT_PLAY_COUNT).toBe(0);
+  });
+
+  it('renvoie le compteur quand il est renseigné', () => {
+    expect(resolvePlayCount({ playCount: 12 })).toBe(12);
+    expect(resolvePlayCount({ playCount: 0 })).toBe(0);
+  });
+
+  it('retombe sur 0 pour un item d’avant le champ (absent, null, userData vide)', () => {
+    expect(resolvePlayCount({})).toBe(0);
+    expect(resolvePlayCount({ playCount: null })).toBe(0);
+    expect(resolvePlayCount({ rating: 3 })).toBe(0);
+    expect(resolvePlayCount(null)).toBe(0);
+    expect(resolvePlayCount(undefined)).toBe(0);
+  });
+
+  it('retombe sur 0 sur une valeur aberrante en base (jamais de crash en lecture)', () => {
+    expect(resolvePlayCount({ playCount: -4 })).toBe(0);
+    expect(resolvePlayCount({ playCount: 2.5 })).toBe(0);
+    expect(resolvePlayCount({ playCount: 'douze' })).toBe(0);
   });
 });

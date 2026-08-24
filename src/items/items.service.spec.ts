@@ -298,7 +298,7 @@ describe('ItemsService.list', () => {
         nodeId: null,
         volume: null,
         unifiedData: { type: 'vinyl', title: 'A', creators: ['x'] },
-        userData: { status: 'WISHLIST' },
+        userData: { status: 'WISHLIST', playCount: 7 },
         node: null,
       },
     ]);
@@ -316,10 +316,11 @@ describe('ItemsService.list', () => {
       genre: [],
       releaseDate: null,
       status: 'WISHLIST',
+      playCount: 7,
     });
   });
 
-  it('projette status=OWNED pour un item sans userData.status (avant S1)', async () => {
+  it('projette status=OWNED et playCount=0 pour un item d’avant S1/SD3', async () => {
     const prisma = makePrismaMock();
     prisma.collection.findUnique.mockResolvedValue(VINYL_COLL);
     prisma.item.findMany.mockResolvedValue([
@@ -337,7 +338,7 @@ describe('ItemsService.list', () => {
     const page = await svc.list(ownerAccess(USER_A, COLL_ID), {
       limit: 50,
     } as never);
-    expect(page.data[0]).toMatchObject({ status: 'OWNED' });
+    expect(page.data[0]).toMatchObject({ status: 'OWNED', playCount: 0 });
   });
 
   // L'acces d'autrui est refuse en amont par le guard : reste au service la collection
