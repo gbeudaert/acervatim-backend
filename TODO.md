@@ -33,3 +33,47 @@ P3 circuit-breaker Redis, P3 métriques de files (`GET /admin/queues` + log pér
       Le log `gbooks: intitle no-match …` (ajouté) permet de repérer ces cas en prod. Pistes de repli :
       notice illustrée BnF/Electre, ISBN éditeur, ou provider tiers (Nautiljon/AniList…). Décision
       produit à trancher.
+
+## Jaquettes — import côté serveur pour les comptes premium
+
+- [ ] **Importer et héberger les jaquettes côté backend, pour les comptes premium.** Le serveur ne
+      stocke aujourd'hui **aucune image** : il ne transmet qu'une `coverUrl` de provider, et c'est
+      l'app qui télécharge le fichier à l'enregistrement (`CoverStorageImpl.saveFromUrl`). Deux cas
+      n'ont donc jamais d'image — une **collection reçue en partage** (le destinataire n'a aucun
+      fichier local) et un item **tiré par la synchro** depuis un autre appareil. Le repli distant de
+      `RecordCover` existe pour ça mais ne peut pas fonctionner : l'app n'embarque pas de fetcher
+      réseau Coil (`coil-network-okhttp` absent au classpath) — constaté le 2026-08-26.
+      L'enjeu dépasse le confort : faire charger au destinataire une URL **écrite par le partageur**
+      (`unifiedData.coverUrl`, validée en `z.string().url()` seulement, donc sans contrainte de
+      schéma ni d'hôte) expose son IP à un serveur choisi par l'émetteur et lui fait décoder une
+      image d'origine inconnue. Un import serveur ferme les deux : le backend valide, télécharge une
+      fois, et sert depuis son propre domaine.
+      À trancher : stockage (disque / objet), plafonds (taille par image, nombre par compte),
+      schémas autorisés (`https` seul), reprise/expiration, et le devenir des images quand un compte
+      cesse d'être premium.
+- [ ] **App** (repo `acervatim-app`) : consommer les URLs servies par le backend — ou, en attendant,
+      brancher `coil-network-okhttp` avec un client dédié (timeouts, plafond de taille, **pas**
+      d'`AuthInterceptor`) et un filtre `https`. Ajout de dépendance à valider (cf. `AGENTS.md`).
+
+## Import « manuel » d'une série manga (recherche par titre)
+
+- [ ] **Ajouter une série manga en la cherchant par titre, sans en posséder aucun tome.** Cas
+      d'usage : taper « frieren » et mettre la série en **wishlist**. Aujourd'hui le seul chemin vers
+      une série complète est le **scan d'un tome** (`series/import?barcode=`) : il faut donc déjà en
+      posséder un, soit l'inverse du besoin.
+
+      **Cadré dans `acervatim-docs/spec-macro-import-serie-manga.md`** (2026-08-26) — l'audit y est,
+      ne pas le refaire. En deux lignes : la chaîne d'import fonctionne **déjà** à partir d'un titre
+      (`enumerateEdition` interroge la BnF en `bib.title all`, `import-jobs` est clé sur le titre, et
+      l'import crée déjà les tomes non scannés en `WISHLIST`). Ne manquent que la **découverte** (choisir
+      la bonne série sans l'auteur que fournissait l'ISBN — cf. le commentaire « Frieren » de
+      `chooseIdentity`) et la **projection** des éditions disponibles, dont les notices sont déjà
+      chargées et cachées.
+
+      Découpage : **SD1** découverte série + éditions · **SD2** `edition` dans `MangaSerieSchema` (sans
+      quoi le choix est perdu à la sync, le schéma étant en `.strip()`) · **AD1** écran de recherche ·
+      **AD2** import sans tome possédé + migration Room v8.
+
+      Arbitrage acté : deux éditions d'une même série **coexistent** — ce qui corrige au passage la
+      divergence à l'origine du `409 item déjà ajouté (série + volume)` (unicité
+      `[userId, nodeId, volume]` côté serveur, absente côté app).
