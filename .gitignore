@@ -51,3 +51,7 @@ docs/travail/
 # Windows (voir C:\Appsmad\link-project.ps1). Non portable : on relie, on ne versionne pas.
 /_bmad/
 /_bmad-output/
+
+# Sortie de scripts/scan-resolve.ts : generee localement, contient des resumes et des
+# jaquettes de sources tierces.
+test/fixtures/scanned-isbns.result.json
