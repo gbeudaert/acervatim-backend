@@ -13,6 +13,7 @@ import { DISCOGS_QUEUE } from '../oauth/providers/discogs.types';
 import { MAL_QUEUE } from '../oauth/providers/mal.types';
 import { TMDB_QUEUE } from '../oauth/providers/tmdb.types';
 import { EDITION_IMPORT_QUEUE } from '../search/import/edition-import.types';
+import { EDITION_WATCH_QUEUE } from '../search/watch/edition-watch.types';
 
 /** Compteurs BullMQ d'une file à un instant t. */
 export interface QueueMetric {
@@ -62,6 +63,7 @@ export class QueueMetricsService {
     @InjectQueue(DISCOGS_QUEUE) discogs: Queue,
     @InjectQueue(TMDB_QUEUE) tmdb: Queue,
     @InjectQueue(EDITION_IMPORT_QUEUE) editionImport: Queue,
+    @InjectQueue(EDITION_WATCH_QUEUE) editionWatch: Queue,
   ) {
     this.queues = [
       { name: GBOOKS_QUEUE, queue: gbooks },
@@ -70,6 +72,8 @@ export class QueueMetricsService {
       { name: DISCOGS_QUEUE, queue: discogs },
       { name: TMDB_QUEUE, queue: tmdb },
       { name: EDITION_IMPORT_QUEUE, queue: editionImport },
+      // Rattrapage hebdomadaire (SD3) : un passage bloqué ou en échec se voit ici, pas dans l'app.
+      { name: EDITION_WATCH_QUEUE, queue: editionWatch },
     ];
   }
 

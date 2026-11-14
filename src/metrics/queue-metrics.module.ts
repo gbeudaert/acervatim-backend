@@ -7,12 +7,13 @@ import { DISCOGS_QUEUE } from '../oauth/providers/discogs.types';
 import { MAL_QUEUE } from '../oauth/providers/mal.types';
 import { TMDB_QUEUE } from '../oauth/providers/tmdb.types';
 import { EDITION_IMPORT_QUEUE } from '../search/import/edition-import.types';
+import { EDITION_WATCH_QUEUE } from '../search/watch/edition-watch.types';
 import { QueueMetricsController } from './queue-metrics.controller';
 import { QueueMetricsService } from './queue-metrics.service';
 
 /**
  * Observabilité transverse des files BullMQ : agrège les compteurs de **toutes** les files (d'où
- * l'enregistrement des 6 noms ici — chaque file reste par ailleurs enregistrée dans son module
+ * l'enregistrement des 7 noms ici — chaque file reste par ailleurs enregistrée dans son module
  * feature). `RedisHealthService` est fourni globalement.
  */
 @Module({
@@ -24,6 +25,7 @@ import { QueueMetricsService } from './queue-metrics.service';
       { name: DISCOGS_QUEUE },
       { name: TMDB_QUEUE },
       { name: EDITION_IMPORT_QUEUE },
+      { name: EDITION_WATCH_QUEUE },
     ),
   ],
   controllers: [QueueMetricsController],
