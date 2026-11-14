@@ -1,5 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { HttpClientService } from '../../http/http-client.service';
+import {
+  HttpClientError,
+  HttpClientService,
+} from '../../http/http-client.service';
 import { BnfAuthor } from '../bnf/bnf.types';
 import {
   matchesAuthor,
@@ -10,7 +13,9 @@ import {
 import {
   LOCALE_PREFERENCE,
   MangaDexIdentity,
+  MangaDexSearchPage,
   MangaDexSeriesCovers,
+  MangaDexSeriesSummary,
   MangaDexVolumeCover,
   SeriesCoverLookup,
 } from './mangadex.types';
@@ -31,9 +36,31 @@ const COVER_MAX_RECORDS = 500; // garde-fou (séries à couvertures multi-éditi
 // même mangaka (spin-off « Jigokuraku: … ») dont le titre diverge trop de la série scannée.
 const IDENTIFY_TITLE_FLOOR = 0.5;
 
+/**
+ * Tags de **format** exclus de la recherche texte (ids lus dans `GET /manga/tag`). Mesuré le
+ * 2026-10-27 : « Frieren » trié par pertinence, sans exclusion, ne place même pas *Sousou no
+ * Frieren* dans les cinq premiers ; trié par suivis, doujinshi et anthologies exclus, elle est en
+ * tête (3 résultats au lieu de 11). Les deux « colorisés » écartent les variantes (le piège *One
+ * Piece* de `chooseCoverCandidate`).
+ */
+const SEARCH_EXCLUDED_TAGS = [
+  'b13b2a48-c720-44a9-9c77-39c9979373fb', // Doujinshi
+  '51d83883-4103-437c-b4b1-731cb73d786c', // Anthology
+  '320831a8-4026-470b-94f6-8353740e6f04', // Official Colored
+  '7b2ce280-79ef-4c09-9b58-12b7c23a9b78', // Fan Colored
+];
+
+// La recherche est interactive (saisie debouncée) : une seule tentative, et un timeout sous celui du
+// client HTTP de l'app — un MangaDex lent doit céder la place au repli, pas faire tomber la requête.
+const SEARCH_TIMEOUT_MS = 7_000;
+
 // ---- Sous-ensembles des réponses MangaDex réellement consommés ----
 interface MangaListResponse {
   data?: MangaEntity[];
+  total?: number;
+}
+interface MangaSingleResponse {
+  data?: MangaEntity;
 }
 interface MangaEntity {
   id?: string;
@@ -168,6 +195,81 @@ export class MangaDexResolver {
         `tomes=${Object.keys(volumes).length} synopsisFr=${identity.descriptionFr ? 'y' : 'n'}`,
     );
     return identity;
+  }
+
+  /**
+   * **Recherche texte** de séries, sans jeton : la page de candidats que l'utilisateur départage
+   * lui-même (jaquette, auteurs, année) — aucun rapprochement automatique, donc aucun seuil. Tri par
+   * nombre de suivis et tags de format exclus (cf. {@link SEARCH_EXCLUDED_TAGS}) : c'est ce qui place
+   * la série principale devant ses doujinshi et crossovers. MangaDex cherche aussi dans ses
+   * alt-titres : « L'attaque des titans » trouve *Shingeki no Kyojin* (11 titres FR sur 12 au banc).
+   *
+   * Best-effort : un échec réseau/5xx **propage** (le worker pose un cache d'échec court).
+   */
+  async searchSeries(
+    query: string,
+    offset: number,
+    limit: number,
+  ): Promise<MangaDexSearchPage> {
+    const params = new URLSearchParams({
+      title: query,
+      limit: String(limit),
+      offset: String(offset),
+      'order[followedCount]': 'desc',
+      excludedTagsMode: 'OR',
+    });
+    for (const tag of SEARCH_EXCLUDED_TAGS) {
+      params.append('excludedTags[]', tag);
+    }
+    for (const inc of ['author', 'artist', 'cover_art']) {
+      params.append('includes[]', inc);
+    }
+    const res = await this.http.request<MangaListResponse>(
+      `${API_BASE}/manga?${params.toString()}`,
+      { method: 'GET', maxAttempts: 1, timeoutMs: SEARCH_TIMEOUT_MS },
+    );
+    const results = (res.data?.data ?? [])
+      .filter((e): e is MangaEntity & { id: string } => !!e.id)
+      .map((e) => toSummary(e));
+    this.logger.log(
+      `mangadex: search query="${query}" offset=${offset} total=${res.data?.total ?? 0} returned=${results.length}`,
+    );
+    return {
+      total: res.data?.total ?? results.length,
+      offset,
+      limit,
+      results,
+    };
+  }
+
+  /**
+   * Lit une série **par id** (le candidat choisi après une recherche) : titres FR/romaji/alt et
+   * auteurs, de quoi retrouver ses éditions françaises à la BnF. `null` si l'id est inconnu de
+   * MangaDex (404, ou 400 sur un id mal formé) ; un échec réseau/5xx propage.
+   */
+  async fetchSeries(mangaId: string): Promise<MangaDexSeriesSummary | null> {
+    const params = new URLSearchParams();
+    for (const inc of ['author', 'artist', 'cover_art']) {
+      params.append('includes[]', inc);
+    }
+    try {
+      const res = await this.http.request<MangaSingleResponse>(
+        `${API_BASE}/manga/${encodeURIComponent(mangaId)}?${params.toString()}`,
+        { method: 'GET', maxAttempts: 2 },
+      );
+      const entity = res.data?.data;
+      return entity?.id
+        ? toSummary(entity as MangaEntity & { id: string })
+        : null;
+    } catch (err) {
+      if (
+        err instanceof HttpClientError &&
+        (err.status === 404 || err.status === 400)
+      ) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -419,6 +521,40 @@ function pickByLocale(list: { fileName: string; locale: string }[]): {
     if (hit) return hit;
   }
   return list[0];
+}
+
+/**
+ * Résumé d'une série depuis une entité MangaDex (recherche ou lecture par id). Mêmes extractions
+ * que `identify` : titre FR (titre ou alt-titre `fr`), romaji (`ja-ro`, sinon `en`), auteurs.
+ */
+function toSummary(
+  entity: MangaEntity & { id: string },
+): MangaDexSeriesSummary {
+  const attrs = entity.attributes ?? {};
+  const titleFr =
+    pickLang(attrs.title, 'fr') ?? pickAltLang(attrs.altTitles, 'fr');
+  const titleRomaji =
+    pickLang(attrs.title, 'ja-ro') ??
+    pickAltLang(attrs.altTitles, 'ja-ro') ??
+    pickLang(attrs.title, 'en') ??
+    firstValue(attrs.title);
+  return {
+    mangaId: entity.id,
+    title: titleFr ?? titleRomaji ?? firstValue(attrs.title) ?? entity.id,
+    titleFr,
+    titleRomaji,
+    altTitles: [...new Set(allTitles(attrs))],
+    authors: extractAuthors(entity.relationships),
+    coverUrl: extractMainCover(entity.id, entity.relationships),
+    descriptionFr: pickLang(attrs.description, 'fr'),
+    descriptionEn: pickLang(attrs.description, 'en'),
+    malId: attrs.links?.mal ? String(attrs.links.mal) : null,
+    anilistId: attrs.links?.al ? String(attrs.links.al) : null,
+    status: attrs.status ?? null,
+    year: typeof attrs.year === 'number' ? attrs.year : null,
+    lastVolume: attrs.lastVolume || null,
+    contentRating: attrs.contentRating ?? null,
+  };
 }
 
 /** Tous les libellés d'un manga (titre principal + alt-titres), toutes langues, pour le scoring. */

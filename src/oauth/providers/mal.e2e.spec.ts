@@ -82,7 +82,12 @@ describe('Mal queue (e2e, Redis réel)', () => {
         { provide: OauthCredentialsService, useValue: {} },
         { provide: BnfService, useValue: {} },
         { provide: GoogleBooksCoverService, useValue: {} },
-        { provide: MangaDexCoverService, useValue: {} },
+        // Recherche MangaDex « indisponible » : la recherche texte retombe sur le chemin MAL, qui
+        // est ce que cette suite exerce (file, jeton injecté par le worker, single-flight).
+        {
+          provide: MangaDexCoverService,
+          useValue: { searchSeries: async () => null },
+        },
       ],
     }).compile();
 

@@ -8,14 +8,24 @@ import {
   identityCacheKey,
   MANGADEX_IDENTIFY_JOB,
   MANGADEX_QUEUE,
+  MANGADEX_SEARCH_JOB,
+  MANGADEX_SERIES_JOB,
   MISS_TTL_SECONDS,
   MangaDexCoversJobData,
   MangaDexIdentifyJobData,
   MangaDexIdentityCacheEntry,
   MangaDexJobData,
   MangaDexJobResult,
+  MangaDexSearchCacheEntry,
+  MangaDexSearchJobData,
+  MangaDexSeriesCacheEntry,
   MangaDexSeriesCovers,
+  MangaDexSeriesJobData,
+  SEARCH_HIT_TTL_SECONDS,
+  SEARCH_MISS_TTL_SECONDS,
+  searchCacheKey,
   seriesCacheKey,
+  seriesSummaryCacheKey,
 } from './mangadex.types';
 
 /**
@@ -47,7 +57,77 @@ export class MangaDexProcessor extends WorkerHost {
     if (job.name === MANGADEX_IDENTIFY_JOB) {
       return this.processIdentify(job.data as MangaDexIdentifyJobData);
     }
+    if (job.name === MANGADEX_SEARCH_JOB) {
+      return this.processSearch(job.data as MangaDexSearchJobData);
+    }
+    if (job.name === MANGADEX_SERIES_JOB) {
+      return this.processSeries(job.data as MangaDexSeriesJobData);
+    }
     return this.processCovers(job.data as MangaDexCoversJobData);
+  }
+
+  /**
+   * Recherche texte et cache de la page (résultats `SEARCH_HIT_TTL`, page vide `SEARCH_MISS_TTL`).
+   * Échec dur : entrée `{ page: null }` en `FAIL_TTL` — l'appelant la lit comme « MangaDex
+   * indisponible », pas comme « aucun résultat ».
+   */
+  private async processSearch(
+    data: MangaDexSearchJobData,
+  ): Promise<MangaDexSearchCacheEntry> {
+    const key = searchCacheKey(data.query, data.offset, data.limit);
+    let entry: MangaDexSearchCacheEntry;
+    try {
+      entry = {
+        page: await this.resolver.searchSeries(
+          data.query,
+          data.offset,
+          data.limit,
+        ),
+      };
+    } catch (err) {
+      await this.cache.set<MangaDexSearchCacheEntry>(
+        key,
+        { page: null },
+        FAIL_TTL_SECONDS,
+      );
+      throw err;
+    }
+    await this.cache.set<MangaDexSearchCacheEntry>(
+      key,
+      entry,
+      entry.page && entry.page.results.length > 0
+        ? SEARCH_HIT_TTL_SECONDS
+        : SEARCH_MISS_TTL_SECONDS,
+    );
+    return entry;
+  }
+
+  /**
+   * Lit une série par id et la cache (trouvée `HIT_TTL`, id inconnu `MISS_TTL`). Échec dur :
+   * entrée `failed` en `FAIL_TTL`, qui ne doit pas se lire comme un 404.
+   */
+  private async processSeries(
+    data: MangaDexSeriesJobData,
+  ): Promise<MangaDexSeriesCacheEntry> {
+    const key = seriesSummaryCacheKey(data.mangaId);
+    let summary: MangaDexSeriesCacheEntry['summary'];
+    try {
+      summary = await this.resolver.fetchSeries(data.mangaId);
+    } catch (err) {
+      await this.cache.set<MangaDexSeriesCacheEntry>(
+        key,
+        { summary: null, failed: true },
+        FAIL_TTL_SECONDS,
+      );
+      throw err;
+    }
+    const entry: MangaDexSeriesCacheEntry = { summary };
+    await this.cache.set<MangaDexSeriesCacheEntry>(
+      key,
+      entry,
+      summary ? HIT_TTL_SECONDS : MISS_TTL_SECONDS,
+    );
+    return entry;
   }
 
   /** Résout et cache les jaquettes d'une série (jaquettes `HIT_TTL`, absence `MISS_TTL`). */

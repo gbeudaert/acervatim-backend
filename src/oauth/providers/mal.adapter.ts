@@ -23,7 +23,10 @@ import {
   titleSimilarity,
 } from '../../common/sources/manga-matching';
 import { MangaDexCoverService } from '../../common/sources/mangadex/mangadex.service';
-import { MangaDexIdentity } from '../../common/sources/mangadex/mangadex.types';
+import {
+  MangaDexIdentity,
+  MangaDexSeriesSummary,
+} from '../../common/sources/mangadex/mangadex.types';
 import { titleLadder } from '../../common/sources/title-ladder';
 import { RedisHealthService } from '../../common/redis/redis-health.service';
 import { OauthCredentialsService, OauthProvider } from '../oauth.service';
@@ -250,11 +253,65 @@ export class MalAdapter
 
   // ----- SourceAdapter -----
 
+  /**
+   * Recherche texte de séries manga. **MangaDex d'abord, sans jeton** (mode dégradé compris) : MAL
+   * exigeait un jeton (403 sans BYOT ni premium) et ne porte aucun titre français, là où MangaDex
+   * cherche aussi dans ses alt-titres (étude du 2026-10-27 : 11 titres FR sur 12 retrouvés).
+   *
+   * MAL n'intervient plus qu'en **repli** :
+   *  - MangaDex a répondu mais n'a **rien** pour cette requête (`total = 0`) → MAL seulement si un
+   *    jeton est résolu ; sinon liste vide — jamais de 403 quand MangaDex a répondu ;
+   *  - MangaDex est **indisponible** → chemin MAL historique (cache partagé en mode dégradé, 403
+   *    actionnable à défaut) : mieux qu'une fausse absence de résultat.
+   *
+   * Le repli n'existe qu'en **première page** (offset 0) et s'y arrête (`nextCursor` nul) : le
+   * curseur ne dit pas de quelle source vient la page précédente, une page suivante est donc
+   * toujours une page MangaDex — vide = fin de liste, MangaDex indisponible = 502 à réessayer, jamais
+   * une page MAL cousue à une liste MangaDex.
+   */
   async search(
     query: string,
     ctx: AdapterContext,
   ): Promise<AdapterSearchResult> {
     const offset = parseOffset(ctx.cursor);
+    const page = await this.mangaDex.searchSeries(query, offset, ctx.limit);
+    if (page && page.total > 0) {
+      return {
+        items: page.results.map(mangaDexSearchItem),
+        nextCursor:
+          offset + ctx.limit < page.total ? String(offset + ctx.limit) : null,
+      };
+    }
+    if (offset > 0) {
+      if (page) return { items: [], nextCursor: null };
+      throw new BadGatewayException('mangadex: upstream unavailable');
+    }
+    if (page) {
+      const token = await this.tokenResolver.resolve(ctx.userId, 'mal');
+      if (token.source === 'none') {
+        this.logger.log(
+          `search: mangadex aucun resultat query="${query}" -> pas de jeton MAL, liste vide`,
+        );
+        return { items: [], nextCursor: null };
+      }
+      this.logger.log(
+        `search: mangadex aucun resultat query="${query}" -> repli MAL (jeton ${token.source})`,
+      );
+    } else {
+      this.logger.warn(
+        `search: mangadex indisponible query="${query}" -> repli MAL`,
+      );
+    }
+    const mal = await this.malSearch(query, ctx, offset);
+    return { items: mal.items, nextCursor: null };
+  }
+
+  /** Recherche texte MAL (chemin historique, désormais repli de {@link search}). */
+  private async malSearch(
+    query: string,
+    ctx: AdapterContext,
+    offset: number,
+  ): Promise<AdapterSearchResult> {
     const url = `${MAL_API_BASE}/manga?q=${encodeURIComponent(query)}&limit=${ctx.limit}&offset=${offset}&fields=${encodeURIComponent(MAL_MANGA_FIELDS)}`;
     // Clé de cache partagée (réponse MAL publique) : pas de userId, pour que le
     // repli premium et le mode dégradé (cache-only) profitent des hits inter-users.
@@ -952,6 +1009,36 @@ function malAuthorNames(
     a.node?.first_name,
     a.node?.last_name,
   ]);
+}
+
+/**
+ * Candidat de recherche MangaDex → `UnifiedItem`. Le `mangaId` voyage en `sourceId` **et** en
+ * metadata : l'app le renvoie à `search/editions`, `edition-mapping` et `import-jobs`, ce qui joint
+ * les jaquettes directement (première étape de `findManga`), sans aucun rapprochement par titre.
+ */
+function mangaDexSearchItem(s: MangaDexSeriesSummary): UnifiedItem {
+  return {
+    source: 'mangadex',
+    sourceId: s.mangaId,
+    mediaType: 'manga',
+    title: s.title,
+    creators: s.authors,
+    releaseDate: s.year ? String(s.year) : undefined,
+    coverUrl: s.coverUrl ?? undefined,
+    description: s.descriptionFr ?? s.descriptionEn ?? undefined,
+    metadata: {
+      mangaId: s.mangaId,
+      titleFr: s.titleFr,
+      titleRomaji: s.titleRomaji,
+      malId: s.malId,
+      anilistId: s.anilistId,
+      status: s.status,
+      num_volumes: toVolumeCount(s.lastVolume) ?? null,
+      year: s.year,
+      contentRating: s.contentRating,
+    },
+    rawData: s,
+  };
 }
 
 /** `lastVolume` MangaDex (brut) → nombre de tomes, `undefined` si non numérique. */

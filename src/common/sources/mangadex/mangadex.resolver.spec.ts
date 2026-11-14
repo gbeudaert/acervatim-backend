@@ -1,3 +1,5 @@
+import { BadGatewayException } from '@nestjs/common';
+import { HttpClientError } from '../../http/http-client.service';
 import { MangaDexResolver } from './mangadex.resolver';
 import { BnfAuthor } from '../bnf/bnf.types';
 
@@ -412,5 +414,142 @@ describe('MangaDexResolver.fetchSeriesCovers', () => {
 
     expect(res.status).toBe('absent');
     expect(res.mangaId).toBeNull();
+  });
+});
+
+describe('MangaDexResolver.searchSeries (recherche texte, sans jeton)', () => {
+  const FRIEREN = {
+    total: 3,
+    data: [
+      {
+        id: 'md-frieren',
+        attributes: {
+          title: { 'ja-ro': 'Sousou no Frieren' },
+          altTitles: [{ en: "Frieren: Beyond Journey's End" }],
+          description: { en: 'An elf mage.' },
+          links: { mal: '126287', al: '118586' },
+          status: 'ongoing',
+          year: 2020,
+          lastVolume: '',
+          contentRating: 'safe',
+        },
+        relationships: [
+          { type: 'author', attributes: { name: 'Yamada Kanehito' } },
+          { type: 'artist', attributes: { name: 'Abe Tsukasa' } },
+          { type: 'cover_art', attributes: { fileName: 'f.jpg' } },
+        ],
+      },
+      {
+        id: 'md-snk',
+        attributes: {
+          title: { en: 'Attack on Titan' },
+          altTitles: [
+            { fr: "L'attaque des titans" },
+            { 'ja-ro': 'Shingeki no Kyojin' },
+          ],
+          links: { mal: '23390' },
+          status: 'completed',
+          lastVolume: '34',
+        },
+        relationships: [],
+      },
+    ],
+  };
+
+  it('trie par suivis, exclut les tags de format et demande auteurs + jaquette', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockResolvedValue(ok(FRIEREN));
+
+    await resolver.searchSeries('Frieren', 0, 20);
+
+    const [url, opts] = http.request.mock.calls[0];
+    const params = new URL(url).searchParams;
+    expect(params.get('title')).toBe('Frieren');
+    expect(params.get('order[followedCount]')).toBe('desc');
+    expect(params.get('limit')).toBe('20');
+    expect(params.get('offset')).toBe('0');
+    expect(params.get('excludedTagsMode')).toBe('OR');
+    expect(params.getAll('excludedTags[]')).toEqual([
+      'b13b2a48-c720-44a9-9c77-39c9979373fb', // Doujinshi
+      '51d83883-4103-437c-b4b1-731cb73d786c', // Anthology
+      '320831a8-4026-470b-94f6-8353740e6f04', // Official Colored
+      '7b2ce280-79ef-4c09-9b58-12b7c23a9b78', // Fan Colored
+    ]);
+    expect(params.getAll('includes[]')).toEqual([
+      'author',
+      'artist',
+      'cover_art',
+    ]);
+    // Interactif : une seule tentative.
+    expect(opts).toMatchObject({ maxAttempts: 1 });
+  });
+
+  it('résume chaque candidat : titre FR, romaji, auteurs, jaquette, liens', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockResolvedValue(ok(FRIEREN));
+
+    const page = await resolver.searchSeries('Frieren', 0, 20);
+
+    expect(page.total).toBe(3);
+    expect(page.results[0]).toMatchObject({
+      mangaId: 'md-frieren',
+      title: 'Sousou no Frieren', // pas de titre FR → romaji
+      titleFr: null,
+      titleRomaji: 'Sousou no Frieren',
+      authors: ['Yamada Kanehito', 'Abe Tsukasa'],
+      coverUrl: 'https://uploads.mangadex.org/covers/md-frieren/f.jpg.512.jpg',
+      malId: '126287',
+      anilistId: '118586',
+      status: 'ongoing',
+      year: 2020,
+      lastVolume: null,
+    });
+    expect(page.results[1]).toMatchObject({
+      title: "L'attaque des titans",
+      titleFr: "L'attaque des titans",
+      titleRomaji: 'Shingeki no Kyojin',
+      lastVolume: '34',
+    });
+    expect(page.results[1].altTitles).toContain('Attack on Titan');
+  });
+});
+
+describe('MangaDexResolver.fetchSeries (lecture par id)', () => {
+  it('résume la série lue par id', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockResolvedValue(
+      ok({
+        data: {
+          id: 'md-snk',
+          attributes: {
+            title: { en: 'Attack on Titan' },
+            altTitles: [{ fr: "L'attaque des titans" }],
+          },
+          relationships: [
+            { type: 'author', attributes: { name: 'Isayama Hajime' } },
+          ],
+        },
+      }),
+    );
+
+    const s = await resolver.fetchSeries('md-snk');
+
+    expect(http.request.mock.calls[0][0]).toContain('/manga/md-snk?');
+    expect(s).toMatchObject({
+      mangaId: 'md-snk',
+      titleFr: "L'attaque des titans",
+      authors: ['Isayama Hajime'],
+    });
+  });
+
+  it('id inconnu (404) → null ; panne (502) → propage', async () => {
+    const { resolver, http } = makeResolver();
+    http.request.mockRejectedValueOnce(new HttpClientError('404', 404, null));
+    await expect(resolver.fetchSeries('nope')).resolves.toBeNull();
+
+    http.request.mockRejectedValueOnce(new BadGatewayException('down'));
+    await expect(resolver.fetchSeries('md-snk')).rejects.toBeInstanceOf(
+      BadGatewayException,
+    );
   });
 });

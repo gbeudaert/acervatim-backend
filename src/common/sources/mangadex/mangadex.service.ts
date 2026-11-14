@@ -15,19 +15,35 @@ import {
   identityJobId,
   MANGADEX_COVERS_JOB,
   MANGADEX_IDENTIFY_JOB,
+  MANGADEX_PRIORITY_BACKGROUND,
+  MANGADEX_PRIORITY_INTERACTIVE,
   MANGADEX_QUEUE,
+  MANGADEX_SEARCH_FAMILY,
+  MANGADEX_SEARCH_JOB,
+  MANGADEX_SERIES_JOB,
   MangaDexIdentity,
   MangaDexIdentityCacheEntry,
   MangaDexJobData,
   MangaDexJobResult,
+  MangaDexSearchCacheEntry,
+  MangaDexSearchPage,
+  MangaDexSeriesCacheEntry,
   MangaDexSeriesCovers,
+  MangaDexSeriesLookup,
   SeriesCoverLookup,
+  searchCacheKey,
+  searchJobId,
   seriesCacheKey,
   seriesJobId,
+  seriesSummaryCacheKey,
+  seriesSummaryJobId,
 } from './mangadex.types';
 
 // Plafond d'attente d'une résolution (best-effort) : la série se résout en 1-few appels rapides.
 const WAIT_TIMEOUT_MS = 15_000;
+// Recherche texte : chemin interactif, sous le timeout du client HTTP de l'app (incident 0.5.3 :
+// au-delà de 10 s, l'app abandonne). Le job continue en fond et réchauffe le cache pour la suite.
+const SEARCH_WAIT_MS = 8_000;
 
 const UNRESOLVED: MangaDexSeriesCovers = {
   mangaId: null,
@@ -111,6 +127,7 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
         },
         {
           jobId: seriesJobId(lookup.malId, title),
+          priority: MANGADEX_PRIORITY_BACKGROUND,
           removeOnComplete: { age: 60, count: 500 },
           // MangaDex 5xx est rare mais possible ; petit backoff pour absorber une vague.
           attempts: 3,
@@ -153,6 +170,8 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
         { query, authors },
         {
           jobId: identityJobId(query),
+          // Appelée par le scan, que l'utilisateur attend.
+          priority: MANGADEX_PRIORITY_INTERACTIVE,
           removeOnComplete: { age: 60, count: 500 },
           attempts: 3,
           backoff: { type: 'exponential', delay: 5_000 },
@@ -169,4 +188,90 @@ export class MangaDexCoverService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
   }
+
+  /**
+   * **Recherche texte** de séries (sans jeton) : hit de cache → immédiat ; sinon enfile un job
+   * `mangadex:search` (single-flight par requête normalisée) et attend le worker. Best-effort — ne
+   * jette jamais : `null` = MangaDex **indisponible** (Redis down, échec réseau récent, timeout), à
+   * distinguer d'une page vide (`results: []`), car l'appelant ne replie pas de la même façon.
+   */
+  async searchSeries(
+    query: string,
+    offset: number,
+    limit: number,
+  ): Promise<MangaDexSearchPage | null> {
+    const key = searchCacheKey(query, offset, limit);
+    const cached = await this.cache.get<MangaDexSearchCacheEntry>(
+      key,
+      MANGADEX_SEARCH_FAMILY,
+    );
+    if (cached) return cached.page;
+
+    if (!this.redisHealth.isAvailable()) return null;
+
+    try {
+      const job = await this.queue.add(
+        MANGADEX_SEARCH_JOB,
+        { query, offset, limit },
+        {
+          jobId: searchJobId(query, offset, limit),
+          priority: MANGADEX_PRIORITY_INTERACTIVE,
+          removeOnComplete: { age: 60, count: 500 },
+          // Interactif : pas de retry différé — l'utilisateur attend, le repli prend le relais.
+          attempts: 1,
+          removeOnFail: true,
+        },
+      );
+      const res = (await job.waitUntilFinished(
+        this.queueEvents,
+        SEARCH_WAIT_MS,
+      )) as MangaDexSearchCacheEntry;
+      return res?.page ?? null;
+    } catch {
+      this.logger.warn(`mangadex: search failed query="${query}"`);
+      return null;
+    }
+  }
+
+  /**
+   * Lit une série **par id** (candidat choisi après une recherche). Tri-état pour l'appelant :
+   * `found` / `absent` (id inconnu de MangaDex → 404) / `unresolved` (indisponible → 502). Ne jette
+   * jamais.
+   */
+  async fetchSeries(mangaId: string): Promise<MangaDexSeriesLookup> {
+    const key = seriesSummaryCacheKey(mangaId);
+    const cached = await this.cache.get<MangaDexSeriesCacheEntry>(key);
+    if (cached) return toLookup(cached);
+
+    if (!this.redisHealth.isAvailable()) return { status: 'unresolved' };
+
+    try {
+      const job = await this.queue.add(
+        MANGADEX_SERIES_JOB,
+        { mangaId },
+        {
+          jobId: seriesSummaryJobId(mangaId),
+          priority: MANGADEX_PRIORITY_INTERACTIVE,
+          removeOnComplete: { age: 60, count: 500 },
+          attempts: 1,
+          removeOnFail: true,
+        },
+      );
+      const res = (await job.waitUntilFinished(
+        this.queueEvents,
+        SEARCH_WAIT_MS,
+      )) as MangaDexSeriesCacheEntry;
+      return toLookup(res);
+    } catch {
+      this.logger.warn(`mangadex: series lookup failed mangaId=${mangaId}`);
+      return { status: 'unresolved' };
+    }
+  }
+}
+
+function toLookup(entry: MangaDexSeriesCacheEntry): MangaDexSeriesLookup {
+  if (entry.failed) return { status: 'unresolved' };
+  return entry.summary
+    ? { status: 'found', summary: entry.summary }
+    : { status: 'absent' };
 }

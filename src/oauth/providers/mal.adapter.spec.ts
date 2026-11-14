@@ -39,7 +39,7 @@ interface MockDeps {
     resolveCoverAndDescription: jest.Mock;
     resolveVolumeInfo: jest.Mock;
   };
-  mangaDex: { identifySeries: jest.Mock };
+  mangaDex: { identifySeries: jest.Mock; searchSeries: jest.Mock };
   redisHealth: { isAvailable: jest.Mock };
   queue: { add: jest.Mock };
   waitUntilFinished: jest.Mock;
@@ -98,6 +98,9 @@ function makeDeps(configOverrides: Record<string, string | undefined> = {}): {
   // scénarios MAL historiques. Les tests du chemin nominal surchargent `identifySeries`.
   const mangaDex = {
     identifySeries: jest.fn().mockResolvedValue(null),
+    // Par défaut : MangaDex INDISPONIBLE (null) pour la recherche texte → chemin MAL historique,
+    // ce qui préserve les scénarios MAL. Les tests de la recherche MangaDex surchargent.
+    searchSeries: jest.fn().mockResolvedValue(null),
   };
   const redisHealth = { isAvailable: jest.fn().mockReturnValue(true) };
   const waitUntilFinished = jest.fn();
@@ -395,7 +398,7 @@ describe('MalAdapter.search', () => {
     ).rejects.toBeInstanceOf(BadGatewayException);
   });
 
-  it('calcule nextCursor depuis paging.next + offset', async () => {
+  it('repli MAL : une seule page, même si MAL en annonce une suivante', async () => {
     const { deps, svc } = makeDeps();
     deps.tokenResolver.resolve.mockResolvedValue({
       source: 'user',
@@ -406,7 +409,9 @@ describe('MalAdapter.search', () => {
     );
 
     const res = await svc.search('x', { userId: USER, limit: 50 });
-    expect(res.nextCursor).toBe('50'); // 0 + 50
+    // Le curseur ne dit pas de quelle source vient une page : une page suivante serait servie par
+    // MangaDex. Le repli MAL s'arrête donc à la première page.
+    expect(res.nextCursor).toBeNull();
   });
 
   it('clé de cache search partagée (provider:query, SANS userId) — repli/dégradé mutualisables, pas de fuite', async () => {
@@ -418,6 +423,149 @@ describe('MalAdapter.search', () => {
     const cacheKey = deps.cache.getOrFetch.mock.calls[0][0] as string;
     expect(cacheKey).toBe('mal:search:one piece:0:50');
     expect(cacheKey).not.toContain(USER);
+  });
+});
+
+describe('MalAdapter.search — MangaDex d’abord, sans jeton', () => {
+  const FRIEREN = {
+    mangaId: 'md-frieren',
+    title: 'Sousou no Frieren',
+    titleFr: null,
+    titleRomaji: 'Sousou no Frieren',
+    altTitles: ['Sousou no Frieren'],
+    authors: ['Yamada Kanehito', 'Abe Tsukasa'],
+    coverUrl: 'https://uploads.mangadex.org/covers/md-frieren/f.jpg.512.jpg',
+    descriptionFr: null,
+    descriptionEn: 'An elf mage.',
+    malId: '126287',
+    anilistId: '118586',
+    status: 'ongoing',
+    year: 2020,
+    lastVolume: null,
+    contentRating: 'safe',
+  };
+
+  it('mappe les candidats MangaDex (mangaId en sourceId et metadata), sans jeton ni appel MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    deps.mangaDex.searchSeries.mockResolvedValue({
+      total: 3,
+      offset: 0,
+      limit: 2,
+      results: [FRIEREN],
+    });
+
+    const res = await svc.search('Frieren', { userId: USER, limit: 2 });
+
+    expect(deps.mangaDex.searchSeries).toHaveBeenCalledWith('Frieren', 0, 2);
+    expect(deps.queue.add).not.toHaveBeenCalled();
+    expect(res.items[0]).toEqual({
+      source: 'mangadex',
+      sourceId: 'md-frieren',
+      mediaType: 'manga',
+      title: 'Sousou no Frieren',
+      creators: ['Yamada Kanehito', 'Abe Tsukasa'],
+      releaseDate: '2020',
+      coverUrl: 'https://uploads.mangadex.org/covers/md-frieren/f.jpg.512.jpg',
+      description: 'An elf mage.',
+      metadata: {
+        mangaId: 'md-frieren',
+        titleFr: null,
+        titleRomaji: 'Sousou no Frieren',
+        malId: '126287',
+        anilistId: '118586',
+        status: 'ongoing',
+        num_volumes: null,
+        year: 2020,
+        contentRating: 'safe',
+      },
+      rawData: FRIEREN,
+    });
+    expect(res.nextCursor).toBe('2'); // 0 + 2 < total 3
+  });
+
+  it('dernière page : nextCursor null', async () => {
+    const { deps, svc } = makeDeps();
+    deps.mangaDex.searchSeries.mockResolvedValue({
+      total: 3,
+      offset: 2,
+      limit: 2,
+      results: [FRIEREN],
+    });
+    const res = await svc.search('Frieren', {
+      userId: USER,
+      limit: 2,
+      cursor: '2',
+    });
+    expect(deps.mangaDex.searchSeries).toHaveBeenCalledWith('Frieren', 2, 2);
+    expect(res.nextCursor).toBeNull();
+  });
+
+  it('MangaDex n’a rien et pas de jeton MAL → liste vide, jamais de 403', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'none' });
+    deps.mangaDex.searchSeries.mockResolvedValue({
+      total: 0,
+      offset: 0,
+      limit: 10,
+      results: [],
+    });
+
+    const res = await svc.search('zzz', { userId: USER, limit: 10 });
+
+    expect(res).toEqual({ items: [], nextCursor: null });
+    expect(deps.queue.add).not.toHaveBeenCalled();
+    expect(deps.cache.get).not.toHaveBeenCalled();
+  });
+
+  it('MangaDex n’a rien mais un jeton MAL est résolu → repli MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.mangaDex.searchSeries.mockResolvedValue({
+      total: 0,
+      offset: 0,
+      limit: 10,
+      results: [],
+    });
+    deps.waitUntilFinished.mockResolvedValue(
+      malBody([{ id: 9, title: 'Obscure' }]),
+    );
+
+    const res = await svc.search('obscure', { userId: USER, limit: 10 });
+
+    expect(deps.queue.add).toHaveBeenCalledTimes(1);
+    expect(res.items[0]).toMatchObject({ source: 'mal', sourceId: '9' });
+  });
+
+  it('page suivante vide côté MangaDex → fin de liste, jamais de repli MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.tokenResolver.resolve.mockResolvedValue({ source: 'fallback' });
+    deps.mangaDex.searchSeries.mockResolvedValue({
+      total: 0,
+      offset: 20,
+      limit: 10,
+      results: [],
+    });
+
+    const res = await svc.search('obscure', {
+      userId: USER,
+      limit: 10,
+      cursor: '20',
+    });
+
+    expect(res).toEqual({ items: [], nextCursor: null });
+    expect(deps.queue.add).not.toHaveBeenCalled();
+    expect(deps.tokenResolver.resolve).not.toHaveBeenCalled();
+  });
+
+  it('page suivante avec MangaDex indisponible → 502 à réessayer, pas de page MAL', async () => {
+    const { deps, svc } = makeDeps();
+    deps.mangaDex.searchSeries.mockResolvedValue(null);
+
+    await expect(
+      svc.search('obscure', { userId: USER, limit: 10, cursor: '20' }),
+    ).rejects.toBeInstanceOf(BadGatewayException);
+    expect(deps.queue.add).not.toHaveBeenCalled();
   });
 });
 
