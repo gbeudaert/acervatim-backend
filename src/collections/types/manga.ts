@@ -27,6 +27,10 @@ export const MangaItemSchema = z
     // Ex "1-3" pour un tome d'édition Colossale qui compile les tomes 1 à 3 de
     // l'édition standard. null = édition standard (mapping 1:1).
     sourceVolumeRange: z.string().max(64).nullable().default(null),
+    // Mention d'édition du tome (BnF 205$a, ex "Éd. colossale"). null = standard. Ne vivait que
+    // dans les extras locaux de l'app : un second appareil ne savait plus de quelle édition était
+    // le tome.
+    edition: z.string().max(128).nullable().default(null),
   })
   .strict();
 
@@ -47,6 +51,14 @@ export const MangaSerieSchema = z
       .default(null),
     synopsis: z.string().max(4000).nullable().default(null),
     coverUrl: optionalUrl(),
+    // Identité d'édition de la série : deux éditions d'une même œuvre sont deux nœuds (arbitrage du
+    // 2026-08-26), distingués par l'éditeur ET la mention 205 — la « standard » Pika et la 2-en-1
+    // France Loisirs n'ont ni l'une ni l'autre de mention. Le schéma étant en `.strip()`, sans ces
+    // champs l'édition envoyée par l'app était silencieusement supprimée.
+    edition: z.string().max(128).nullable().default(null),
+    publisherFr: z.string().max(256).nullable().default(null),
+    // id MangaDex de la série : jointure directe des jaquettes, et clé du rattrapage serveur.
+    mangaId: z.string().max(64).nullable().default(null),
   })
   .strip();
 

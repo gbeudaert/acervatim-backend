@@ -167,3 +167,35 @@ describe('MangaSerieSchema — demographic (niveau série)', () => {
     ).toThrow();
   });
 });
+
+describe('Édition dans le contrat de synchro (SD2)', () => {
+  it("le tome porte l'édition (le schéma strict la refusait)", () => {
+    const parsed = MangaItemSchema.parse({
+      type: 'manga',
+      edition: 'Éd. colossale',
+    });
+    expect(parsed.edition).toBe('Éd. colossale');
+    expect(MangaItemSchema.parse({ type: 'manga' }).edition).toBeNull();
+  });
+
+  it('la série porte édition, éditeur et mangaId (le schéma strip les supprimait)', () => {
+    const parsed = MangaSerieSchema.parse({
+      title: "L'attaque des titans",
+      edition: null,
+      publisherFr: 'France loisirs',
+      mangaId: '304ceac3-8cdb-4fe7-acf7-2b6ff7a60613',
+    });
+    expect(parsed).toMatchObject({
+      edition: null,
+      publisherFr: 'France loisirs',
+      mangaId: '304ceac3-8cdb-4fe7-acf7-2b6ff7a60613',
+    });
+  });
+
+  it('défauts null quand absents (nœuds déjà synchronisés)', () => {
+    const parsed = MangaSerieSchema.parse({ title: 'X' });
+    expect(parsed.edition).toBeNull();
+    expect(parsed.publisherFr).toBeNull();
+    expect(parsed.mangaId).toBeNull();
+  });
+});
