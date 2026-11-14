@@ -45,15 +45,17 @@ describe('EditionImportProcessor.process', () => {
       edition: null,
       malId: null,
       mangaId: null,
+      publisher: null,
     });
     const res = await proc.process(j);
 
     expect(res).toEqual<EditionImportResult>({ tomeCount: 3 });
-    // edition null + malId/mangaId null → transmis en undefined à warmEditionMapping.
+    // edition null + malId/mangaId/publisher null → transmis en undefined à warmEditionMapping.
     expect(search.warmEditionMapping).toHaveBeenCalledWith(
       'Black torch',
       undefined,
       expect.any(Function),
+      undefined,
       undefined,
       undefined,
     );
@@ -75,7 +77,13 @@ describe('EditionImportProcessor.process', () => {
     search.warmEditionMapping.mockResolvedValue({ tomes: [] });
 
     await proc.process(
-      job({ title: 'X', edition: 'Éd. colossale', malId: null, mangaId: null }),
+      job({
+        title: 'X',
+        edition: 'Éd. colossale',
+        malId: null,
+        mangaId: null,
+        publisher: null,
+      }),
     );
 
     expect(search.warmEditionMapping).toHaveBeenCalledWith(
@@ -84,6 +92,31 @@ describe('EditionImportProcessor.process', () => {
       expect.any(Function),
       undefined,
       undefined,
+      undefined,
+    );
+  });
+
+  it('transmet l’éditeur et le mangaId (import lancé depuis la recherche par titre)', async () => {
+    const { proc, search } = make();
+    search.warmEditionMapping.mockResolvedValue({ tomes: [] });
+
+    await proc.process(
+      job({
+        title: "L'attaque des titans",
+        edition: null,
+        malId: null,
+        mangaId: 'md-1',
+        publisher: 'Pika',
+      }),
+    );
+
+    expect(search.warmEditionMapping).toHaveBeenCalledWith(
+      "L'attaque des titans",
+      undefined,
+      expect.any(Function),
+      undefined,
+      'md-1',
+      'Pika',
     );
   });
 });

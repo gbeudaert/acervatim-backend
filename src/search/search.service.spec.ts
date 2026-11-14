@@ -1,4 +1,8 @@
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { BnfService } from '../common/sources/bnf/bnf.service';
 import { GoogleBooksCoverService } from '../common/sources/googlebooks/googlebooks.service';
@@ -10,7 +14,7 @@ import {
 } from '../oauth/providers/types';
 import { SearchService } from './search.service';
 
-const bnfMock = { enumerateEdition: jest.fn() };
+const bnfMock = { enumerateEdition: jest.fn(), listEditions: jest.fn() };
 const bnf = bnfMock as unknown as BnfService;
 
 const gbooksMock = {
@@ -24,6 +28,7 @@ const gbooks = gbooksMock as unknown as GoogleBooksCoverService;
 const mangadexMock = {
   cachedSeriesCovers: jest.fn(),
   resolveSeriesCovers: jest.fn(),
+  fetchSeries: jest.fn(),
 };
 const mangadex = mangadexMock as unknown as MangaDexCoverService;
 
@@ -218,6 +223,7 @@ describe('SearchService', () => {
     expect(bnfMock.enumerateEdition).toHaveBeenCalledWith(
       "L'attaque des titans",
       'Éd. colossale',
+      { publisher: undefined, since: undefined },
     );
     // Tome sans ISBN → aucune résolution tentée. Le hint porte titre série + n° tome + édition.
     expect(gbooksMock.resolveCoverAndDescription).toHaveBeenCalledTimes(1);
@@ -286,7 +292,85 @@ describe('SearchService', () => {
     bnfMock.enumerateEdition.mockResolvedValue({ tomeCount: 34, tomes: [] });
     const svc = makeService([]);
     await svc.editionMapping('Naruto');
-    expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null);
+    expect(bnfMock.enumerateEdition).toHaveBeenCalledWith('Naruto', null, {
+      publisher: undefined,
+      since: undefined,
+    });
+  });
+
+  it('editionMapping transmet éditeur et rattrapage (since) à l’énumération', async () => {
+    bnfMock.enumerateEdition.mockResolvedValue({ tomeCount: 0, tomes: [] });
+    const svc = makeService([]);
+    await svc.editionMapping('Sakamoto days', undefined, undefined, 'md-1', {
+      publisher: 'Glénat',
+      since: '20260701',
+    });
+    expect(bnfMock.enumerateEdition).toHaveBeenCalledWith(
+      'Sakamoto days',
+      null,
+      { publisher: 'Glénat', since: '20260701' },
+    );
+  });
+
+  describe('listEditions (GET /v1/search/editions)', () => {
+    const SUMMARY = {
+      mangaId: 'md-snk',
+      title: "L'attaque des titans",
+      titleFr: "L'attaque des titans",
+      titleRomaji: 'Shingeki no Kyojin',
+      altTitles: ['Attack on Titan', "L'attaque des titans"],
+      authors: ['Isayama Hajime'],
+    };
+
+    it('relit la série par id et interroge la BnF : titre FR, saisie, romaji', async () => {
+      mangadexMock.fetchSeries.mockResolvedValue({
+        status: 'found',
+        summary: SUMMARY,
+      });
+      bnfMock.listEditions.mockResolvedValue({
+        editions: [{ publisher: 'Pika' }],
+        complete: false,
+      });
+      const svc = makeService([]);
+
+      const res = await svc.listEditions('md-snk', 'attaque titans');
+
+      expect(mangadexMock.fetchSeries).toHaveBeenCalledWith('md-snk');
+      expect(bnfMock.listEditions).toHaveBeenCalledWith(
+        ["L'attaque des titans", 'attaque titans', 'Shingeki no Kyojin'],
+        [
+          "L'attaque des titans",
+          'attaque titans',
+          'Shingeki no Kyojin',
+          'Attack on Titan',
+          "L'attaque des titans",
+        ],
+        ['Isayama Hajime'],
+      );
+      // `complete` relayé tel quel : l'app peut proposer de réessayer une liste partielle.
+      expect(res).toEqual({
+        mangaId: 'md-snk',
+        editions: [{ publisher: 'Pika' }],
+        complete: false,
+      });
+    });
+
+    it('id inconnu de MangaDex → 404', async () => {
+      mangadexMock.fetchSeries.mockResolvedValue({ status: 'absent' });
+      const svc = makeService([]);
+      await expect(svc.listEditions('md-x')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(bnfMock.listEditions).not.toHaveBeenCalled();
+    });
+
+    it('MangaDex indisponible → 502', async () => {
+      mangadexMock.fetchSeries.mockResolvedValue({ status: 'unresolved' });
+      const svc = makeService([]);
+      await expect(svc.listEditions('md-x')).rejects.toBeInstanceOf(
+        BadGatewayException,
+      );
+    });
   });
 
   it('editionMapping (endpoint HTTP) est cache-only : lit le cache, ne touche jamais au réseau', async () => {

@@ -38,6 +38,7 @@ export class EditionImportController {
       body.edition,
       body.malId,
       body.mangaId,
+      body.publisher,
     );
   }
 

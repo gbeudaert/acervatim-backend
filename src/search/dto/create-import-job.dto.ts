@@ -16,6 +16,9 @@ export const CreateImportJobSchema = z
     // id MangaDex (identité produite au scan, metadata.pivot.mangaId) : join direct des jaquettes,
     // sans recherche par titre. Optionnel.
     mangaId: z.string().max(64).optional(),
+    // Éditeur de l'édition (même sémantique qu'`edition-mapping`) ; entre dans l'id du job : deux
+    // éditeurs d'une même mention sont deux imports distincts. Optionnel.
+    publisher: z.string().min(1).max(256).optional(),
   })
   .strict();
 

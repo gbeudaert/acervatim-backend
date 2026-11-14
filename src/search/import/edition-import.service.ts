@@ -37,6 +37,7 @@ export class EditionImportService {
     edition?: string,
     malId?: string,
     mangaId?: string,
+    publisher?: string,
   ): Promise<{ jobId: string; state: ApiJobState }> {
     // Circuit-breaker : Redis down → 503 immédiat (l'app retombe sur son import local). Évite
     // d'attendre l'erreur de connexion BullMQ (cf. RedisHealthService).
@@ -45,7 +46,7 @@ export class EditionImportService {
         'import: file indisponible (Redis)',
       );
     }
-    const jobId = editionImportJobId(title, edition ?? null);
+    const jobId = editionImportJobId(title, edition ?? null, publisher ?? null);
 
     const existing = await this.queue.getJob(jobId);
     if (existing) {
@@ -64,6 +65,7 @@ export class EditionImportService {
         edition: edition ?? null,
         malId: malId ?? null,
         mangaId: mangaId ?? null,
+        publisher: publisher ?? null,
       },
       {
         jobId,

@@ -27,8 +27,53 @@ describe('EditionImportService', () => {
       expect(res).toEqual({ jobId: expectedId, state: 'queued' });
       expect(queue.add).toHaveBeenCalledWith(
         EDITION_IMPORT_JOB,
-        { title: TITLE, edition: EDITION, malId: null, mangaId: null },
+        {
+          title: TITLE,
+          edition: EDITION,
+          malId: null,
+          mangaId: null,
+          publisher: null,
+        },
         expect.objectContaining({ jobId: expectedId }),
+      );
+    });
+
+    it("l'éditeur entre dans le jobId (Pika ≠ France Loisirs) sans changer l'id d'un import sans éditeur", async () => {
+      const { svc, queue } = make();
+      queue.getJob.mockResolvedValue(undefined);
+
+      const pika = await svc.enqueue(
+        TITLE,
+        undefined,
+        undefined,
+        'md-1',
+        'Pika',
+      );
+      const pikaEd = await svc.enqueue(
+        TITLE,
+        undefined,
+        undefined,
+        'md-1',
+        'Pika édition',
+      );
+      const fl = await svc.enqueue(
+        TITLE,
+        undefined,
+        undefined,
+        'md-1',
+        'France loisirs',
+      );
+
+      expect(pika.jobId).toBe(pikaEd.jobId); // mots génériques ignorés
+      expect(pika.jobId).not.toBe(fl.jobId);
+      expect(editionImportJobId(TITLE, null)).toBe(
+        editionImportJobId(TITLE, null, null),
+      );
+      expect(pika.jobId).not.toBe(editionImportJobId(TITLE, null));
+      expect(queue.add).toHaveBeenCalledWith(
+        EDITION_IMPORT_JOB,
+        expect.objectContaining({ publisher: 'Pika', mangaId: 'md-1' }),
+        expect.objectContaining({ jobId: pika.jobId }),
       );
     });
 

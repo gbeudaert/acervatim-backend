@@ -1,8 +1,18 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { CollectionTypeCode } from '../collections/collection-type-codes';
 import { CursorPage } from '../common/pagination/paginate';
 import { BnfService } from '../common/sources/bnf/bnf.service';
-import { EditionMapping, EditionTome } from '../common/sources/bnf/bnf.types';
+import {
+  EditionMapping,
+  EditionSummary,
+  EditionTome,
+} from '../common/sources/bnf/bnf.types';
 import {
   CoverHint,
   CoverResult,
@@ -90,6 +100,23 @@ export interface EditionMappingResponse extends Omit<EditionMapping, 'tomes'> {
   tomes: EditionTomeWithCover[];
 }
 
+/** Réponse de `GET /v1/search/editions` : les éditions françaises de la série MangaDex choisie. */
+export interface SeriesEditionsResponse {
+  mangaId: string;
+  editions: EditionSummary[];
+  /**
+   * `false` quand une page BnF n'a pas pu être lue : la liste peut manquer une édition (l'app peut
+   * proposer de réessayer). Sans aucune notice lue, la requête échoue en 502 au lieu de répondre.
+   */
+  complete: boolean;
+}
+
+/** Paramètres d'énumération ajoutés après coup (éditeur de l'édition, rattrapage). */
+export interface EditionMappingFilters {
+  publisher?: string;
+  since?: string;
+}
+
 @Injectable()
 export class SearchService {
   private readonly byMediaType: Map<CollectionTypeCode, SourceAdapter>;
@@ -119,12 +146,46 @@ export class SearchService {
     edition?: string,
     malId?: string,
     mangaId?: string,
+    filters: EditionMappingFilters = {},
   ): Promise<EditionMappingResponse> {
     return this.buildEditionMapping(titleFr, edition, {
       resolveCovers: false,
       malId,
       mangaId,
+      ...filters,
     });
+  }
+
+  /**
+   * Éditions françaises d'une série MangaDex choisie après une recherche texte. La série est relue
+   * **par id** (titres FR/romaji/alt, auteurs) plutôt que reçue de l'app : l'identité vient de la
+   * source, pas du client. On interroge la BnF avec le titre FR d'abord, puis la saisie, puis le
+   * romaji (titre original catalogué) ; chaque édition renvoyée se rejoue dans `edition-mapping`.
+   *
+   * `404` si MangaDex ne connaît pas l'id, `502` si MangaDex est indisponible — ou si la BnF n'a pu
+   * fournir aucune notice (cf. `BnfService.listEditions`).
+   */
+  async listEditions(
+    mangaId: string,
+    title?: string,
+  ): Promise<SeriesEditionsResponse> {
+    const lookup = await this.mangaDex.fetchSeries(mangaId);
+    if (lookup.status === 'unresolved') {
+      throw new BadGatewayException('mangadex: upstream unavailable');
+    }
+    if (lookup.status === 'absent') {
+      throw new NotFoundException('manga not found');
+    }
+    const s = lookup.summary;
+    const queryTitles = [s.titleFr, title, s.titleRomaji].filter(
+      (t): t is string => !!t && t.trim().length > 0,
+    );
+    const { editions, complete } = await this.bnf.listEditions(
+      queryTitles,
+      [...queryTitles, ...s.altTitles],
+      s.authors,
+    );
+    return { mangaId, editions, complete };
   }
 
   /**
@@ -140,12 +201,14 @@ export class SearchService {
     onProgress?: (done: number, total: number) => void,
     malId?: string,
     mangaId?: string,
+    publisher?: string,
   ): Promise<EditionMappingResponse> {
     return this.buildEditionMapping(titleFr, edition, {
       resolveCovers: true,
       onProgress,
       malId,
       mangaId,
+      publisher,
     });
   }
 
@@ -162,10 +225,15 @@ export class SearchService {
       resolveCovers: boolean;
       malId?: string;
       mangaId?: string;
+      publisher?: string;
+      since?: string;
       onProgress?: (done: number, total: number) => void;
     },
   ): Promise<EditionMappingResponse> {
-    const mapping = await this.bnf.enumerateEdition(titleFr, edition ?? null);
+    const mapping = await this.bnf.enumerateEdition(titleFr, edition ?? null, {
+      publisher: opts.publisher,
+      since: opts.since,
+    });
     const total = mapping.tomes.length;
 
     // MangaDex, par SÉRIE : un seul appel pour toute l'édition (indexé par série + n° de tome), là où

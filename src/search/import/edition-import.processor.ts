@@ -26,7 +26,7 @@ export class EditionImportProcessor extends WorkerHost {
   async process(
     job: Job<EditionImportJobData, EditionImportResult>,
   ): Promise<EditionImportResult> {
-    const { title, edition, malId, mangaId } = job.data;
+    const { title, edition, malId, mangaId, publisher } = job.data;
 
     // Phase 1 : énumération BnF (le total n'est connu qu'après). On l'annonce pour l'UI.
     await job.updateProgress({ phase: 'enumerating', done: 0, total: 0 });
@@ -40,6 +40,8 @@ export class EditionImportProcessor extends WorkerHost {
       },
       malId ?? undefined,
       mangaId ?? undefined,
+      // Jobs enfilés avant l'ajout du champ : `publisher` absent → éditeur dominant.
+      publisher ?? undefined,
     );
 
     return { tomeCount: mapping.tomes.length };

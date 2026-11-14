@@ -7,8 +7,13 @@ import { CursorPage } from '../common/pagination/paginate';
 import { UnifiedItem } from '../oauth/providers/types';
 import { CoverQueryDto } from './dto/cover.query';
 import { EditionMappingQueryDto } from './dto/edition-mapping.query';
+import { EditionsQueryDto } from './dto/editions.query';
 import { SearchQueryDto } from './dto/search.query';
-import { EditionMappingResponse, SearchService } from './search.service';
+import {
+  EditionMappingResponse,
+  SearchService,
+  SeriesEditionsResponse,
+} from './search.service';
 
 @ApiTags('search')
 @ApiBearerAuth()
@@ -45,7 +50,20 @@ export class SearchController {
       query.edition,
       query.malId,
       query.mangaId,
+      { publisher: query.publisher, since: query.since },
     );
+  }
+
+  /**
+   * Éditions françaises (BnF) de la série MangaDex choisie après une recherche texte : une ligne par
+   * (éditeur, mention d'édition), à rejouer telle quelle dans `edition-mapping` / `import-jobs`.
+   * `editions: []` quand la BnF ne connaît pas la série (l'app propose la création manuelle).
+   */
+  @Get('editions')
+  async editions(
+    @Query() query: EditionsQueryDto,
+  ): Promise<SeriesEditionsResponse> {
+    return this.search.listEditions(query.mangaId, query.title);
   }
 
   /**
