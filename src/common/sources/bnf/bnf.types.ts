@@ -87,6 +87,47 @@ export interface EditionTome {
    * les mangas ; c'est la source primaire du résumé par tome (repli Google Books côté search).
    */
   description: string | null;
+  /**
+   * Date de création de la notice (`100$a`, positions 0-7) au format `YYYY-MM-DD`, ou null. Ce
+   * n'est **pas** la date de sortie : la BnF crée la notice des semaines après la parution (cf.
+   * étude du 2026-10-27, § 2). Sert au rattrapage (`since`) et à mesurer ce délai.
+   */
+  noticeCreatedAt: string | null;
+}
+
+/** Options d'énumération d'une édition. */
+export interface EnumerateEditionOptions {
+  /**
+   * Éditeur de l'édition (libellé libre, normalisé à la comparaison). Absent : l'éditeur
+   * **dominant** (le plus de tomes numérotés) — une même mention 205 (ou son absence) recouvre
+   * plusieurs éditeurs (Pika et les 2-en-1 France Loisirs pour la « standard »).
+   */
+  publisher?: string;
+  /** `AAAAMMJJ` : ne garder que les notices créées à cette date ou après (rattrapage). */
+  since?: string;
+}
+
+/**
+ * Une édition française d'une série, telle que projetée depuis les notices BnF
+ * (`GET /v1/search/editions`). Ses trois premiers champs rejouent `edition-mapping` à l'identique.
+ */
+export interface EditionSummary {
+  /** Titre de série tel que catalogué (461$t, sinon 200$a) → `title` d'`edition-mapping`. */
+  seriesTitleFr: string;
+  /** Éditeur lisible (mots génériques retirés) → `publisher` d'`edition-mapping`, ou null. */
+  publisher: string | null;
+  /** 205$a brut, null = édition standard → `edition` d'`edition-mapping`. */
+  edition: string | null;
+  isArtEdition: boolean;
+  /** Tomes numérotés distincts. */
+  tomeCount: number;
+  firstYear: string | null;
+  lastYear: string | null;
+  ongoing: boolean;
+  /** Au moins un tome porte un 454$h (« contient les tomes 1 à 3 » : colossale, 2-en-1…). */
+  hasSourceVolumeRange: boolean;
+  /** ISBN du tome de plus petit numéro, pour une jaquette d'exemple. */
+  sampleIsbn: string | null;
 }
 
 /** Mapping complet d'une édition (énumération BnF « toute la série d'un coup »). */
@@ -95,6 +136,8 @@ export interface EditionMapping {
   titleFr: string;
   /** Édition ciblée (205), ou null pour l'édition standard. */
   edition: string | null;
+  /** Éditeur retenu (demandé, sinon dominant), libellé lisible ; null si aucun. */
+  publisher: string | null;
   /** Nombre de tomes de CETTE édition (ex 12 pour la Colossale), dérivé. */
   tomeCount: number;
   /** Tomes ordonnés par n° d'édition. */
@@ -109,4 +152,10 @@ export interface EditionMapping {
   recordsScanned: number;
   /** Au moins une notice en cours de publication → mapping potentiellement partiel. */
   ongoing: boolean;
+  /**
+   * `false` si l'énumération n'a pas tout lu : plafond `EDITION_MAX_RECORDS` atteint, ou une page
+   * SRU en échec / illisible. Distingue « aucun tome » de « la BnF n'a pas répondu » — le
+   * rattrapage (`since`) ne tient pour vérifiée qu'une fenêtre lue en entier.
+   */
+  complete: boolean;
 }

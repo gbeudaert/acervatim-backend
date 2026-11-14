@@ -135,7 +135,16 @@ const ART_EDITION_KEYWORDS = [
 export function isSpecialArtEdition(
   edition: string | null | undefined,
 ): boolean {
-  if (!edition) return false;
-  const norm = normName(edition);
-  return ART_EDITION_KEYWORDS.some((k) => norm.includes(k));
+  return artEditionKeywords(edition).length > 0;
+}
+
+/**
+ * Mots-clés d'édition d'art présents dans `text` (normalisé). Sert aussi aux **pré-notices** BnF,
+ * qui n'ont pas encore de mention `205` : le mot-clé lu dans le titre (« Hellsing perfect
+ * edition ») est le seul indice qu'un tome récent n'appartient pas à l'édition standard.
+ */
+export function artEditionKeywords(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const norm = normName(text);
+  return ART_EDITION_KEYWORDS.filter((k) => norm.includes(k));
 }

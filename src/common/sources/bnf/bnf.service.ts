@@ -1,5 +1,6 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import {
+  BadGatewayException,
   Injectable,
   Logger,
   OnModuleDestroy,
@@ -19,14 +20,32 @@ import {
   BnfNotice,
   BnfResolution,
   EditionMapping,
+  EditionSummary,
   EditionTome,
+  EnumerateEditionOptions,
 } from './bnf.types';
 import {
-  allDatafields,
+  belongsToSeries,
+  displayPublisher,
+  dominantPublisher,
+  EditionRecord,
+  extractAuthors,
+  firstSubfieldAmong,
+  isOngoing,
+  keepForDominant,
+  matchesEdition,
+  normalizeEdition,
+  normalizePublisher,
+  normalizeSeriesKey,
+  normalizeVolumeRange,
+  projectEditions,
+  readEditionRecord,
+  volumeOf,
+} from './edition-records';
+import {
   controlfield,
   firstSubfield,
   parseUnimarc,
-  subfieldOf,
   UnimarcRecord,
 } from './unimarc.parser';
 
@@ -40,6 +59,16 @@ const NOTICE_CACHE_TTL_SECONDS = 30 * 24 * 3600; // notices biblio quasi immuabl
 // et la notice apparaît au plus tard le lendemain de son entrée au catalogue.
 const NOT_FOUND_CACHE_TTL_SECONDS = 24 * 3600;
 const EDITION_CACHE_TTL_SECONDS = 7 * 24 * 3600; // une édition peut gagner des tomes.
+// Page d'énumération **vide** (0 notice) : comme l'absence d'un ISBN, elle n'est pas immuable — un
+// titre absent aujourd'hui peut être catalogué demain. 7 jours la figeaient ; 24 h suffisent.
+const EMPTY_EDITION_PAGE_TTL_SECONDS = NOT_FOUND_CACHE_TTL_SECONDS;
+// Rattrapage (`since`) : la question posée est « quoi de neuf depuis telle date ? », rejouée au
+// plus une fois par semaine et par série. Une demi-journée de cache absorbe les ouvertures
+// répétées d'une même série sans retarder la découverte d'une notice de plus de 12 h.
+const SINCE_CACHE_TTL_SECONDS = 12 * 3600;
+// Requêtes BnF tentées pour lister les éditions d'une série (titre FR, saisie, romaji) : au-delà,
+// on paierait des pages SRU pour des titres de plus en plus improbables.
+const LIST_EDITIONS_MAX_QUERIES = 3;
 // Une notice par tome, mais le titre matche aussi le bruit (standard + collector +
 // spin-offs + guides + rééditions) : un titre populaire dépasse largement 100 notices.
 const EDITION_PAGE_SIZE = 100; // par requête SRU.
@@ -178,103 +207,125 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Énumère TOUS les tomes d'une édition (« récupérer toute la série d'un coup »).
-   * Recherche par titre FR + filtre sur l'édition (205), dédup par n° de tome.
-   * Best-effort : le catalogue est bruité (rééditions, guides, séries en cours) —
-   * on loggue le bruit et on renvoie ce qui est exploitable.
+   * Recherche par titre FR (texte imprimé seulement), puis filtre sur la série, l'édition (205) et
+   * l'**éditeur**, dédup par n° de tome. Best-effort : le catalogue est bruité (rééditions, guides,
+   * romans dérivés, séries en cours) — on loggue le bruit et on renvoie ce qui est exploitable.
+   *
+   * L'éditeur fait partie de l'identité d'une édition : sans lui, les 2-en-1 France Loisirs
+   * (« 11-12 ») prenaient la place des tomes Pika de même numéro dans la « standard » de *L'attaque
+   * des titans*. Non précisé, l'éditeur **dominant** gagne les collisions de n° (cf.
+   * {@link keepForDominant}) ; précisé, le filtre est strict.
    *
    * @param titleFr  titre FR de la série (ex "L'attaque des titans")
    * @param edition  mention d'édition 205 (ex "Éd. colossale") ; null = édition standard
+   * @param opts     `publisher` (sinon dominant) ; `since` AAAAMMJJ (rattrapage : notices créées
+   *                 depuis cette date seulement)
    */
   async enumerateEdition(
     titleFr: string,
     edition: string | null = null,
+    opts: EnumerateEditionOptions = {},
   ): Promise<EditionMapping> {
     const empty: EditionMapping = {
       titleFr,
       edition,
+      publisher: null,
       tomeCount: 0,
       tomes: [],
       authors: [],
       recordsScanned: 0,
       ongoing: false,
+      complete: true,
     };
 
-    const { records, total, complete } =
-      await this.fetchEditionRecords(titleFr);
-    if (records.length === 0) return empty;
+    const fetched = await this.fetchEditionRecords(titleFr, opts.since);
+    const { records, total } = fetched;
+    // Une liste vide n'est une réponse que si la BnF a répondu : une première page en échec doit
+    // rester distinguable de « aucun tome », sinon le rattrapage croirait la fenêtre vérifiée.
+    let complete = fetched.complete;
+    if (records.length === 0) return { ...empty, complete };
 
-    const wantEdition = normalizeEdition(edition);
     const wantSeries = normalizeSeriesKey(titleFr);
+    const wantEdition = normalizeEdition(edition);
+    const members = records
+      .map(readEditionRecord)
+      .filter((r) => belongsToSeries(r, wantSeries));
+    const inEdition = members.filter((r) =>
+      matchesEdition(r, wantEdition, edition, wantSeries),
+    );
+
+    // Éditeur retenu : celui demandé (filtre strict), sinon le dominant, qui ne gagne que les
+    // collisions de n° (cf. keepForDominant). En rattrapage (`since`), le sous-ensemble des notices
+    // récentes ne dit rien de l'éditeur dominant (un seul 2-en-1 récent suffirait à le fausser) : on
+    // le calcule sur l'énumération complète, servie par son propre cache.
+    let publisherKey: string | null;
+    let kept: EditionRecord[];
+    if (opts.publisher !== undefined) {
+      publisherKey = normalizePublisher(opts.publisher);
+      kept = inEdition.filter((r) => r.publisherKey === publisherKey);
+    } else {
+      let reference = inEdition;
+      if (opts.since) {
+        const full = await this.fetchEditionRecords(titleFr);
+        // L'éditeur dominant tiré d'une énumération tronquée peut être faux : le résultat aussi.
+        complete = complete && full.complete;
+        reference = full.records
+          .map(readEditionRecord)
+          .filter(
+            (r) =>
+              belongsToSeries(r, wantSeries) &&
+              matchesEdition(r, wantEdition, edition, wantSeries),
+          );
+      }
+      const dominant = dominantPublisher(reference, wantSeries);
+      publisherKey = dominant.key;
+      kept = inEdition.filter((r) => keepForDominant(r, wantSeries, dominant));
+    }
 
     const byVolume = new Map<number, EditionTome>();
     // Auteurs de la série, agrégés sur les notices membres (toutes éditions confondues) et
     // dédupliqués : servent à valider par l'auteur le rapprochement MangaDex des jaquettes.
     const seriesAuthors = new Map<string, BnfAuthor>();
-    let ongoing = false;
-    for (const rec of records) {
-      // Appartenance à la série : le catalogage BnF varie (461$t « fait partie de »,
-      // sinon 225$a collection, sinon 200$a). Exclut les spin-offs et homonymes qui
-      // matchent le titre mais ne sont pas la même série (ex "…: Before the Fall").
-      const recSeries = normalizeSeriesKey(
-        firstSubfield(rec, '461', 't') ??
-          firstSubfield(rec, '225', 'a') ??
-          firstSubfield(rec, '200', 'a') ??
-          null,
-      );
-      if (recSeries !== wantSeries) continue;
-
-      for (const a of extractAuthors(rec)) {
+    for (const r of members) {
+      for (const a of r.authors) {
         const key = normalizeSeriesKey(a.full ?? a.surname ?? a.given ?? '');
         if (key && !seriesAuthors.has(key)) seriesAuthors.set(key, a);
       }
-
-      const rec205 = normalizeEdition(firstSubfield(rec, '205', 'a') ?? null);
-      if (rec205 !== wantEdition) continue; // mauvaise édition (ou standard vs collector)
-
-      // N° de tome : 461$v (ensemble) → 225$v (collection) → 200$h. Certains éditeurs
-      // (Ki-oon) ne mettent PAS le n° en 200$h mais en 225$v/461$v — le lire seul
-      // ne remontait qu'un tome.
-      const volume = parseVolume(
-        firstSubfield(rec, '461', 'v') ??
-          firstSubfield(rec, '225', 'v') ??
-          firstSubfield(rec, '200', 'h'),
-      );
+    }
+    let ongoing = false;
+    const publishers: string[] = [];
+    for (const r of kept) {
+      const volume = volumeOf(r, wantSeries);
       if (volume === null) continue; // pas un tome numéroté → bruit (guide, intégrale…)
-
-      if (!byVolume.has(volume)) {
-        byVolume.set(volume, {
-          editionVolume: volume,
-          sourceVolumeRange: normalizeVolumeRange(
-            firstSubfield(rec, '454', 'h'),
-          ),
-          isbn: firstSubfield(rec, '010', 'a') ?? null,
-          titleFr: firstSubfield(rec, '200', 'a') ?? null,
-          // 330$a — résumé propre au tome (souvent absent) ; repli Google Books côté search.
-          description: firstSubfield(rec, '330', 'a') ?? null,
-        });
-      }
-      const date =
-        firstSubfield(rec, '210', 'd') ??
-        firstSubfield(rec, '214', 'd') ??
-        null;
-      if (isOngoing(date)) ongoing = true;
+      if (r.publisher) publishers.push(r.publisher);
+      if (!byVolume.has(volume)) byVolume.set(volume, toTome(r, volume));
+      if (isOngoing(r.date)) ongoing = true;
     }
 
     const tomes = [...byVolume.values()].sort(
       (a, b) => a.editionVolume - b.editionVolume,
     );
+    // Libellé de l'éditeur retenu (dominant ou demandé), pas celui d'un tome qui comble un trou.
+    const publisher = displayPublisher(
+      kept.find((r) => r.publisherKey === publisherKey)?.publisher ??
+        publishers[0] ??
+        null,
+    );
+    const otherPublishers = new Set(
+      inEdition.map((r) => r.publisherKey).filter((k) => k !== publisherKey),
+    ).size;
 
     this.logger.log(
-      `bnf: edition title="${titleFr}" edition="${edition ?? 'standard'}" recordsScanned=${records.length} numberOfRecords=${total} tomesKept=${tomes.length}${complete ? '' : ' TRUNCATED'}${ongoing ? ' ONGOING' : ''}`,
+      `bnf: edition title="${titleFr}" edition="${edition ?? 'standard'}" publisher="${publisher ?? '-'}"${opts.publisher === undefined ? ` (dominant, ${otherPublishers} autre(s) libelle(s) : collisions ecartees, trous combles)` : ''}${opts.since ? ` since=${opts.since}` : ''} recordsScanned=${records.length} numberOfRecords=${total} tomesKept=${tomes.length}${complete ? '' : ' TRUNCATED'}${ongoing ? ' ONGOING' : ''}`,
     );
-    if (tomes.length === 0) {
+    if (tomes.length === 0 && !opts.since) {
       this.logger.warn(
-        `bnf: edition NO tome matched title="${titleFr}" edition="${edition ?? 'standard'}" (titre/edition introuvables ou catalogage non exploitable)`,
+        `bnf: edition NO tome matched title="${titleFr}" edition="${edition ?? 'standard'}" publisher="${opts.publisher ?? '-'}" (titre/edition/editeur introuvables ou catalogage non exploitable)`,
       );
     }
     if (!complete) {
       this.logger.warn(
-        `bnf: edition TRUNCATED title="${titleFr}" recordsScanned=${records.length}/${total} (plafond EDITION_MAX_RECORDS=${EDITION_MAX_RECORDS}) -> tomes potentiellement manquants`,
+        `bnf: edition TRUNCATED title="${titleFr}" recordsScanned=${records.length}/${total} (plafond EDITION_MAX_RECORDS=${EDITION_MAX_RECORDS} ou page SRU en echec) -> tomes potentiellement manquants`,
       );
     }
     if (ongoing) {
@@ -286,12 +337,72 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
     return {
       titleFr,
       edition,
+      publisher,
       tomeCount: tomes.length,
       tomes,
       authors: [...seriesAuthors.values()],
       recordsScanned: records.length,
       ongoing,
+      complete,
     };
+  }
+
+  /**
+   * Liste les **éditions françaises** d'une série : projection sur les mêmes notices que
+   * {@link enumerateEdition} (même requête, même cache), groupées par (série, éditeur, 205$a). Chaque
+   * édition renvoyée se rejoue à l'identique dans `enumerateEdition(seriesTitleFr, edition,
+   * { publisher })`.
+   *
+   * @param queryTitles titres à interroger, dans l'ordre (FR d'abord) ; on s'arrête au premier qui
+   *                    produit au moins une édition
+   * @param matchTitles tous les titres connus de la série (FR, romaji, alt-titres, saisie) : une
+   *                    notice n'est retenue que si l'un de ses titres en égale un
+   * @param authorNames auteurs de la série (MangaDex), pour écarter un homonyme catalogué
+   *
+   * `complete` = toutes les pages interrogées ont été lues. Si **aucune** notice n'a pu être lue et
+   * qu'au moins une lecture a échoué, on lève une erreur passerelle (502) plutôt que de répondre
+   * `editions: []` : l'app proposerait sinon la création manuelle d'une série que la BnF connaît
+   * peut-être, au lieu de « réessayer ».
+   */
+  async listEditions(
+    queryTitles: string[],
+    matchTitles: string[],
+    authorNames: string[],
+  ): Promise<{ editions: EditionSummary[]; complete: boolean }> {
+    const matchKeys = new Set(
+      [...matchTitles, ...queryTitles]
+        .map((t) => normalizeSeriesKey(t))
+        .filter((k) => k.length > 0),
+    );
+    const tried = new Set<string>();
+    let complete = true;
+    let recordsRead = 0;
+    for (const title of queryTitles) {
+      const key = normalizeSeriesKey(title);
+      if (!key || tried.has(key)) continue;
+      if (tried.size >= LIST_EDITIONS_MAX_QUERIES) break;
+      tried.add(key);
+
+      const fetched = await this.fetchEditionRecords(title);
+      complete = complete && fetched.complete;
+      recordsRead += fetched.records.length;
+      const editions = projectEditions(
+        fetched.records.map(readEditionRecord),
+        matchKeys,
+        authorNames,
+      );
+      this.logger.log(
+        `bnf: editions query="${title}" records=${fetched.records.length} editions=${editions.length}${fetched.complete ? '' : ' INCOMPLETE'}`,
+      );
+      if (editions.length > 0) return { editions, complete };
+    }
+    if (recordsRead === 0 && !complete) {
+      this.logger.warn(
+        `bnf: editions indisponibles queries=${tried.size} (aucune notice lue, lecture en echec) -> 502`,
+      );
+      throw new BadGatewayException('bnf: upstream unavailable');
+    }
+    return { editions: [], complete };
   }
 
   /**
@@ -299,8 +410,17 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
    * Un seul page de 100 ne suffit pas pour un titre populaire (standard + collector
    * + spin-offs + guides) : les tomes catalogués au-delà étaient silencieusement
    * perdus. Best-effort : `complete=false` si on s'arrête sur plafond/erreur/quota.
+   *
+   * Requête restreinte au **texte imprimé** (`bib.doctype any "a"`) : le titre seul remonte aussi
+   * DVD, CD et Blu-ray. `since` ajoute `bib.creationdate >= "AAAAMMJJ"` (format strict : une date
+   * `AAAA-MM-JJ` renvoie 0 notice sans erreur). Le TTL dépend de la réponse — une page vide n'est
+   * gardée que 24 h, comme l'absence d'un ISBN —, d'où le déroulé get / fetch / parse / set plutôt
+   * que `getOrFetch`.
    */
-  private async fetchEditionRecords(titleFr: string): Promise<{
+  private async fetchEditionRecords(
+    titleFr: string,
+    since?: string,
+  ): Promise<{
     records: UnimarcRecord[];
     total: number;
     complete: boolean;
@@ -309,6 +429,10 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
     let total = 0;
     let complete = true;
     let startRecord = 1; // SRU est indexé à partir de 1.
+    const title = cqlPhrase(titleFr);
+    const query =
+      `bib.title all "${title}" and bib.doctype any "a"` +
+      (since ? ` and bib.creationdate >= "${since}"` : '');
 
     while (startRecord <= EDITION_MAX_RECORDS) {
       const params = new URLSearchParams({
@@ -317,18 +441,22 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
         recordSchema: 'unimarcxchange',
         maximumRecords: String(EDITION_PAGE_SIZE),
         startRecord: String(startRecord),
-        query: `bib.title all "${titleFr}"`,
+        query,
       });
       const url = `${this.baseUrl}?${params.toString()}`;
-      const cacheKey = `bnf:edition-page:${titleFr.toLowerCase()}:${startRecord}`;
+      // v2 : la requête porte désormais le filtre `doctype` — les pages v1 (sans filtre) ne
+      // correspondent plus à la même question.
+      const cacheKey = since
+        ? `bnf:edition-since:v1:${titleFr.toLowerCase()}:${since}:${startRecord}`
+        : `bnf:edition-page:v2:${titleFr.toLowerCase()}:${startRecord}`;
 
+      // Lecture cache + fetch dans le même try : une panne du cache (base indisponible) dégrade
+      // l'énumération en `complete=false`, comme une page SRU en échec, au lieu d'une 500.
+      let cached: string | null;
       let xml: string;
       try {
-        xml = await this.cache.getOrFetch<string>(
-          cacheKey,
-          EDITION_CACHE_TTL_SECONDS,
-          () => this.fetchSru(url, BNF_PRIORITY_BACKGROUND),
-        );
+        cached = await this.cache.get<string>(cacheKey);
+        xml = cached ?? (await this.fetchSru(url, BNF_PRIORITY_BACKGROUND));
       } catch {
         this.logger.warn(
           `bnf: edition fetch failed title="${titleFr}" startRecord=${startRecord}`,
@@ -338,8 +466,33 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
       }
 
       const parsed = parseUnimarc(xml);
+      if (!parsed.isSruResponse) {
+        // Page d'erreur / diagnostic : transitoire, jamais mise en cache (cf. resolveByIsbn).
+        this.logger.warn(
+          `bnf: edition unparsable title="${titleFr}" startRecord=${startRecord}`,
+        );
+        complete = false;
+        break;
+      }
       if (parsed.numberOfRecords > 0) total = parsed.numberOfRecords;
       all.push(...parsed.records);
+      if (cached === null) {
+        const ttl = since
+          ? SINCE_CACHE_TTL_SECONDS
+          : parsed.records.length > 0
+            ? EDITION_CACHE_TTL_SECONDS
+            : EMPTY_EDITION_PAGE_TTL_SECONDS;
+        try {
+          await this.cache.set(cacheKey, xml, ttl);
+        } catch {
+          // La page lue reste exploitable ; on s'arrête là, le résultat est marqué incomplet.
+          this.logger.warn(
+            `bnf: edition cache write failed title="${titleFr}" startRecord=${startRecord}`,
+          );
+          complete = false;
+          break;
+        }
+      }
 
       if (parsed.records.length === 0) break; // plus de notices à récupérer.
       if (all.length >= total) break; // tout récupéré (selon le serveur).
@@ -369,10 +522,9 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
       titleFr: firstSubfield(rec, '200', 'a') ?? null,
       volume: firstSubfield(rec, '200', 'h') ?? null,
       edition: firstSubfield(rec, '205', 'a') ?? null,
-      publisherFr:
-        firstSubfield(rec, '210', 'c') ??
-        firstSubfield(rec, '214', 'c') ??
-        null,
+      // Même lecture que l'énumération (edition-records) : toutes les 210/214, première à porter un
+      // $c — une 214 d'imprimeur sans $c placée en tête ne doit pas vider l'éditeur du scan.
+      publisherFr: firstSubfieldAmong(rec, ['210', '214'], 'c'),
       seriesTitle:
         firstSubfield(rec, '461', 't') ??
         firstSubfield(rec, '225', 'a') ??
@@ -415,74 +567,22 @@ export class BnfService implements OnModuleInit, OnModuleDestroy {
   }
 }
 
-function extractAuthors(rec: UnimarcRecord): BnfAuthor[] {
-  const authors: BnfAuthor[] = [];
-  for (const df of [
-    ...allDatafields(rec, '700'),
-    ...allDatafields(rec, '701'),
-  ]) {
-    const surname = subfieldOf(df, 'a');
-    const given = subfieldOf(df, 'b');
-    if (surname || given) {
-      authors.push({
-        surname,
-        given,
-        full: [given, surname].filter(Boolean).join(' ') || undefined,
-      });
-    }
-  }
-  if (authors.length === 0) {
-    const f = firstSubfield(rec, '200', 'f');
-    if (f) authors.push({ full: f });
-  }
-  return authors;
+/** Tome d'édition à partir d'une notice relue (cf. `edition-records`). */
+function toTome(r: EditionRecord, volume: number): EditionTome {
+  return {
+    editionVolume: volume,
+    sourceVolumeRange: r.sourceVolumeRange,
+    isbn: r.isbn,
+    titleFr: r.rawTitle,
+    // 330$a — résumé propre au tome (souvent absent) ; repli Google Books côté search.
+    description: r.description,
+    noticeCreatedAt: r.noticeCreatedAt,
+  };
 }
 
-/** Clé de série normalisée (minuscules, sans accents ni ponctuation) pour comparer
- * l'appartenance : "Maid sama !" et "Maid sama" → "maid sama". */
-function normalizeSeriesKey(raw: string | null): string {
-  if (!raw) return '';
-  return raw
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-/** "Éd. colossale" → "colossale" ; null/standard → "". Pour comparer les éditions. */
-function normalizeEdition(raw: string | null): string {
-  if (!raw) return '';
-  return raw
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/\b(ed|edition)\.?\b/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-/** "1" → 1 ; "31" → 31 ; "T. 5" → 5 ; non numérique → null. */
-function parseVolume(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const m = raw.match(/\d+/);
-  return m ? Number(m[0]) : null;
-}
-
-/** "vol. 1-3" / "T. 1-3" / "1-3" → "1-3". null si rien d'exploitable. */
-function normalizeVolumeRange(raw: string | undefined): string | null {
-  if (!raw) return null;
-  const cleaned = raw
-    .replace(/vol\.?|tomes?|t\.?/gi, '')
-    .replace(/\s+/g, '')
-    .trim();
-  return /\d/.test(cleaned) ? cleaned : null;
-}
-
-/** Date ouverte type "2015-" / "DL 2015-" → série en cours. */
-function isOngoing(date: string | null): boolean {
-  if (!date) return false;
-  return /\d{4}\s*-\s*$/.test(date.trim());
+/** Valeur insérable entre guillemets dans une requête CQL : un `"` fermerait la phrase. */
+function cqlPhrase(s: string): string {
+  return s.replace(/["\\]/g, ' ').trim();
 }
 
 function quote(s: string | null | undefined): string {
